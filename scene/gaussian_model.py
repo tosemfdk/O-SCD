@@ -59,6 +59,9 @@ class GaussianModel:
         self.shoptimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
+        self._persistent_id = torch.empty(0, dtype=torch.int64)
+        self._next_persistent_id = 0
+        self._protected_pids = set()
         self.setup_functions()
 
     def capture(self):
@@ -77,21 +80,26 @@ class GaussianModel:
             self.optimizer.state_dict(),
             self.shoptimizer.state_dict() if self.shoptimizer else None,
             self.spatial_lr_scale,
+            self._persistent_id,
+            self._next_persistent_id,
         )
-    
+
     def restore(self, model_args, training_args):
-        (self.active_sh_degree, 
-        self._xyz, 
-        self._features_dc, 
+        if len(model_args) == 16:
+            model_args, self._persistent_id, self._next_persistent_id = \
+                model_args[:14], model_args[14], model_args[15]
+        (self.active_sh_degree,
+        self._xyz,
+        self._features_dc,
         self._features_rest,
-        self._scaling, 
-        self._rotation, 
+        self._scaling,
+        self._rotation,
         self._opacity,
-        self.max_radii2D, 
-        xyz_gradient_accum, 
+        self.max_radii2D,
+        xyz_gradient_accum,
         xyz_gradient_accum_abs,
         denom,
-        opt_dict, 
+        opt_dict,
         shopt_dict,
         self.spatial_lr_scale) = model_args
         self.training_setup(training_args)
@@ -101,6 +109,54 @@ class GaussianModel:
         self.optimizer.load_state_dict(opt_dict)
         if shopt_dict is not None:
             self.shoptimizer.load_state_dict(shopt_dict)
+
+    # --- Persistent Gaussian identity (used by target_nbv) ------------------
+    # Row indices shift on densify/split/prune; _persistent_id gives each
+    # Gaussian a stable int64 ID. Every surgery site must go through
+    # _append_persistent_ids / _compact_persistent_ids so the mapping cannot
+    # silently drift. Protected IDs are excluded from split/clone selection
+    # and from pruning while a target-NBV episode is active.
+
+    def _init_persistent_ids(self, count):
+        self._persistent_id = torch.arange(count, dtype=torch.int64, device="cuda")
+        self._next_persistent_id = count
+
+    def _load_or_init_persistent_ids(self, ply_path):
+        sidecar = ply_path + ".pid.pt"
+        count = self.get_xyz.shape[0]
+        if os.path.exists(sidecar):
+            data = torch.load(sidecar, map_location="cuda")
+            if data["persistent_id"].shape[0] == count:
+                self._persistent_id = data["persistent_id"]
+                self._next_persistent_id = int(data["next_persistent_id"])
+                return
+        self._init_persistent_ids(count)
+
+    def _append_persistent_ids(self, count):
+        if self._persistent_id.numel() == 0 and self._next_persistent_id == 0:
+            return  # model predates ID support (restored old checkpoint)
+        new_ids = torch.arange(self._next_persistent_id, self._next_persistent_id + count,
+                               dtype=torch.int64, device="cuda")
+        self._persistent_id = torch.cat((self._persistent_id, new_ids))
+        self._next_persistent_id += count
+
+    def _compact_persistent_ids(self, valid_points_mask):
+        if self._persistent_id.numel():
+            self._persistent_id = self._persistent_id[valid_points_mask]
+
+    def protect_ids(self, pids):
+        self._protected_pids.update(int(p) for p in pids)
+
+    def unprotect_ids(self, pids):
+        for p in pids:
+            self._protected_pids.discard(int(p))
+
+    def _protected_rows_mask(self):
+        if not self._protected_pids or self._persistent_id.numel() == 0:
+            return None
+        pid_tensor = torch.tensor(sorted(self._protected_pids), dtype=torch.int64,
+                                  device=self._persistent_id.device)
+        return torch.isin(self._persistent_id, pid_tensor)
 
     @property
     def get_scaling(self):
@@ -155,6 +211,7 @@ class GaussianModel:
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        self._init_persistent_ids(self.get_xyz.shape[0])
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
@@ -281,6 +338,10 @@ class GaussianModel:
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
+        if self._persistent_id.numel() == xyz.shape[0]:
+            # int64 IDs cannot ride in the float PLY schema; sidecar keeps them lossless
+            torch.save({"persistent_id": self._persistent_id,
+                        "next_persistent_id": self._next_persistent_id}, path + ".pid.pt")
 
     def save_ply_change(self, path):
         mkdir_p(os.path.dirname(path))
@@ -300,6 +361,10 @@ class GaussianModel:
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
+        if self._persistent_id.numel() == xyz.shape[0]:
+            # int64 IDs cannot ride in the float PLY schema; sidecar keeps them lossless
+            torch.save({"persistent_id": self._persistent_id,
+                        "next_persistent_id": self._next_persistent_id}, path + ".pid.pt")
 
     def reset_opacity(self):
         opacities_new = inverse_sigmoid(torch.min(self.get_opacity, torch.ones_like(self.get_opacity)*0.01))
@@ -349,6 +414,7 @@ class GaussianModel:
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
         self.active_sh_degree = self.max_sh_degree
+        self._load_or_init_persistent_ids(path)
 
     def load_ply_change(self, path):
         plydata = PlyData.read(path)
@@ -393,6 +459,7 @@ class GaussianModel:
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
         self.active_sh_degree = 0
+        self._load_or_init_persistent_ids(path)
 
     def replace_tensor_to_optimizer(self, tensor, name):
         optimizable_tensors = {}
@@ -432,6 +499,9 @@ class GaussianModel:
         return optimizable_tensors
 
     def prune_points(self, mask):
+        protected = self._protected_rows_mask()
+        if protected is not None:
+            mask = torch.logical_and(mask, ~protected)
         valid_points_mask = ~mask
         optimizable_tensors = self._prune_optimizer(valid_points_mask)
 
@@ -446,6 +516,7 @@ class GaussianModel:
 
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
+        self._compact_persistent_ids(valid_points_mask)
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -489,6 +560,7 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
+        self._append_persistent_ids(new_xyz.shape[0])
 
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -502,6 +574,9 @@ class GaussianModel:
         selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
+        protected = self._protected_rows_mask()
+        if protected is not None:
+            selected_pts_mask = torch.logical_and(selected_pts_mask, ~protected)
 
         stds = self.get_scaling[selected_pts_mask].repeat(N,1)
         means =torch.zeros((stds.size(0), 3),device="cuda")
@@ -524,7 +599,10 @@ class GaussianModel:
         selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
-        
+        protected = self._protected_rows_mask()
+        if protected is not None:
+            selected_pts_mask = torch.logical_and(selected_pts_mask, ~protected)
+
         new_xyz = self._xyz[selected_pts_mask]
         new_features_dc = self._features_dc[selected_pts_mask]
         new_features_rest = self._features_rest[selected_pts_mask]
@@ -565,6 +643,9 @@ class GaussianModel:
     # FasrGS Related functions
 
     def prune_points_fastgs(self, mask):
+        protected = self._protected_rows_mask()
+        if protected is not None:
+            mask = torch.logical_and(mask, ~protected)
         valid_points_mask = ~mask
         optimizable_tensors = self._prune_optimizer(valid_points_mask)
 
@@ -582,6 +663,7 @@ class GaussianModel:
         self.max_radii2D = self.max_radii2D[valid_points_mask]
         if self.tmp_radii is not None:
             self.tmp_radii = self.tmp_radii[valid_points_mask]
+        self._compact_persistent_ids(valid_points_mask)
 
     def optimizer_step(self, iteration):
         ''' An optimization schdeuler. The goal is similar to the sparse Adam of taming 3dgs.'''
@@ -619,6 +701,7 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
+        self._append_persistent_ids(new_xyz.shape[0])
 
         if self.tmp_radii is not None and new_tmp_radii is not None:
             self.tmp_radii = torch.cat((self.tmp_radii, new_tmp_radii))
@@ -635,6 +718,9 @@ class GaussianModel:
         selected_pts_mask = torch.zeros((n_init_points), dtype=bool, device="cuda")
         mask = torch.logical_and(metric_mask, filter)
         selected_pts_mask[:mask.shape[0]] = mask
+        protected = self._protected_rows_mask()
+        if protected is not None:
+            selected_pts_mask = torch.logical_and(selected_pts_mask, ~protected)
 
         stds = self.get_scaling[selected_pts_mask].repeat(N,1)
         means =torch.zeros((stds.size(0), 3),device="cuda")
@@ -655,7 +741,10 @@ class GaussianModel:
 
     def densify_and_clone_fastgs(self, metric_mask, filter):
         selected_pts_mask = torch.logical_and(metric_mask, filter)
-        
+        protected = self._protected_rows_mask()
+        if protected is not None:
+            selected_pts_mask = torch.logical_and(selected_pts_mask, ~protected)
+
         new_xyz = self._xyz[selected_pts_mask]
         new_features_dc = self._features_dc[selected_pts_mask]
         new_features_rest = self._features_rest[selected_pts_mask]
