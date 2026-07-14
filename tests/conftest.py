@@ -53,6 +53,55 @@ def make_toy_model(n: int = 100, seed: int = 0, spatial_lr_scale: float = 1.0,
     return model
 
 
+def make_scene(points, scales, opacities=None, colors=None, setup_optimizer: bool = False):
+    """GaussianModel with exact placement. points/scales: (N,3) lists or arrays;
+    scales are LINEAR sigmas (stored as log internally)."""
+    import torch
+    from torch import nn
+    from scene import GaussianModel
+    from utils.general_utils import inverse_sigmoid
+
+    pts = torch.tensor(points, dtype=torch.float32)
+    n = pts.shape[0]
+    scl = torch.tensor(scales, dtype=torch.float32)
+    opac = torch.full((n, 1), 0.9) if opacities is None else torch.tensor(opacities, dtype=torch.float32).reshape(n, 1)
+    col = 0.5 * torch.ones((n, 1, 3)) if colors is None else torch.tensor(colors, dtype=torch.float32).reshape(n, 1, 3)
+    rots = torch.zeros((n, 4)); rots[:, 0] = 1.0
+
+    model = GaussianModel(0, 0)
+    model.spatial_lr_scale = 1.0
+    model._xyz = nn.Parameter(pts.cuda().requires_grad_(True))
+    model._scaling = nn.Parameter(torch.log(scl).cuda().requires_grad_(True))
+    model._rotation = nn.Parameter(rots.cuda().requires_grad_(True))
+    model._opacity = nn.Parameter(inverse_sigmoid(opac).cuda().requires_grad_(True))
+    model._features_dc = nn.Parameter(col.cuda().requires_grad_(True))
+    model._features_rest = nn.Parameter(torch.zeros((n, 0, 3)).cuda().requires_grad_(True))
+    model.max_radii2D = torch.zeros(n, device="cuda")
+    model.active_sh_degree = 0
+    model._init_persistent_ids(n)
+    if setup_optimizer:
+        model.training_setup_change(make_opt_args())
+    return model
+
+
+def make_pipe():
+    from arguments import PipelineParams
+    parser = ArgumentParser()
+    pp = PipelineParams(parser)
+    return pp.extract(parser.parse_args([]))
+
+
 @pytest.fixture
 def toy_model():
     return make_toy_model()
+
+
+@pytest.fixture
+def pipe():
+    return make_pipe()
+
+
+@pytest.fixture
+def background():
+    import torch
+    return torch.zeros(3, device="cuda")

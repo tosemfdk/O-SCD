@@ -164,22 +164,27 @@ chain-rule through `σ'(z)/3` on **rendered** values.
 
 ## 8. Visibility backends
 
-- **Backend A′ (MVP): metric-map counting.** The fastgs rasterizer accepts a
-  flattened `metric_map` (int, cuda, length H·W) with `get_flag=True` and
-  returns `accum_metric_counts (P,) int32` = per-Gaussian count of contributed
-  pixels inside the map region (`forward.cu:401-406`). Procedure: analytically
-  project the target's 3σ ellipse (Python EWA, single Gaussian) → bbox →
-  metric_map → one render → `counts[row]`.
-  `responsibility_proxy = counts/ellipse_area_px`,
-  `occlusion_ratio = 1 − counts/ellipse_area_px` (clamped),
-  `responsibility_sum ≈ counts · sigmoid(opacity_t)` (documented proxy).
-  Frustum pre-gate: `markVisible` (no render). Never consume
-  `visibility_filter` (it is **indices**, not a bool mask); use `radii[row]>0`.
-- **Backend B (exact α·T, deferred).** `forward.cu` computes per-pixel
-  transmittance (`final_T`, `n_contrib` at lines 422-423) but discards them; an
-  exact backend would export `α_t,p·T_t,p` for the target ID only. ABC stub
-  `ExactAlphaTBackend` raises `NotImplementedError`; implemented only if stage
-  14 shows A′ misranks.
+- **Backend A″ (MVP): color probe — exact responsibility, no CUDA change.**
+  Render a duck-typed **proxy** of the model (tensors shared read-only, only
+  `_features_dc` replaced) with the target's DC color set to render as 1 and
+  all others as 0 at `sh_degree=0` (color = `SH_C0·dc + 0.5`). The rendered
+  image then equals the per-pixel compositing responsibility
+  `r_t,p = α_t,p·T_t,p` exactly. A second single-row render (target only)
+  gives the unoccluded self-responsibility; `occlusion_ratio = 1 −
+  Σr_occ/Σr_unocc`. Two renders per evaluation; the real model is never
+  mutated. The analytic 3σ ellipse projection (Python EWA, single Gaussian)
+  still provides the bbox/crop and projected radius.
+  Rejected alternative (A′): `metric_map`+`accum_metric_counts` counting — the
+  count condition in `forward.cu:387-406` is `α ≥ 1/255 ∧ T ≥ 1e-4` and α is
+  clamped at 0.99, so counts ignore the α·T magnitude and a strong occluder
+  barely reduces them (verified by test).
+  Never consume `visibility_filter` (it is **indices**, not a bool mask); use
+  `radii[row] > 0`.
+- **Backend B (single-pass exact α·T, deferred).** `forward.cu` computes
+  per-pixel transmittance (`final_T`, lines 422-423) but discards it; a CUDA
+  export would fuse A″'s two passes into one. ABC stub `ExactAlphaTBackend`
+  raises `NotImplementedError`; only worth doing for speed, since A″ is
+  already exact.
 - Exact Jacobians already include alpha/compositing effects — **never multiply
   responsibility into exact FIMs** (double weighting). Responsibility is for
   gating, crop selection, and the proxy score only.

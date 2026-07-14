@@ -31,7 +31,7 @@ class CandidateConfig:
 
 @dataclass
 class VisibilityConfig:
-    backend: str = "metric_map"   # "metric_map" (A') | "exact_alpha_t" (B, stub)
+    backend: str = "color_probe"  # "color_probe" (A'') | "exact_alpha_t" (B, stub)
     min_responsibility: float = 1e-4
     max_occlusion_ratio: float = 0.95
     crop_margin_px: int = 8
@@ -151,7 +151,7 @@ class TargetNBVConfig:
             raise ValueError("projected radius bounds must satisfy min < desired < max")
         if self.candidates.min_distance <= 0 or self.candidates.max_distance <= self.candidates.min_distance:
             raise ValueError("require 0 < min_distance < max_distance")
-        if self.visibility.backend not in ("metric_map", "exact_alpha_t"):
+        if self.visibility.backend not in ("color_probe", "exact_alpha_t"):
             raise ValueError(f"unknown visibility backend {self.visibility.backend!r}")
         if self.mode in ("geometry_schur",) and not self.neighbors.enabled:
             raise ValueError("mode geometry_schur requires neighbors.enabled=true")
