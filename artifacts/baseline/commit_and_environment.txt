@@ -1,0 +1,31 @@
+=== Capture date: 2026-07-14T15:39:05+09:00 ===
+=== Git ===
+3abfeaaaef112ba9666b03993edf7d5a91fcaf74
+?? OSCD_Budgeted_View_Project_Context.md
+?? arguments/__pycache__/
+?? artifacts/
+?? data/PASLCD/
+?? dataloaders/__pycache__/
+?? gaussian_renderer/__pycache__/
+?? poses/__pycache__/
+?? scene/__pycache__/
+?? submodules/diff-gaussian-rasterization_fastgs/diff_gaussian_rasterization_fastgs.egg-info/
+?? submodules/simple-knn/build/
+=== OS ===
+Description:	Ubuntu 22.04.5 LTS
+6.8.0-111-generic
+=== GPU ===
+NVIDIA RTX A6000, 580.142, 46068 MiB
+=== CUDA (conda env toolkit) ===
+Build cuda_12.8.r12.8/compiler.35583870_0
+=== Python/PyTorch ===
+Python 3.12.13
+torch 2.11.0+cu128 | torch.cuda 12.8 | cudnn 91900
+=== gcc used for extensions ===
+x86_64-conda-linux-gnu-gcc (conda-forge gcc 13.4.0-19) 13.4.0
+=== Reference 3DGS PLY hashes (first 2 scenes) ===
+d2b6af864231922a6d7764217194e66f  data/PASLCD/Instance_1/Garden/reference_reconstruction/point_cloud/iteration_30000/point_cloud.ply
+99ec2a51c9845f9abda97dd8a21c927e  data/PASLCD/Instance_1/Cantina/reference_reconstruction/point_cloud/iteration_30000/point_cloud.ply
+=== Dataset ===
+20/20 instances verified: 25 inference + 25 gt_mask each, ref images 50-109, all iteration_30000 PLYs present (see source_map.md)
+15G	data/PASLCD

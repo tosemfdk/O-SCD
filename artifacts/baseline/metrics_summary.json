@@ -1,0 +1,15 @@
+{
+  "miou_online": 0.4887168899178505,
+  "f1_online": 0.6423261016607285,
+  "miou_refined": 0.5573211729526519,
+  "f1_refined": 0.7008867025375366,
+  "n_instances": 20,
+  "paper_online": {
+    "miou": 0.486,
+    "f1": 0.638
+  },
+  "paper_offline": {
+    "miou": 0.552,
+    "f1": 0.694
+  }
+}

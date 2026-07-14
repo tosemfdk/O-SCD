@@ -1,0 +1,5 @@
+bash run_oscd.sh
+# equivalent per scene:
+# python oscd.py -s data/PASLCD/<Instance>/<Scene>/ -m output/<Instance>/<Scene>/ --resolution 4 --test_hold 5 --refine
+# python utils/evaluate.py --gt data/PASLCD/<Instance>/<Scene>/gt_mask/ --pred_binary output/<Instance>/<Scene>/renders/change_mask/
+# python utils/evaluate.py --gt data/PASLCD/<Instance>/<Scene>/gt_mask/ --pred_binary output/<Instance>/<Scene>/renders/change_mask_refined/
