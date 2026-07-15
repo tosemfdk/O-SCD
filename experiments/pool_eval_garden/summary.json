@@ -1,0 +1,92 @@
+{
+  "n_targets": 10,
+  "pool_size": 25,
+  "budget": 5,
+  "mean_visibility_s": 0.0022574564470348624,
+  "mean_jacobian_s": 0.018461777494659336,
+  "n_jacobians": 182,
+  "proxy_exact_kendall_tau": 0.3805790037292707,
+  "proxy_exact_top1_agreement": 0.28888888888888886,
+  "config": {
+    "mode": "geometry_exact",
+    "seed": 7,
+    "parameter_groups": [
+      "mean",
+      "log_scale"
+    ],
+    "candidates": {
+      "sampling": "fibonacci_sphere",
+      "count": 128,
+      "radius_shells": [
+        0.75,
+        1.0,
+        1.5
+      ],
+      "desired_projected_radius_px": 24.0,
+      "min_projected_radius_px": 4.0,
+      "max_projected_radius_px": 96.0,
+      "min_distance": 0.1,
+      "max_distance": 10.0,
+      "hemisphere_from_normal": false,
+      "jitter": 0.0
+    },
+    "visibility": {
+      "backend": "color_probe",
+      "min_responsibility": 0.0001,
+      "max_occlusion_ratio": 0.95,
+      "crop_margin_px": 8,
+      "reject_fully_occluded": true
+    },
+    "proxy": {
+      "enabled": true,
+      "top_k": 12,
+      "uses_visibility": true,
+      "responsibility_normalization": "percentile90"
+    },
+    "jacobian": {
+      "backend": "finite_difference",
+      "exact_top_k": 8,
+      "mean_epsilon_rel": 0.01,
+      "log_scale_epsilon": 0.02,
+      "fixed_crop": true,
+      "separate_rgb_channels": true
+    },
+    "information": {
+      "absolute_damping": 1e-06,
+      "relative_damping": 1e-06,
+      "max_jitter": 0.01
+    },
+    "scoring": {
+      "d_weight": 1.0,
+      "trace_weight": 0.0,
+      "e_weight": 0.0,
+      "movement_weight": 0.0,
+      "translation_scale": 1.0,
+      "rotation_weight": 1.0
+    },
+    "neighbors": {
+      "enabled": false,
+      "max_neighbors": 4,
+      "selection": "covisibility_then_distance",
+      "neighbor_damping": 1e-05,
+      "fallback_to_target_only": true
+    },
+    "change": {
+      "fisher_enabled": false,
+      "beta_enabled": false,
+      "beta_prior_a": 1.0,
+      "beta_prior_b": 1.0,
+      "pseudo_count_scale": 1.0
+    },
+    "stopping": {
+      "minimum_predicted_gain": 0.0001,
+      "max_views": 10
+    },
+    "debug": {
+      "save_renders": true,
+      "save_responsibility_maps": false,
+      "save_candidate_table": true,
+      "verify_model_restoration": true
+    }
+  }
+}
