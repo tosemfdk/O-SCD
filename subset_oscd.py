@@ -85,8 +85,10 @@ def parse_args_subset():
     parser.add_argument('--iters_miniba_incr', type=int, default=20)
     # Selection args
     parser.add_argument('--frames_method', type=str, default='all',
-                        choices=['all', 'random', 'uniform', 'nbv', 'nbv_dopt'],
+                        choices=['all', 'random', 'uniform', 'nbv', 'nbv_dopt', 'manual'],
                         help="How to select which inference frames update R_change")
+    parser.add_argument('--frames_list', type=str, default='',
+                        help="manual: comma-separated image names (no extension) or indices")
     parser.add_argument('--nbv_dopt_damping', type=float, default=1.0,
                         help="nbv_dopt: prior damping of the per-Gaussian 3x3 H_g")
     parser.add_argument('--budget', type=int, default=-1,
@@ -137,8 +139,8 @@ def main(dataset: Namespace, opt: Namespace, pipe: Namespace, args: Namespace):
 
     reference_dataset = ImageDataset(args, instance='ref')
 
-    if args.frames_method in ("nbv", "nbv_dopt"):
-        selected = []  # chosen adaptively in Phase B
+    if args.frames_method in ("nbv", "nbv_dopt", "manual"):
+        selected = []  # nbv*: chosen adaptively; manual: resolved after Phase A
     else:
         selected = select_frames(args.frames_method, len(dataset), args.budget, args.select_seed)
 
@@ -245,9 +247,23 @@ def main(dataset: Namespace, opt: Namespace, pipe: Namespace, args: Namespace):
         all_views.append(view)
     pbar_pose.close()
 
+    if args.frames_method == "manual":
+        req = [s.strip() for s in args.frames_list.split(",") if s.strip()]
+        assert req, "manual needs --frames_list (image names without extension, or indices)"
+        name_to_idx = {v.image_name: i for i, v in enumerate(all_views)}
+        selected = []
+        for r in req:
+            if r in name_to_idx:
+                selected.append(name_to_idx[r])
+            elif r.isdigit() and int(r) < len(all_views):
+                selected.append(int(r))
+            else:
+                raise ValueError(f"unknown frame {r!r}; known: {sorted(name_to_idx)}")
+        selected = sorted(set(selected))
+
     # ---- Phase B: process the selected frames (cue + 16 fusion iterations).
-    # Static methods (uniform/random/all) process their precomputed set in
-    # chronological order; nbv picks the next frame adaptively.
+    # Static methods (uniform/random/all/manual) process their precomputed set
+    # in chronological order; nbv picks the next frame adaptively.
     def process_view(view, pbar_inf):
         nonlocal total_iterations, ema_loss_for_log
         with torch.no_grad():
