@@ -85,8 +85,10 @@ def parse_args_subset():
     parser.add_argument('--iters_miniba_incr', type=int, default=20)
     # Selection args
     parser.add_argument('--frames_method', type=str, default='all',
-                        choices=['all', 'random', 'uniform', 'nbv'],
+                        choices=['all', 'random', 'uniform', 'nbv', 'nbv_dopt'],
                         help="How to select which inference frames update R_change")
+    parser.add_argument('--nbv_dopt_damping', type=float, default=1.0,
+                        help="nbv_dopt: prior damping of the per-Gaussian 3x3 H_g")
     parser.add_argument('--budget', type=int, default=-1,
                         help="Number of update frames K (ignored for method=all)")
     parser.add_argument('--select_seed', type=int, default=0,
@@ -135,7 +137,7 @@ def main(dataset: Namespace, opt: Namespace, pipe: Namespace, args: Namespace):
 
     reference_dataset = ImageDataset(args, instance='ref')
 
-    if args.frames_method == "nbv":
+    if args.frames_method in ("nbv", "nbv_dopt"):
         selected = []  # chosen adaptively in Phase B
     else:
         selected = select_frames(args.frames_method, len(dataset), args.budget, args.select_seed)
@@ -314,28 +316,40 @@ def main(dataset: Namespace, opt: Namespace, pipe: Namespace, args: Namespace):
             change_mask = (change_mask > 0.5).float()
             change_masks[view.image_name] = change_mask
 
-    if args.frames_method == "nbv":
-        # Adaptive: each round, render the change model with per-Gaussian
-        # weights w_g = unit Beta-EIG (one probe render per remaining frame;
-        # uses ONLY poses + current change state, never a frame's RGB/cue) and
-        # process the frame that sees the most undecided change mass. After
-        # processing, commit exact responsibility-weighted soft counts of the
-        # OBSERVED cue to the Beta state.
+    if args.frames_method in ("nbv", "nbv_dopt"):
+        # Adaptive selection (uses ONLY poses + current change state, never a
+        # candidate frame's RGB/cue).
+        #   nbv:      direction-blind — one Beta-EIG-weighted probe render per
+        #             remaining frame, pick the most undecided change mass.
+        #   nbv_dopt: direction-aware — per-Gaussian 3x3 mean-block D-opt gain
+        #             with the (I - r r^T)/d^2 viewing-geometry FIM, Beta
+        #             ambiguity as weights (joint geometry x change mode).
+        # After processing, exact responsibility-weighted soft counts of the
+        # OBSERVED cue update the Beta state (and H_g for nbv_dopt).
         from target_nbv.change.beta_state import BetaChangeState
         from target_nbv.change.counts import responsibility_probe_render, soft_counts
+        from target_nbv.change.dopt_scorer import DoptFrameState
 
         assert 0 < args.budget <= len(all_views), "nbv needs --budget in [1, n_frames]"
         beta = BetaChangeState(gaussians_change.get_xyz.shape[0],
                                pseudo_count_scale=args.nbv_count_scale)
+        dopt = (DoptFrameState(gaussians_change.get_xyz.shape[0],
+                               damping=args.nbv_dopt_damping)
+                if args.frames_method == "nbv_dopt" else None)
         remaining = list(range(len(all_views)))
         selected = []
-        pbar_inf = tqdm(range(args.budget), desc=f"Running OSCD subset (nbv, K={args.budget})")
+        pbar_inf = tqdm(range(args.budget),
+                        desc=f"Running OSCD subset ({args.frames_method}, K={args.budget})")
         for _ in pbar_inf:
             with torch.no_grad():
                 w = beta.unit_eig().float()
                 w = w / max(float(w.max()), 1e-12)
-                scores = {i: float(responsibility_probe_render(
-                              gaussians_change, all_views[i], w, pipe).sum())
+                if dopt is None:
+                    scores = {i: float(responsibility_probe_render(
+                                  gaussians_change, all_views[i], w, pipe).sum())
+                              for i in remaining}
+            if dopt is not None:  # needs autograd for the tau adjoint
+                scores = {i: dopt.score_frame(gaussians_change, all_views[i], w, pipe)
                           for i in remaining}
             pick = max(scores, key=scores.get)
             remaining.remove(pick)
@@ -345,9 +359,13 @@ def main(dataset: Namespace, opt: Namespace, pipe: Namespace, args: Namespace):
             grown = gaussians_change.get_xyz.shape[0] - len(beta)
             if grown > 0:  # densify clone/split during fusion
                 beta.append(grown)
+                if dopt is not None:
+                    dopt.append(grown)
             M = all_views[pick].candidate_map.squeeze(0).clamp(0.0, 1.0)
-            e1, e0, _ = soft_counts(gaussians_change, all_views[pick], M, pipe)
+            e1, e0, tau = soft_counts(gaussians_change, all_views[pick], M, pipe)
             beta.update(e1, e0)
+            if dopt is not None:
+                dopt.commit(gaussians_change, all_views[pick], tau)
         pbar_inf.close()
         processing_order = list(selected)
         selected = sorted(selected)

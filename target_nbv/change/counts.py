@@ -52,6 +52,24 @@ def responsibility_probe_render(model, cam, weights: torch.Tensor, pipe) -> torc
     return out.mean(dim=0)
 
 
+def responsibilities(model, cam, pipe) -> torch.Tensor:
+    """Per-Gaussian total responsibility tau_g = sum_p r_g,p at this camera,
+    for ALL Gaussians in one render + one backward. float64 (N,)."""
+    from gaussian_renderer import render
+
+    n = model.get_xyz.shape[0]
+    device = model.get_xyz.device
+    dc = torch.zeros((n, 1, 3), device=device, requires_grad=True)
+    bg = torch.zeros(3, device=device)
+    pkg = render(cam, _make_probe(model, dc), pipe, bg)
+    if not (pkg["radii"] > 0).any():
+        # nothing rendered: fastgs backward with num_rendered==0 launches an
+        # invalid (size-0) kernel and poisons the CUDA context — skip it
+        return torch.zeros(n, dtype=torch.float64, device=device)
+    g = torch.autograd.grad(pkg["render"].mean(dim=0).sum(), dc)[0]
+    return (g.sum(dim=(1, 2)) / SH_C0).double().clamp_min(0.0)
+
+
 def soft_counts(model, cam, soft_mask: torch.Tensor, pipe):
     """Exact per-Gaussian soft counts against a change mask, via the adjoint.
 
@@ -65,7 +83,11 @@ def soft_counts(model, cam, soft_mask: torch.Tensor, pipe):
     device = model.get_xyz.device
     dc = torch.zeros((n, 1, 3), device=device, requires_grad=True)  # color 0.5
     bg = torch.zeros(3, device=device)
-    out = render(cam, _make_probe(model, dc), pipe, bg)["render"].mean(dim=0)
+    pkg = render(cam, _make_probe(model, dc), pipe, bg)
+    out = pkg["render"].mean(dim=0)
+    if not (pkg["radii"] > 0).any():  # see responsibilities(): size-0 backward
+        z = torch.zeros(n, dtype=torch.float64, device=device)
+        return z, z.clone(), z.clone()
 
     M = soft_mask.detach().to(device=device, dtype=out.dtype).clamp(0.0, 1.0)
     if M.shape != out.shape:
