@@ -2,13 +2,18 @@
 # Mirror of oscd.py with budgeted frame selection; oscd.py itself stays frozen.
 #
 # Differences vs oscd.py, and nothing else:
-#   * --frames_method {all,random,uniform} --budget K --select_seed S select which
-#     inference frames update R_change. Selection uses its own RandomState so the
-#     global RNG stream is untouched; with --frames_method all the update path is
-#     call-for-call identical to oscd.py (reproduces the frozen baseline).
-#   * Frames are always processed in chronological (sorted-filename) order.
-#     Pose estimation runs for every frame (needed for query-view evaluation);
-#     change cues and fusion updates run only for selected frames.
+#   * --frames_method {all,random,uniform,nbv} --budget K --select_seed S select
+#     which inference frames update R_change. Selection uses its own RandomState
+#     so the global RNG stream is untouched.
+#   * Two-phase since Gate H: Phase A estimates poses for ALL frames, Phase B
+#     processes the selected frames (static methods in chronological order; nbv
+#     adaptively — each round a Beta-EIG-weighted probe render scores every
+#     remaining pose and the frame seeing the most undecided change mass is
+#     processed next; selection uses only poses + current change state, never a
+#     candidate frame's RGB/cue). NOTE: the two-phase split reorders global RNG
+#     consumption vs the pre-Gate-H interleaved loop, so masks are not bitwise
+#     comparable with the old garden_sweep_results.csv rows — rerun baselines
+#     within the same protocol when comparing selectors.
 #   * Outputs: renders/change_mask/ holds online masks for selected frames only
 #     (selected-view eval); renders/query_mask/ holds masks rendered from the
 #     final R_change at all inference poses (all-query-view eval). Held-out RGB
@@ -80,12 +85,14 @@ def parse_args_subset():
     parser.add_argument('--iters_miniba_incr', type=int, default=20)
     # Selection args
     parser.add_argument('--frames_method', type=str, default='all',
-                        choices=['all', 'random', 'uniform'],
+                        choices=['all', 'random', 'uniform', 'nbv'],
                         help="How to select which inference frames update R_change")
     parser.add_argument('--budget', type=int, default=-1,
                         help="Number of update frames K (ignored for method=all)")
     parser.add_argument('--select_seed', type=int, default=0,
                         help="Seed for the random selector (independent of global RNG)")
+    parser.add_argument('--nbv_count_scale', type=float, default=0.05,
+                        help="nbv: Beta pseudo-count scale for responsibility counts")
 
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
@@ -128,8 +135,10 @@ def main(dataset: Namespace, opt: Namespace, pipe: Namespace, args: Namespace):
 
     reference_dataset = ImageDataset(args, instance='ref')
 
-    selected = select_frames(args.frames_method, len(dataset), args.budget, args.select_seed)
-    selected_set = set(selected)
+    if args.frames_method == "nbv":
+        selected = []  # chosen adaptively in Phase B
+    else:
+        selected = select_frames(args.frames_method, len(dataset), args.budget, args.select_seed)
 
     max_error = max(args.match_max_error * width, 1.5)
     matcher = Matcher(args.fundmat_samples, max_error)
@@ -207,10 +216,11 @@ def main(dataset: Namespace, opt: Namespace, pipe: Namespace, args: Namespace):
         with torch.no_grad():
             candidate_map = generate_candidate_map(dummy_image, dummy_image, model, patch_size, height, width)
 
-    pbar_inf = tqdm(range(0, len(dataset)), desc=f"Running OSCD subset ({args.frames_method}, K={len(selected)})")
-
-    for frameID in pbar_inf:
-
+    # ---- Phase A: pose estimation for EVERY frame (needed for query-view
+    # evaluation and for candidate scoring; the frame's change cue is NOT
+    # computed here, so unprocessed frames contribute pose only).
+    pbar_pose = tqdm(range(0, len(dataset)), desc="Estimating poses")
+    for frameID in pbar_pose:
         image, info = dataset.getnext()
         desc_kpts = detector(image)
         prev_keyframes = get_reference_keyframes(
@@ -231,10 +241,13 @@ def main(dataset: Namespace, opt: Namespace, pipe: Namespace, args: Namespace):
 
         cam_centers.append(view.camera_center)
         all_views.append(view)
+    pbar_pose.close()
 
-        if frameID not in selected_set:
-            continue
-
+    # ---- Phase B: process the selected frames (cue + 16 fusion iterations).
+    # Static methods (uniform/random/all) process their precomputed set in
+    # chronological order; nbv picks the next frame adaptively.
+    def process_view(view, pbar_inf):
+        nonlocal total_iterations, ema_loss_for_log
         with torch.no_grad():
             render_pkg = render(view, gaussians_rgb, pipe, background)
             image_rgb = render_pkg["render"]
@@ -301,7 +314,49 @@ def main(dataset: Namespace, opt: Namespace, pipe: Namespace, args: Namespace):
             change_mask = (change_mask > 0.5).float()
             change_masks[view.image_name] = change_mask
 
-    pbar_inf.close()
+    if args.frames_method == "nbv":
+        # Adaptive: each round, render the change model with per-Gaussian
+        # weights w_g = unit Beta-EIG (one probe render per remaining frame;
+        # uses ONLY poses + current change state, never a frame's RGB/cue) and
+        # process the frame that sees the most undecided change mass. After
+        # processing, commit exact responsibility-weighted soft counts of the
+        # OBSERVED cue to the Beta state.
+        from target_nbv.change.beta_state import BetaChangeState
+        from target_nbv.change.counts import responsibility_probe_render, soft_counts
+
+        assert 0 < args.budget <= len(all_views), "nbv needs --budget in [1, n_frames]"
+        beta = BetaChangeState(gaussians_change.get_xyz.shape[0],
+                               pseudo_count_scale=args.nbv_count_scale)
+        remaining = list(range(len(all_views)))
+        selected = []
+        pbar_inf = tqdm(range(args.budget), desc=f"Running OSCD subset (nbv, K={args.budget})")
+        for _ in pbar_inf:
+            with torch.no_grad():
+                w = beta.unit_eig().float()
+                w = w / max(float(w.max()), 1e-12)
+                scores = {i: float(responsibility_probe_render(
+                              gaussians_change, all_views[i], w, pipe).sum())
+                          for i in remaining}
+            pick = max(scores, key=scores.get)
+            remaining.remove(pick)
+            selected.append(pick)
+            process_view(all_views[pick], pbar_inf)
+
+            grown = gaussians_change.get_xyz.shape[0] - len(beta)
+            if grown > 0:  # densify clone/split during fusion
+                beta.append(grown)
+            M = all_views[pick].candidate_map.squeeze(0).clamp(0.0, 1.0)
+            e1, e0, _ = soft_counts(gaussians_change, all_views[pick], M, pipe)
+            beta.update(e1, e0)
+        pbar_inf.close()
+        processing_order = list(selected)
+        selected = sorted(selected)
+    else:
+        pbar_inf = tqdm(selected, desc=f"Running OSCD subset ({args.frames_method}, K={len(selected)})")
+        for frameID in pbar_inf:
+            process_view(all_views[frameID], pbar_inf)
+        pbar_inf.close()
+        processing_order = list(selected)
 
     for key in change_masks:
         cv2.imwrite(os.path.join(renders_path, "change_mask", f"{key}.png"), (change_masks[key].cpu().numpy() * 255).astype(np.uint8))
@@ -320,7 +375,7 @@ def main(dataset: Namespace, opt: Namespace, pipe: Namespace, args: Namespace):
             "frames_method": args.frames_method,
             "budget": len(selected),
             "select_seed": args.select_seed,
-            "processing_order": "chronological",
+            "processing_order": processing_order,
             "selected_indices": selected,
             "selected_names": [all_views[i].image_name for i in selected],
         }, f, indent=4)

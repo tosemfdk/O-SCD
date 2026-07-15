@@ -48,8 +48,11 @@ def test_full_mask_puts_everything_in_e1():
     cam, pipe = simple_cam(distance=2.0), make_pipe()
     M = torch.ones((cam.image_height, cam.image_width), device="cuda")
     e1, e0, tau = soft_counts(model, cam, M, pipe)
-    assert torch.allclose(e1, tau, atol=1e-6)
-    assert float(e0.abs().max()) < 1e-6
+    # e1 and tau come from two separate CUDA backward passes; atomics make
+    # them agree only to float precision, not bitwise
+    rel = 1e-4 * max(float(tau.max()), 1.0)
+    assert torch.allclose(e1, tau, atol=rel)
+    assert float(e0.abs().max()) < rel
 
 
 def test_weighted_probe_one_hot_equals_responsibility():
