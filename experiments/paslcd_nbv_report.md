@@ -66,8 +66,30 @@ Reuse existing verified pieces, no new machinery:
    - logdet H_g], w_g = Beta ambiguity weight.
 "Look again, from a different angle, at what looks changed but unconfirmed."
 
+## 5. nbv_dopt iteration (direction-aware, 2026-07-15 later)
+
+| config | mIoU mean | mIoU min | vs uniform | W/T/L vs uniform |
+|---|---|---|---|---|
+| nbv_dopt@3 | 0.4273 | 0.2207 | −0.031 | 4/0/6 |
+| nbv_dopt@5 | 0.4688 | 0.2858 | −0.024 | 3/0/7 |
+
+- **The diagnosis was confirmed where it was made**: Porch — nbv's worst scene
+  (−0.11/−0.13 vs uniform) — flipped to nbv_dopt's best (+0.121/+0.080;
+  0.2645→0.4976 at K=3). K=5 mean improved +0.015 over nbv, min 0.248→0.286.
+- **But a new failure appeared**: Zen collapsed (0.2207 at K=3, −0.288 vs
+  uniform; Cantina −0.131). Suspected proximity bias: the 1/d² factor makes
+  close-up views dominate the score while contributing narrow cues.
+- **Benchmark noise discovery**: scene-level variance is far larger than the
+  ±0.005 Garden estimate. Zen uniform@5 (0.4252) < uniform@3 (0.5091);
+  random seeds span ±0.09 within one scene-budget. Runs are deterministic
+  (global seed 0), so this is chaotic sensitivity of the fusion/densify path
+  to the selected set — single-run scene comparisons carry ~±0.05-0.1 noise,
+  and only multi-scene aggregates are meaningful. Instance_1-only means each
+  mean is 10 samples of that noise.
+
 ## Caveats
 
-- Instance_1 only (10 scenes); Instance_2 not run. nbv deterministic (1 run/K).
+- Instance_1 only (10 scenes); Instance_2 not run (resumable). nbv/nbv_dopt
+  deterministic (1 run/K).
 - selection.json audit shows nbv picks are spatially spread, not clustered —
   the failure is what it optimizes, not a degenerate pick pattern.
