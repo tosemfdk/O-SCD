@@ -1,0 +1,26 @@
+{
+    "frames_method": "random",
+    "budget": 5,
+    "select_seed": 2,
+    "processing_order": [
+        0,
+        6,
+        14,
+        17,
+        23
+    ],
+    "selected_indices": [
+        0,
+        6,
+        14,
+        17,
+        23
+    ],
+    "selected_names": [
+        "Inst_1_test_IMG_E7225",
+        "Inst_1_test_IMG_E7239",
+        "Inst_1_test_IMG_E7258",
+        "Inst_1_test_IMG_E7265",
+        "Inst_1_test_IMG_E7277"
+    ]
+}

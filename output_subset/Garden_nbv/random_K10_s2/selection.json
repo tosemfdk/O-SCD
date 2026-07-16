@@ -1,0 +1,41 @@
+{
+    "frames_method": "random",
+    "budget": 10,
+    "select_seed": 2,
+    "processing_order": [
+        0,
+        3,
+        6,
+        9,
+        12,
+        14,
+        16,
+        17,
+        22,
+        23
+    ],
+    "selected_indices": [
+        0,
+        3,
+        6,
+        9,
+        12,
+        14,
+        16,
+        17,
+        22,
+        23
+    ],
+    "selected_names": [
+        "Inst_1_test_IMG_E7225",
+        "Inst_1_test_IMG_E7233",
+        "Inst_1_test_IMG_E7239",
+        "Inst_1_test_IMG_E7245",
+        "Inst_1_test_IMG_E7252",
+        "Inst_1_test_IMG_E7258",
+        "Inst_1_test_IMG_E7262",
+        "Inst_1_test_IMG_E7265",
+        "Inst_1_test_IMG_E7276",
+        "Inst_1_test_IMG_E7277"
+    ]
+}

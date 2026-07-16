@@ -1,0 +1,20 @@
+{
+    "frames_method": "nbv_dopt",
+    "budget": 3,
+    "select_seed": 0,
+    "processing_order": [
+        13,
+        10,
+        3
+    ],
+    "selected_indices": [
+        3,
+        10,
+        13
+    ],
+    "selected_names": [
+        "Inst_1_test_IMG_E2792",
+        "Inst_1_test_IMG_E2813",
+        "Inst_1_test_IMG_E2821"
+    ]
+}

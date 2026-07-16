@@ -1,0 +1,26 @@
+{
+    "frames_method": "uniform",
+    "budget": 5,
+    "select_seed": 0,
+    "processing_order": [
+        0,
+        6,
+        12,
+        18,
+        24
+    ],
+    "selected_indices": [
+        0,
+        6,
+        12,
+        18,
+        24
+    ],
+    "selected_names": [
+        "Inst_1_test_IMG_3838",
+        "Inst_1_test_IMG_3852",
+        "Inst_1_test_IMG_3861",
+        "Inst_1_test_IMG_3872",
+        "Inst_1_test_IMG_3882"
+    ]
+}
