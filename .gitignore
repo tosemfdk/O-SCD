@@ -1,1 +1,8 @@
 __pycache__/
+
+# Local datasets and generated experiment outputs
+/data/PASLCD
+/experiments/all25_repeats.csv
+/experiments/oracle_search_results.csv
+/output_subset/**
+!/output_subset/.gitkeep
