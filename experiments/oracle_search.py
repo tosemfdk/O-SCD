@@ -3,8 +3,8 @@
 # Phase A: the proper uniform@5 reference — all 5 stride-5 offset variants
 #   ([o, o+5, o+10, o+15, o+20], o = 0..4) per scene, averaged.
 # Phase B: random 5-subsets, scenes round-robin, one combo at a time. STOP as
-#   soon as a combo beats its scene's uniform mean by >= --hit-margin (default
-#   0.05 = one scene-noise band) on all-query-view mIoU, and report it.
+#   soon as a combo beats its scene's uniform mean by >= --hit-margin-rel
+#   (default 10% RELATIVE) on all-query-view mIoU, and report it.
 #
 # Every run goes through subset_oscd.py --frames_method manual (index list),
 # query_mask evaluated at ALL 25 poses vs all 25 GT masks. Resumable: results
@@ -79,7 +79,8 @@ def record(scene: str, phase: str, combo: tuple[int, ...], miou: float, f1: floa
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--max-combos", type=int, default=300)
-    ap.add_argument("--hit-margin", type=float, default=0.05)
+    ap.add_argument("--hit-margin-rel", type=float, default=0.10,
+                    help="report when combo mIoU >= (1 + margin) * scene uniform mean")
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
 
@@ -124,14 +125,14 @@ def main():
         record(scene, "random", combo, *res)
         done[(scene, "-".join(map(str, combo)))] = res
         ref = float(np.mean(uni[scene]))
-        delta = res[0] - ref
+        rel = res[0] / ref - 1.0
         print(f"[B {time.time()-t0:5.0f}s #{tried}] {scene} {combo}: "
-              f"mIoU {res[0]:.4f} (uniform ref {ref:.4f}, d={delta:+.4f})", flush=True)
-        if delta >= args.hit_margin:
+              f"mIoU {res[0]:.4f} (uniform ref {ref:.4f}, {rel:+.1%})", flush=True)
+        if rel >= args.hit_margin_rel:
             print(f"\nHIT: {scene} combo {combo} mIoU {res[0]:.4f} beats uniform "
-                  f"mean {ref:.4f} by {delta:+.4f} (margin {args.hit_margin})", flush=True)
+                  f"mean {ref:.4f} by {rel:+.1%} (margin {args.hit_margin_rel:.0%})", flush=True)
             return 0
-    print(f"\nNO HIT after {tried} random combos (margin {args.hit_margin})", flush=True)
+    print(f"\nNO HIT after {tried} random combos (margin {args.hit_margin_rel:.0%})", flush=True)
     return 2
 
 
