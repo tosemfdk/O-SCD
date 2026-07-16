@@ -6,3 +6,4 @@ __pycache__/
 /experiments/oracle_search_results.csv
 /output_subset/**
 !/output_subset/.gitkeep
+/experiments/frame_features.csv
