@@ -1,14 +1,16 @@
-# Oracle-5 map via local search (user-directed design, 2026-07-16).
+# Oracle-5 map via local search (user-directed design, 2026-07-16, rev 2).
 #
-# Per Instance_1 scene: seed = the BEST stride-5 uniform offset combo (coarse
-# solution from oracle_search.py Phase A), then hill-climb by swapping 1-3
-# frames per step. Stop the scene early on a HIT:
-#     mIoU >= 1.10 * max(best uniform offset, all-25)
-# (simultaneously >=10% over both references), else after --per-scene evals.
+# Phase 0: all-25 is itself nondeterministic (cuda benchmark + atomics), so
+#   run it 5x per scene and use the MEAN as the reference.
+# Search, per Instance_1 scene: seed = the BEST stride-5 uniform offset combo
+#   (from oracle_search.py Phase A), hill-climb by swapping 1-3 frames per
+#   step; any improvement becomes the new mutation center. Scene stops on HIT:
+#     mIoU >= 1.10 * uniform_best  AND  mIoU >= mean(all-25 x5)
+#   or after --per-scene evals (default 30).
 # Everything is appended to experiments/oracle_search_results.csv (phase
 # "local"), giving the oracle-5 map for later "what makes a good set" analysis.
 #
-#   python experiments/oracle_local_search.py --per-scene 100
+#   python experiments/oracle_local_search.py --per-scene 30
 
 from __future__ import annotations
 
@@ -24,11 +26,69 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from oracle_search import (CSV_PATH, N_FRAMES, K, REPO, SCENES,  # noqa: E402
                            load_done, record, run_combo)
 
-PASLCD_CSV = os.path.join(REPO, "experiments", "paslcd_nbv_results.csv")
+ALL25_CSV = os.path.join(REPO, "experiments", "all25_repeats.csv")
+
+
+def run_all25(scene: str, rep: int) -> tuple[float, float] | None:
+    """One all-25 run (frames_method=all), evaluated on query_mask."""
+    import re
+    import shutil
+    import subprocess
+    out_dir = os.path.join(REPO, "output_subset", "oracle", scene, f"all25_rep{rep}")
+    src = os.path.join(REPO, "data", "PASLCD", "Instance_1", scene)
+    env = {**os.environ, "PYTHONPATH": ""}
+    r = subprocess.run(
+        [sys.executable, os.path.join(REPO, "subset_oscd.py"),
+         "-s", src + "/", "-m", out_dir + "/",
+         "--resolution", "4", "--test_hold", "5", "--frames_method", "all"],
+        capture_output=True, text=True, env=env, cwd=REPO)
+    if r.returncode != 0:
+        print(f"ALL25 FAILED {scene} rep{rep}: {r.stderr[-300:]}", flush=True)
+        return None
+    ev = subprocess.run(
+        [sys.executable, os.path.join(REPO, "utils", "evaluate.py"),
+         "--gt", os.path.join(src, "gt_mask") + "/",
+         "--pred_binary", os.path.join(out_dir, "renders", "query_mask") + "/"],
+        capture_output=True, text=True, env=env, cwd=REPO)
+    m = re.search(r"Mean IoU: ([0-9.]+).*Mean F1: ([0-9.]+)", ev.stdout, re.S)
+    shutil.rmtree(out_dir, ignore_errors=True)
+    if not m:
+        print(f"ALL25 EVAL FAILED {scene} rep{rep}", flush=True)
+        return None
+    return float(m.group(1)), float(m.group(2))
+
+
+def all25_means(reps: int, t0: float) -> dict[str, float]:
+    """Mean all-25 mIoU per scene over `reps` runs, cached in ALL25_CSV."""
+    done: dict[str, list[float]] = {s: [] for s in SCENES}
+    if os.path.exists(ALL25_CSV):
+        for r in csv.DictReader(open(ALL25_CSV)):
+            done[r["scene"]].append(float(r["miou_query"]))
+    for scene in SCENES:
+        while len(done[scene]) < reps:
+            rep = len(done[scene])
+            res = run_all25(scene, rep)
+            if res is None:
+                continue
+            new = not os.path.exists(ALL25_CSV)
+            with open(ALL25_CSV, "a", newline="") as f:
+                w = csv.writer(f)
+                if new:
+                    w.writerow(["scene", "rep", "miou_query", "f1_query"])
+                w.writerow([scene, rep, f"{res[0]:.6f}", f"{res[1]:.6f}"])
+            done[scene].append(res[0])
+            print(f"[0 {time.time()-t0:5.0f}s] all25 {scene} rep{rep}: {res[0]:.4f}", flush=True)
+    out = {}
+    for scene in SCENES:
+        v = np.array(done[scene][:reps])
+        out[scene] = float(v.mean())
+        print(f"  all25 {scene:15s}: {v.mean():.4f} +- {v.std():.4f}  {np.round(v,4).tolist()}",
+              flush=True)
+    return out
 
 
 def load_references():
-    """(uniform_best[scene], uniform_best_combo[scene], all25[scene])."""
+    """(uniform_best[scene], uniform_best_combo[scene]) from Phase A results."""
     done = load_done()
     uni_best, uni_combo = {}, {}
     offsets = {"-".join(map(str, range(o, N_FRAMES, 5))) for o in range(5)}
@@ -36,14 +96,10 @@ def load_references():
         if combo in offsets and (scene not in uni_best or miou > uni_best[scene]):
             uni_best[scene] = miou
             uni_combo[scene] = tuple(int(x) for x in combo.split("-"))
-    all25 = {}
-    for r in csv.DictReader(open(PASLCD_CSV)):
-        if r["method"] == "all" and r["scene"].startswith("Instance_1/"):
-            all25[r["scene"].split("/", 1)[1]] = float(r["miou_query"])
-    missing = [s for s in SCENES if s not in uni_best or s not in all25]
+    missing = [s for s in SCENES if s not in uni_best]
     if missing:
-        raise RuntimeError(f"missing references for {missing}; run oracle_search.py Phase A first")
-    return uni_best, uni_combo, all25
+        raise RuntimeError(f"missing uniform references for {missing}; run oracle_search.py Phase A first")
+    return uni_best, uni_combo
 
 
 def mutate(combo: tuple[int, ...], m: int, rng) -> tuple[int, ...]:
@@ -58,19 +114,23 @@ def mutate(combo: tuple[int, ...], m: int, rng) -> tuple[int, ...]:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--per-scene", type=int, default=100)
-    ap.add_argument("--hit-margin-rel", type=float, default=0.10)
+    ap.add_argument("--per-scene", type=int, default=30)
+    ap.add_argument("--hit-margin-rel", type=float, default=0.10,
+                    help="relative margin over uniform_best (all-25 mean must merely be reached)")
+    ap.add_argument("--all25-reps", type=int, default=5)
     ap.add_argument("--seed", type=int, default=7)
     args = ap.parse_args()
 
-    uni_best, uni_combo, all25 = load_references()
     rng = np.random.default_rng(args.seed)
     t0 = time.time()
+    uni_best, uni_combo = load_references()
+    all25 = all25_means(args.all25_reps, t0)
     summary = {}
 
     for scene in SCENES:
         done = load_done()
-        target = (1.0 + args.hit_margin_rel) * max(uni_best[scene], all25[scene])
+        # HIT: >=10% over uniform_best AND at least the (mean) all-25 level
+        target = max((1.0 + args.hit_margin_rel) * uni_best[scene], all25[scene])
         # scene-best over everything already evaluated (seed included)
         best_combo, best = uni_combo[scene], uni_best[scene]
         for (sc, c), (miou, _) in done.items():
@@ -101,7 +161,7 @@ def main():
                   f"{combo}: {res[0]:.4f} (best {best:.4f}){marker}", flush=True)
             if res[0] >= target:
                 print(f"HIT {scene}: combo {combo} mIoU {res[0]:.4f} >= "
-                      f"{target:.4f} (+10% over uniform_best AND all-25)", flush=True)
+                      f"{target:.4f} (+10% over uniform_best AND >= all-25 mean)", flush=True)
                 hit = True
                 break
         summary[scene] = (best_combo, best, hit, evals)
