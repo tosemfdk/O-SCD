@@ -1,0 +1,26 @@
+{
+    "frames_method": "manual",
+    "budget": 5,
+    "select_seed": 0,
+    "processing_order": [
+        4,
+        9,
+        15,
+        19,
+        24
+    ],
+    "selected_indices": [
+        4,
+        9,
+        15,
+        19,
+        24
+    ],
+    "selected_names": [
+        "Inst_1_test_IMG_E6643",
+        "Inst_1_test_IMG_E6674",
+        "Inst_1_test_IMG_E6680",
+        "Inst_1_test_IMG_E6684",
+        "Inst_1_test_IMG_E6689"
+    ]
+}

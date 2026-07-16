@@ -1,0 +1,41 @@
+{
+    "frames_method": "uniform",
+    "budget": 10,
+    "select_seed": 0,
+    "processing_order": [
+        0,
+        3,
+        5,
+        8,
+        11,
+        13,
+        16,
+        19,
+        21,
+        24
+    ],
+    "selected_indices": [
+        0,
+        3,
+        5,
+        8,
+        11,
+        13,
+        16,
+        19,
+        21,
+        24
+    ],
+    "selected_names": [
+        "Inst_1_test_IMG_E2658",
+        "Inst_1_test_IMG_E2664",
+        "Inst_1_test_IMG_E2669",
+        "Inst_1_test_IMG_E2679",
+        "Inst_1_test_IMG_E2688",
+        "Inst_1_test_IMG_E2693",
+        "Inst_1_test_IMG_E2700",
+        "Inst_1_test_IMG_E2708",
+        "Inst_1_test_IMG_E2714",
+        "Inst_1_test_IMG_E2718"
+    ]
+}

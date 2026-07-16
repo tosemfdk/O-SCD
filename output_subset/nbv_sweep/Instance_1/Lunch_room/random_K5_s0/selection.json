@@ -1,0 +1,26 @@
+{
+    "frames_method": "random",
+    "budget": 5,
+    "select_seed": 0,
+    "processing_order": [
+        2,
+        5,
+        11,
+        16,
+        19
+    ],
+    "selected_indices": [
+        2,
+        5,
+        11,
+        16,
+        19
+    ],
+    "selected_names": [
+        "Inst_1_test_IMG_3510",
+        "Inst_1_test_IMG_3515",
+        "Inst_1_test_IMG_3521",
+        "Inst_1_test_IMG_3527",
+        "Inst_1_test_IMG_3531"
+    ]
+}
