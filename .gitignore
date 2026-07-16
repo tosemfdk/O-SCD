@@ -1,9 +1,7 @@
 __pycache__/
 
-# Local datasets and generated experiment outputs
+# Local datasets and bulky regenerable render outputs stay untracked;
+# experiment result CSVs are tracked (user decision, 2026-07-16).
 /data/PASLCD
-/experiments/all25_repeats.csv
-/experiments/oracle_search_results.csv
 /output_subset/**
 !/output_subset/.gitkeep
-/experiments/frame_features.csv
