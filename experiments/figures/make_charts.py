@@ -34,12 +34,12 @@ def save(fig, name):
 
 
 # ---- A. oracle-5 vs all-25 vs uniform mean (dumbbell) ------------------------
-data = [  # scene, best5, all25 mean, uniform stride-5 mean
-    ("Playground", 0.4499, 0.3590, 0.3818), ("Garden", 0.5498, 0.4520, 0.4805),
-    ("Lunch_room", 0.4177, 0.3714, 0.3234), ("Meeting_room", 0.5661, 0.5151, 0.5036),
-    ("Lounge", 0.5868, 0.5345, 0.5388), ("Pots", 0.6520, 0.6116, 0.6134),
-    ("Zen", 0.5694, 0.5368, 0.4198), ("Cantina", 0.5900, 0.5655, 0.4374),
-    ("Porch", 0.6292, 0.6040, 0.5343), ("Printing_area", 0.7031, 0.6867, 0.5837),
+data = [  # scene, best5 (rev3 map, ~590 evals/scene), all25 mean, uniform stride-5 mean
+    ("Playground", 0.5199, 0.3590, 0.3818), ("Garden", 0.5515, 0.4520, 0.4805),
+    ("Lunch_room", 0.4251, 0.3714, 0.3234), ("Meeting_room", 0.5678, 0.5151, 0.5036),
+    ("Lounge", 0.6037, 0.5345, 0.5388), ("Pots", 0.6582, 0.6116, 0.6134),
+    ("Zen", 0.5850, 0.5368, 0.4198), ("Cantina", 0.5955, 0.5655, 0.4374),
+    ("Porch", 0.6385, 0.6040, 0.5343), ("Printing_area", 0.7115, 0.6867, 0.5837),
 ]
 data.sort(key=lambda r: r[1] / r[2])  # sort by oracle gain, biggest at top
 fig, ax = plt.subplots(figsize=(9, 5.6))
@@ -73,8 +73,8 @@ ax.plot(K, pct, color=BLUE, lw=2, marker="o", ms=8, label="uniform selection")
 for k, p in zip(K, pct):
     ax.annotate(f"{p:.0f}%", (k, p), xytext=(0, 9), textcoords="offset points",
                 ha="center", fontsize=9, color=INK2)
-ax.scatter([5], [109.4], s=110, color=AQUA, zorder=5, label="oracle-5 (well-chosen 5)")
-ax.annotate("oracle-5: 109% with K=5", (5, 109.4), xytext=(12, 2),
+ax.scatter([5], [111.8], s=110, color=AQUA, zorder=5, label="oracle-5 (well-chosen 5)")
+ax.annotate("oracle-5: 112% with K=5", (5, 111.8), xytext=(12, 2),
             textcoords="offset points", fontsize=10, color="#0f7a54", fontweight="bold")
 ax.set_xlabel("update-frame budget K (out of 25)")
 ax.set_ylabel("% of all-25 mIoU (10-scene mean)")
@@ -134,10 +134,11 @@ fig, ax = plt.subplots(figsize=(9, 5.4))
 ax.scatter(xs[~toxic], ys[~toxic], s=26, color=MUTED, alpha=0.65, label="other frames")
 ax.scatter(xs[toxic], ys[toxic], s=64, color=RED, zorder=4,
            label="toxic frames (marginal mIoU < −0.05)")
-for label in ("Zen/3", "Zen/4", "Cantina/11", "Playground/19"):
-    i = names.index(label)
-    ax.annotate(label, (xs[i], ys[i]), xytext=(7, 4), textcoords="offset points",
-                fontsize=9.5, color=RED, fontweight="bold")
+# label every toxic point (rev3 marginals; the old hardcoded list had a
+# sign-flipped member, Playground/19, which is an anchor on the deeper map)
+for i in np.flatnonzero(toxic):
+    ax.annotate(names[i], (xs[i], ys[i]), xytext=(7, 4), textcoords="offset points",
+                fontsize=9, color=RED, fontweight="bold")
 ax.add_patch(plt.Rectangle((60, 0), 40, 40, fill=False, ls="--", ec=RED, lw=1.2))
 ax.annotate("big cue, low 3D consensus\n= identified toxic type", (98, 42),
             ha="right", fontsize=9.5, color=RED)

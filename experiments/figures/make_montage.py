@@ -9,9 +9,19 @@ BLUE, YELLOW, INK, INK2 = "#2a78d6", "#eda100", "#1a1a19", "#5f5e58"
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 OUT = os.path.dirname(os.path.abspath(__file__))
 
+# rev3 map (2026-07-17, ~590 evals/scene) vs each scene's BEST stride-5
+# uniform offset — the honest per-scene comparison, no cherry-picked offset.
 CASES = [
-    ("Cantina", (12, 15, 17, 20, 24), 0.5900, (0, 5, 10, 15, 20), 0.4589),
-    ("Garden", (1, 5, 7, 10, 12), 0.5498, (0, 5, 10, 15, 20), 0.5112),
+    ("Cantina", (12, 15, 17, 20, 21), 0.5955, (3, 8, 13, 18, 23), 0.4751),
+    ("Garden", (1, 4, 14, 16, 19), 0.5515, (0, 5, 10, 15, 20), 0.5112),
+    ("Lounge", (0, 1, 3, 11, 20), 0.6037, (0, 5, 10, 15, 20), 0.5722),
+    ("Lunch_room", (1, 5, 19, 21, 24), 0.4251, (1, 6, 11, 16, 21), 0.3824),
+    ("Meeting_room", (10, 12, 19, 23, 24), 0.5678, (2, 7, 12, 17, 22), 0.5316),
+    ("Playground", (0, 4, 19, 20, 21), 0.5199, (1, 6, 11, 16, 21), 0.4258),
+    ("Porch", (1, 5, 14, 20, 23), 0.6385, (4, 9, 14, 19, 24), 0.6243),
+    ("Pots", (1, 7, 9, 11, 21), 0.6582, (1, 6, 11, 16, 21), 0.6429),
+    ("Printing_area", (2, 8, 11, 12, 14), 0.7115, (3, 8, 13, 18, 23), 0.6286),
+    ("Zen", (2, 11, 15, 18, 22), 0.5850, (0, 5, 10, 15, 20), 0.5475),
 ]
 
 for scene, oc, om, uc, um in CASES:
@@ -23,7 +33,7 @@ for scene, oc, om, uc, um in CASES:
     fig.patch.set_facecolor("white")
     for row, (combo, miou, color, name) in enumerate([
             (oc, om, BLUE, "oracle-5 (found by search)"),
-            (uc, um, YELLOW, "uniform-5 (stride 5, offset 0)")]):
+            (uc, um, YELLOW, "uniform-5 (best stride-5 offset)")]):
         for col, idx in enumerate(combo):
             ax = axes[row, col]
             im = Image.open(os.path.join(img_dir, files[idx]))
