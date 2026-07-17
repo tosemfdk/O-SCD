@@ -136,6 +136,7 @@
 | 내용 | 파일 |
 |---|---|
 | 이 문서 | `docs/budgeted_view_findings.md` |
+| 결과 비교 테이블 (예산 곡선·셀렉터·지도) | `docs/experiment_results_tables.md` |
 | target-NBV 설계 문서 | `docs/target_gaussian_nbv.md` |
 | stage-14 pool 실험 (target D-opt 검증) | `experiments/pool_eval_garden/report.md` |
 | Garden 셀렉터 비교 | `experiments/garden_nbv_report.md` |
