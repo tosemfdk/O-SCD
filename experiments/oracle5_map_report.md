@@ -141,6 +141,31 @@ python experiments/oracle_local_search.py --per-scene 250 --seed 8   # round 2
 
 ---
 
+# Round 3 (2026-07-18): +450 evals/scene — the plateau holds a third time
+
+Same rules (HIT = prev_best x 1.10, 50-stall pool jump, seed 9), 4,500 runs
+in ~9.5h. **Zero HITs; per-scene gains +0.0% … +1.0%, Playground included
+(+0.3%).** Cumulative ~1,018 sets/scene (~2% of C(25,5)) with 8 pool
+restarts/scene this round. Updated map (only the movers):
+
+- Lunch_room 0.4251 -> 0.4293 (+1.0%), Printing_area 0.7115 -> 0.7165,
+  Pots 0.6582 -> 0.6620, Garden 0.5515 -> 0.5536, Playground 0.5199 ->
+  0.5213, Lounge 0.6037 -> 0.6051. Instance_1 mean best-5 0.5875 vs all-25
+  0.5237 = **+12.2%**.
+- Same-machine rechecks reproduce to +-0.0000 — within-batch noise is nil;
+  the plateau is a property of the search space, not measurement noise.
+
+What the doubled sample buys — the marginal-value estimates converge:
+
+- Feature correlations are now stable across rounds: cue_consistency
+  **+0.177** (strongest), cue_area −0.153, cue_mass −0.147, pose ≈ 0.
+- The 2-feature toxic filter reaches **10/30** bottom-3 retrieval
+  (chance 3.6; 6/30 at n≈35, 9/30 at n≈590).
+- Anchor structure final: best set contains ≥1 of the top-3 anchors in
+  10/10 scenes, ≥2 in 9/10 (Porch is the exception with 1).
+- Worst toxic frames, final ranking: Zen/4 (−0.111), Zen/6 (−0.087),
+  Porch/0 (−0.077), Printing_area/4 (−0.076), Porch/7 (−0.065).
+
 # Instance_2 replication (2026-07-17)
 
 **Question** (user): does the ~+11% mean gain reproduce on Instance_2?
