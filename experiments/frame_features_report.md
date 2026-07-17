@@ -1,4 +1,4 @@
-# GT-Free Frame-Quality Features vs Oracle Marginal Value (2026-07-16)
+# GT-Free Frame-Quality Features vs Oracle Marginal Value (2026-07-16; rev3 update at bottom)
 
 **Question**: can anchor/toxic frames (from the oracle-5 map) be identified
 WITHOUT ground truth, at selection time?
@@ -55,3 +55,33 @@ Correlations pooled over 10 scenes with per-scene z-scoring (n=200).
   direction-aware set criterion (nbv_dopt line) argument.
 - Next candidates if pursued: set-conditional features (marginal parallax on
   consensus-change Gaussians), or learning-to-rank on the oracle map data.
+
+---
+
+# rev3 update (2026-07-17): marginals recomputed on the 20x map
+
+`frame_features.csv`'s `marginal_miou` column was recomputed from the rev3
+oracle CSV (~590 sets/scene vs ~35; features unchanged). Same pooled
+z-scored correlation:
+
+| feature | pearson (old -> new) | spearman (new) |
+|---|---|---|
+| cue_consistency | +0.104 -> **+0.173** | +0.109 |
+| cue_area | −0.185 -> −0.137 | −0.051 |
+| cue_mass | −0.169 -> −0.131 | −0.039 |
+| ba_residual | +0.083 -> +0.059 | +0.060 |
+| pose features | ~0 -> ~0 | ~0 |
+
+1. **cue_consistency is now the strongest single signal** (+0.173): frames
+   whose 3D-lifted cue agrees with the consensus of the other frames are
+   worth more. The raw cue-size signal weakened — size alone matters less
+   than idiosyncrasy.
+2. **The 2-feature filter (z(cue_area) − z(cue_consistency)) improved from
+   6/30 to 9/30** of the actual bottom-3 frames (chance 3.6/30) — 2.5x
+   chance, still not standalone, but no longer marginal.
+3. **Old marginals had noise-level sign errors**: Playground/19 flipped
+   toxic -> anchor (−0.071 -> +0.018) and sits in the new Playground best
+   set. The worst toxic frames are stable though: Zen/3,4,6 (−0.072/−0.112/
+   −0.082), Porch/0,7 (−0.083/−0.065), Printing_area/4 (−0.080).
+4. Caveat: rev3 marginals come from hill-climb-biased set samples, so they
+   are conditioned on "mostly good" contexts rather than uniform ones.

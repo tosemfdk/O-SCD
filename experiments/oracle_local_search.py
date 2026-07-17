@@ -1,24 +1,36 @@
-# Oracle-5 map via local search (user-directed design, 2026-07-16, rev 2).
+# Oracle-5 map via local search (user-directed design, 2026-07-17, rev 3).
 #
-# Phase 0: all-25 is itself nondeterministic (cuda benchmark + atomics), so
-#   run it 5x per scene and use the MEAN as the reference.
-# Search, per Instance_1 scene: seed = the BEST stride-5 uniform offset combo
-#   (from oracle_search.py Phase A), hill-climb by swapping 1-3 frames per
-#   step; any improvement becomes the new mutation center. Scene stops on HIT:
-#     mIoU >= 1.10 * uniform_best  AND  mIoU >= mean(all-25 x5)
-#   or after --per-scene evals (default 30).
-# Everything is appended to experiments/oracle_search_results.csv (phase
-# "local"), giving the oracle-5 map for later "what makes a good set" analysis.
+# Per Instance_1 scene:
+#   - prev_best = the scene's best mIoU over EVERYTHING already in the CSV
+#     (frozen at start). HIT target = (1 + --hit-margin-rel) * prev_best,
+#     i.e. find a 5-combo 10% better than the previous experiments' best.
+#   - hill-climb: mutate the current center by 1-3 frame swaps; a combo that
+#     beats the current pool's local best becomes the new center.
+#   - stall restart: if the scene-global best has not improved for
+#     --stall-restarts consecutive evals (default 50), jump to a NEW pool —
+#     an unseen random combo overlapping the global best in <= 2 frames —
+#     and hill-climb from there (stall counter resets).
+#   - stop on HIT or after --per-scene evals (default 300).
+# Rows are appended to experiments/oracle_search_results.csv with phase
+# "local3" (hill-climb) / "restart3" (pool-jump combos). uniform / all-25
+# references are loaded for reporting only, not for the HIT rule.
 #
-#   python experiments/oracle_local_search.py --per-scene 30
+# Scenes run in PARALLEL, one worker thread per GPU (--gpus, default: all
+# visible GPUs); each scene's search stays sequential on its own GPU.
+#
+#   python experiments/oracle_local_search.py --per-scene 300
 
 from __future__ import annotations
 
 import argparse
 import csv
 import os
+import queue
+import subprocess
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
@@ -27,6 +39,17 @@ from oracle_search import (CSV_PATH, N_FRAMES, K, REPO, SCENES,  # noqa: E402
                            load_done, record, run_combo)
 
 ALL25_CSV = os.path.join(REPO, "experiments", "all25_repeats.csv")
+CSV_LOCK = threading.Lock()
+
+
+def detect_gpus() -> list[int]:
+    try:
+        r = subprocess.run(["nvidia-smi", "--list-gpus"],
+                           capture_output=True, text=True)
+        n = len([ln for ln in r.stdout.splitlines() if ln.strip()])
+    except FileNotFoundError:
+        n = 0
+    return list(range(n)) if n else [0]
 
 
 def run_all25(scene: str, rep: int) -> tuple[float, float] | None:
@@ -112,69 +135,152 @@ def mutate(combo: tuple[int, ...], m: int, rng) -> tuple[int, ...]:
     return tuple(sorted(keep))
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--per-scene", type=int, default=30)
-    ap.add_argument("--hit-margin-rel", type=float, default=0.10,
-                    help="relative margin over uniform_best (all-25 mean must merely be reached)")
-    ap.add_argument("--all25-reps", type=int, default=5)
-    ap.add_argument("--seed", type=int, default=7)
-    args = ap.parse_args()
+def restart_center(best_combo: tuple[int, ...], scene_done: dict, rng,
+                   max_overlap: int = 2) -> tuple[int, ...]:
+    """Unseen random combo sharing <= max_overlap frames with the scene best."""
+    while True:
+        combo = tuple(sorted(rng.choice(N_FRAMES, K, replace=False).tolist()))
+        if len(set(combo) & set(best_combo)) > max_overlap:
+            continue
+        if "-".join(map(str, combo)) not in scene_done:
+            return combo
 
-    rng = np.random.default_rng(args.seed)
-    t0 = time.time()
-    uni_best, uni_combo = load_references()
-    all25 = all25_means(args.all25_reps, t0)
-    summary = {}
 
-    for scene in SCENES:
-        done = load_done()
-        # HIT: >=10% over uniform_best AND at least the (mean) all-25 level
-        target = max((1.0 + args.hit_margin_rel) * uni_best[scene], all25[scene])
-        # scene-best over everything already evaluated (seed included)
-        best_combo, best = uni_combo[scene], uni_best[scene]
-        for (sc, c), (miou, _) in done.items():
-            if sc == scene and miou > best:
-                best, best_combo = miou, tuple(int(x) for x in c.split("-"))
-        print(f"\n=== {scene}: seed {best_combo} {best:.4f} | refs uniform_best "
-              f"{uni_best[scene]:.4f}, all25 {all25[scene]:.4f} -> target {target:.4f}",
-              flush=True)
+def search_scene(scene: str, scene_idx: int, args, gpu_pool: queue.Queue,
+                 t0: float):
+    """Sequential rev-3 search for one scene, pinned to one GPU."""
+    rng = np.random.default_rng(args.seed * 1000 + scene_idx)
+    gpu = gpu_pool.get()
+    try:
+        with CSV_LOCK:
+            done = load_done()
+        scene_done = {c: v for (sc, c), v in done.items() if sc == scene}
+        if not scene_done:
+            raise RuntimeError(f"{scene}: no previous results to seed from")
+        best_key = max(scene_done, key=lambda c: scene_done[c][0])
+        prev_best = scene_done[best_key][0]
+        best_combo = tuple(int(x) for x in best_key.split("-"))
+        target = (1.0 + args.hit_margin_rel) * prev_best
+        best = prev_best
+        center, local_best = best_combo, best
+        print(f"=== {scene} [gpu{gpu}]: prev_best {best_combo} {prev_best:.4f} "
+              f"-> target {target:.4f} (+{args.hit_margin_rel:.0%})", flush=True)
 
-        evals, hit = 0, False
+        # Calibration: the CSV's prev_best may come from another machine/env.
+        # Re-run it once here (logged as recheck3, not counted, not a target
+        # change) so the machine shift is quantifiable in the report.
+        if args.recheck_prev_best:
+            res = run_combo(scene, best_combo, gpu=gpu)
+            if res is not None:
+                with CSV_LOCK:
+                    record(scene, "recheck3", best_combo, *res)
+                print(f"[{scene} gpu{gpu}] recheck prev_best {best_combo}: "
+                      f"{res[0]:.4f} (CSV said {prev_best:.4f}, shift "
+                      f"{res[0]-prev_best:+.4f})", flush=True)
+
+        evals, stall, restarts, hit = 0, 0, 0, False
         while evals < args.per_scene:
-            m = int(rng.choice([1, 2, 3], p=[0.5, 0.3, 0.2]))
-            combo = mutate(best_combo, m, rng)
-            key = (scene, "-".join(map(str, combo)))
-            if key in done:
-                continue
-            res = run_combo(scene, combo)
+            if stall >= args.stall_restarts:
+                combo = restart_center(best_combo, scene_done, rng)
+                phase = "restart3"
+                restarts += 1
+                stall = 0
+                center, local_best = combo, -1.0
+                print(f"[{scene} gpu{gpu}] RESTART #{restarts}: new pool {combo} "
+                      f"(overlap<=2 with best {best_combo})", flush=True)
+            else:
+                combo, phase = None, "local3"
+                for _ in range(200):  # dup-proposal guard
+                    m = int(rng.choice([1, 2, 3], p=[0.5, 0.3, 0.2]))
+                    cand = mutate(center, m, rng)
+                    if "-".join(map(str, cand)) not in scene_done:
+                        combo = cand
+                        break
+                if combo is None:  # neighbourhood exhausted -> force a jump
+                    stall = args.stall_restarts
+                    continue
+            res = run_combo(scene, combo, gpu=gpu)
             evals += 1
             if res is None:
+                stall += 1
                 continue
-            record(scene, "local", combo, *res)
-            done[key] = res
+            with CSV_LOCK:
+                record(scene, phase, combo, *res)
+            scene_done["-".join(map(str, combo))] = res
+            if res[0] > local_best:
+                local_best, center = res[0], combo
             marker = ""
             if res[0] > best:
                 best, best_combo = res[0], combo
+                stall = 0
                 marker = " <- new best"
-            print(f"[{scene} {evals:3d}/{args.per_scene} {time.time()-t0:6.0f}s] "
-                  f"{combo}: {res[0]:.4f} (best {best:.4f}){marker}", flush=True)
+            else:
+                stall += 1
+            print(f"[{scene} gpu{gpu} {evals:3d}/{args.per_scene} "
+                  f"{time.time()-t0:6.0f}s] {combo}: {res[0]:.4f} "
+                  f"(best {best:.4f}, stall {stall}){marker}", flush=True)
             if res[0] >= target:
                 print(f"HIT {scene}: combo {combo} mIoU {res[0]:.4f} >= "
-                      f"{target:.4f} (+10% over uniform_best AND >= all-25 mean)", flush=True)
+                      f"{target:.4f} (prev_best {prev_best:.4f} +"
+                      f"{args.hit_margin_rel:.0%})", flush=True)
                 hit = True
                 break
-        summary[scene] = (best_combo, best, hit, evals)
         print(f"SCENE DONE {scene}: best {best_combo} {best:.4f} "
-              f"({best/all25[scene]-1:+.1%} vs all25, {best/uni_best[scene]-1:+.1%} "
-              f"vs uniform_best), hit={hit}, evals={evals}", flush=True)
+              f"({best/prev_best-1:+.1%} vs prev_best), hit={hit}, "
+              f"evals={evals}, restarts={restarts}", flush=True)
+        return scene, (best_combo, best, prev_best, hit, evals, restarts)
+    finally:
+        gpu_pool.put(gpu)
 
-    print("\n=== ORACLE-5 MAP (Instance_1) ===", flush=True)
-    for scene in SCENES:
-        bc, b, hit, ev = summary[scene]
-        print(f"  {scene:15s}: best5 {b:.4f} vs all25 {all25[scene]:.4f} "
-              f"({b/all25[scene]-1:+.1%}) vs uniform_best {uni_best[scene]:.4f} "
-              f"({b/uni_best[scene]-1:+.1%})  combo {bc}  hit={hit} evals={ev}", flush=True)
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--per-scene", type=int, default=300)
+    ap.add_argument("--hit-margin-rel", type=float, default=0.10,
+                    help="relative margin over the scene's previous best (HIT rule)")
+    ap.add_argument("--stall-restarts", type=int, default=50,
+                    help="consecutive evals without a new scene best before a pool jump")
+    ap.add_argument("--all25-reps", type=int, default=5)
+    ap.add_argument("--recheck-prev-best", type=int, default=1,
+                    help="1: re-run each scene's prev_best combo once on this "
+                         "machine first (phase recheck3, not counted)")
+    ap.add_argument("--seed", type=int, default=7)
+    ap.add_argument("--gpus", type=str, default="",
+                    help="comma-separated GPU ids (default: all visible)")
+    ap.add_argument("--scenes", type=str, default="",
+                    help="comma-separated scene subset (default: all)")
+    args = ap.parse_args()
+
+    gpus = ([int(g) for g in args.gpus.split(",") if g != ""]
+            if args.gpus else detect_gpus())
+    scenes = ([s for s in args.scenes.split(",") if s]
+              if args.scenes else list(SCENES))
+    t0 = time.time()
+    uni_best, _ = load_references()
+    all25 = all25_means(args.all25_reps, t0)
+    print(f"\nrev3 search: {len(scenes)} scenes on {len(gpus)} GPUs {gpus}, "
+          f"{args.per_scene} evals/scene, HIT = prev_best +"
+          f"{args.hit_margin_rel:.0%}, pool jump after {args.stall_restarts} "
+          f"stalled evals\n", flush=True)
+
+    gpu_pool: queue.Queue = queue.Queue()
+    for g in gpus:
+        gpu_pool.put(g)
+    summary = {}
+    with ThreadPoolExecutor(max_workers=len(gpus)) as ex:
+        futs = [ex.submit(search_scene, s, i, args, gpu_pool, t0)
+                for i, s in enumerate(scenes)]
+        for f in futs:
+            scene, res = f.result()
+            summary[scene] = res
+
+    print("\n=== ORACLE-5 MAP rev3 (Instance_1) ===", flush=True)
+    for scene in scenes:
+        bc, b, prev, hit, ev, rs = summary[scene]
+        print(f"  {scene:15s}: best5 {b:.4f} ({b/prev-1:+.1%} vs prev_best "
+              f"{prev:.4f}, {b/all25[scene]-1:+.1%} vs all25, "
+              f"{b/uni_best[scene]-1:+.1%} vs uniform_best)  combo {bc}  "
+              f"hit={hit} evals={ev} restarts={rs}", flush=True)
     print("ALL DONE", flush=True)
     return 0
 

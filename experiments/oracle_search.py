@@ -32,7 +32,8 @@ CSV_PATH = os.path.join(REPO, "experiments", "oracle_search_results.csv")
 N_FRAMES, K = 25, 5
 
 
-def run_combo(scene: str, combo: tuple[int, ...]) -> tuple[float, float] | None:
+def run_combo(scene: str, combo: tuple[int, ...],
+              gpu: int | None = None) -> tuple[float, float] | None:
     tag = "c" + "-".join(map(str, combo))
     out_dir = os.path.join(REPO, "output_subset", "oracle", scene, tag)
     src = os.path.join(REPO, "data", "PASLCD", "Instance_1", scene)
@@ -42,6 +43,11 @@ def run_combo(scene: str, combo: tuple[int, ...]) -> tuple[float, float] | None:
            "--frames_method", "manual",
            "--frames_list", ",".join(map(str, combo))]
     env = {**os.environ, "PYTHONPATH": ""}
+    # torch.compile(max-autotune) on SAM2 embeddings breaks under torch 2.5.1
+    # (V100 server env); eager is numerically fine and less noisy.
+    env["TORCHDYNAMO_DISABLE"] = "1"
+    if gpu is not None:
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu)
     r = subprocess.run(cmd, capture_output=True, text=True, env=env, cwd=REPO)
     if r.returncode != 0:
         print(f"RUN FAILED {scene} {tag}: {r.stderr[-300:]}", flush=True)

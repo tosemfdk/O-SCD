@@ -1,4 +1,4 @@
-# Oracle-5 Map — Instance_1 (2026-07-16)
+# Oracle-5 Map — Instance_1 (2026-07-16; rev3 update 2026-07-17, see bottom)
 
 **Question** (user-directed): does a well-chosen 5-frame set beat all 25 frames?
 **Answer: yes, on 10/10 scenes — mean +10.3% mIoU over the all-25 mean (range +2.4% … +25.3%).**
@@ -67,4 +67,74 @@ so these are LOWER bounds on the true oracle.)
 ```bash
 python experiments/oracle_search.py --max-combos 0   # Phase A refs only
 python experiments/oracle_local_search.py --per-scene 30
+```
+
+---
+
+# rev3 — 20x deeper search (2026-07-17)
+
+**Question** (user-directed): the 30-eval map covered 0.06% of C(25,5)=53k —
+does a much deeper search change the picture?
+**Answer: mostly no — and that is the finding.** Mean best-5 improved only
++2.8% over the 30-eval map despite ~550 extra evals/scene. The one exception
+is Playground (+15.5%), whose old best was a genuine underestimate.
+
+Protocol (rev3, user-specified): per scene, HIT = frozen previous best x 1.10;
+budget 300 evals (round 1) + 250 evals (round 2, targets re-raised on the
+updated bests — compounding); hill-climb with 1-3 swaps; if the scene best
+stalls for 50 consecutive evals, jump to a NEW pool (unseen random combo,
+<= 2 frames overlap with the best) and climb there. Runs executed scene-
+parallel on 8x V100 (one worker thread per GPU), 5,315 new runs in ~11.4h
+wall. Driver: `oracle_local_search.py` rev3 (phases `local3`/`restart3`).
+
+**Machine caveat**: rev3 ran on the V100 server (torch 2.5.1, dynamo
+disabled), the pre-rev3 CSV came from the A6000 machine. Per-scene
+`recheck3` rows re-measure each old best here: shift −0.007 … +0.017 mIoU —
+an order of magnitude below the +10% HIT margin, so cross-machine
+comparisons hold.
+
+## rev3 map (best over ALL ~590 evaluated sets/scene)
+
+| scene | best-5 combo | best5 | vs all-25 | vs uniform_best | vs 30-eval map |
+|---|---|---|---|---|---|
+| Playground | (0,4,19,20,21) | 0.5199 | **+44.8%** | +22.1% | **+15.5%** (HIT) |
+| Garden | (1,4,14,16,19) | 0.5515 | +22.0% | +7.9% | +0.3% |
+| Lunch_room | (1,5,19,21,24) | 0.4251 | +14.5% | +11.2% | +1.8% |
+| Lounge | (0,1,3,11,20) | 0.6037 | +12.9% | +5.5% | +2.9% |
+| Meeting_room | (10,12,19,23,24) | 0.5678 | +10.2% | +6.8% | +0.3% |
+| Zen | (2,11,15,18,22) | 0.5850 | +9.0% | +6.8% | +2.7% |
+| Pots | (1,7,9,11,21) | 0.6582 | +7.6% | +2.4% | +0.9% |
+| Porch | (1,5,14,20,23) | 0.6385 | +5.7% | +2.3% | +1.5% |
+| Cantina | (12,15,17,20,21) | 0.5955 | +5.3% | +25.3% | +0.9% |
+| Printing_area | (2,8,11,12,14) | 0.7115 | +3.6% | +13.2% | +1.2% |
+
+Instance_1 mean: best-5 0.5857 vs all-25 0.5237 (**+11.8%**, was +10.3%).
+
+## What rev3 adds to the picture
+
+1. **The oracle plateau is shallow.** 9/10 scenes gained <3% from a 20x
+   larger search with 4-5 pool restarts each — the 30-eval map was already
+   near the practical ceiling. The "+10% over your own best" HIT bar was
+   reached only once (Playground, twice in sequence: 0.4499 -> 0.4971 ->
+   0.5199). The oracle-vs-all-25 gap is real but its size was measured
+   about right the first time.
+2. **Anchor structure survives 15x more data.** With ~590 sets/scene the
+   marginal-value estimates are far less noisy; the best set still contains
+   1-3 of the top-3 anchors in 10/10 scenes (>=2 in 8/10).
+3. **Old per-frame marginals had sign errors.** Playground/19 flipped from
+   "toxic" (−0.071, n≈35) to anchor (+0.018, n≈376) — and frame 19 is in the
+   new Playground best. Magnitudes also shrank overall (Zen/3 −0.109 ->
+   −0.072). Treat the pre-rev3 anchor/toxic lists as superseded.
+4. **Set structure is still not uniform**: mean pairwise index gap of the
+   best sets ranges 4.6 (Cantina, clustered in 12-21) to 12.4 (Lunch_room)
+   vs 10.0 for uniform.
+5. Caveat: rev3 marginals are estimated from hill-climb-biased samples
+   (sets concentrate near good regions), not uniform random sets.
+
+## Reproduce (rev3)
+
+```bash
+python experiments/oracle_local_search.py --per-scene 300            # round 1
+python experiments/oracle_local_search.py --per-scene 250 --seed 8   # round 2
+# logs: experiments/oracle_local_search_r3{,b}.log
 ```
