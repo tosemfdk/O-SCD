@@ -1,6 +1,7 @@
-# Image-level montage: oracle-5 vs uniform-5 for a scene (2 rows x 5 cols),
-# with the frame's GT change region overlaid in red and its pixel share in
-# the tag — makes "which frames actually see the change" directly visible.
+# Image-level montage: oracle-5 vs uniform-5 for a scene, 4 rows x 5 cols —
+# each frame row is followed by a row with that frame's GT change mask and
+# its changed-pixel share, so "which frames actually see the change, and
+# how much" is directly visible.
 import os
 import matplotlib
 matplotlib.use("Agg")
@@ -9,6 +10,7 @@ import numpy as np
 from PIL import Image
 
 BLUE, YELLOW, INK, INK2 = "#2a78d6", "#eda100", "#1a1a19", "#5f5e58"
+GRAY, RED = "#c9c8c1", "#e34948"
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 OUT = os.path.dirname(os.path.abspath(__file__))
 
@@ -32,37 +34,46 @@ for scene, oc, om, uc, um in CASES:
     files = sorted(os.listdir(img_dir))
     shared = set(oc) & set(uc)
 
-    fig, axes = plt.subplots(2, 5, figsize=(15, 6.1))
+    fig, axes = plt.subplots(4, 5, figsize=(15, 11.2))
     fig.patch.set_facecolor("white")
-    for row, (combo, miou, color, name) in enumerate([
+    for set_i, (combo, miou, color, name) in enumerate([
             (oc, om, BLUE, "oracle-5 (found by search)"),
             (uc, um, YELLOW, "uniform-5 (best stride-5 offset)")]):
+        img_row, mask_row = 2 * set_i, 2 * set_i + 1
         for col, idx in enumerate(combo):
-            ax = axes[row, col]
             im = Image.open(os.path.join(img_dir, files[idx])).convert("RGB")
             im.thumbnail((760, 428))
             mask_path = os.path.join(REPO, "data/PASLCD/Instance_1", scene,
                                      "gt_mask", os.path.splitext(files[idx])[0] + ".png")
             m = np.array(Image.open(mask_path).convert("L").resize(im.size)) > 127
-            a = np.asarray(im, dtype=np.float32)
-            a[m] = 0.4 * a[m] + 0.6 * np.array([228, 32, 60])
-            ax.imshow(a.astype(np.uint8))
+
+            ax = axes[img_row, col]
+            ax.imshow(im)
             ax.set_xticks([]); ax.set_yticks([])
             for sp in ax.spines.values():
                 sp.set_edgecolor(color); sp.set_linewidth(3.5)
-            tag = f"frame {idx} · {100*m.mean():.0f}% chg" \
-                + ("  (both)" if idx in shared else "")
+            tag = f"frame {idx}" + ("  (in both sets)" if idx in shared else "")
             ax.set_title(tag, fontsize=10.5,
                          color=INK if idx in shared else INK2,
                          fontweight="bold" if idx in shared else "normal")
-        short = "oracle-5" if row == 0 else "uniform-5"
-        axes[row, 0].set_ylabel(f"{short}\nmIoU {miou:.3f}", fontsize=12,
-                                color=color, fontweight="bold", labelpad=12)
+
+            ax = axes[mask_row, col]
+            ax.imshow(m, cmap="gray", vmin=0, vmax=1)
+            ax.set_xticks([]); ax.set_yticks([])
+            for sp in ax.spines.values():
+                sp.set_edgecolor(GRAY); sp.set_linewidth(1.2)
+            ax.text(0.04, 0.88, f"{100*m.mean():.1f}% changed",
+                    transform=ax.transAxes, fontsize=10.5, color=RED,
+                    fontweight="bold")
+        axes[img_row, 0].set_ylabel(f"{'oracle-5' if set_i == 0 else 'uniform-5'}"
+                                    f"\nmIoU {miou:.3f}", fontsize=12,
+                                    color=color, fontweight="bold", labelpad=12)
+        axes[mask_row, 0].set_ylabel("GT change mask", fontsize=10.5,
+                                     color=INK2, labelpad=12)
     fig.suptitle(f"{scene}: what the winning 5 frames actually look like "
-                 f"(+{(om/um-1)*100:.0f}% over this uniform set) — "
-                 f"GT change regions in red",
+                 f"(+{(om/um-1)*100:.0f}% over this uniform set)",
                  fontsize=15, fontweight="bold", color=INK)
-    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    fig.tight_layout(rect=(0, 0, 1, 0.965))
     out = os.path.join(OUT, f"montage_{scene.lower()}.png")
     fig.savefig(out, dpi=110)
     plt.close(fig)
