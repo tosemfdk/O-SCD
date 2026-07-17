@@ -127,7 +127,10 @@
 - 독성의 나머지 절반(Porch/0류)의 기제는? (셋 조건부 특징 필요)
 - oracle 조합의 시차 구조 — 변화 영역 기준 baseline 분포로 설명되는가?
 - 1/d² 근접 편향 수정 시 nbv_dopt가 K≤3에서 uniform을 넘는가?
-- Instance_2에서 oracle-5 지도가 재현되는가?
+- ~~Instance_2에서 oracle-5 지도가 재현되는가?~~ **해결 (07-17): 재현됨.**
+  100 evals/씬만으로 평균 +10.2% (8/10 씬 양수, Cantina/Zen은 동률권),
+  씬별 갭이 인스턴스 간 r=0.89로 상관 — **oracle 갭은 씬의 고유 속성**.
+  상세: `experiments/oracle5_map_report.md` Instance_2 섹션.
 - 온라인 세팅(순차 도착, 미래 프레임 모름)에서 anchor/독성을 실시간
   판별 가능한가? — stage 13의 질문이자 이 연구의 실용 종착지.
 

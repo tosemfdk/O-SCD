@@ -138,3 +138,53 @@ python experiments/oracle_local_search.py --per-scene 300            # round 1
 python experiments/oracle_local_search.py --per-scene 250 --seed 8   # round 2
 # logs: experiments/oracle_local_search_r3{,b}.log
 ```
+
+---
+
+# Instance_2 replication (2026-07-17)
+
+**Question** (user): does the ~+11% mean gain reproduce on Instance_2?
+**Answer: yes — +10.2% (ratio of means) with only 100 evals/scene, and the
+per-scene gap structure transfers (r = 0.89 with Instance_1).**
+
+Protocol: same rev3 driver with `OSCD_INSTANCE=Instance_2` (per-instance CSVs
+`oracle_search_results_instance_2.csv` / `all25_repeats_instance_2.csv`);
+references (5 stride-5 offsets + all-25 x5) generated per scene inside the
+scene worker, then 100 hill-climb evals, no early stop, 50-stall pool jump.
+Everything within one machine/batch (8x V100, ~2.3h, 1,051 sets). NOTE: the
+search here is 6x shallower than Instance_1's ~590 evals/scene — these best-5
+are lower bounds by a wider margin.
+
+| scene | best-5 combo | best5 | all-25 | Δ | (Instance_1 Δ) |
+|---|---|---|---|---|---|
+| Playground | (0,2,11,15,18) | 0.4482 | 0.3335 | **+34.4%** | +44.8% |
+| Garden | (10,12,14,16,19) | 0.5359 | 0.4194 | +27.8% | +22.0% |
+| Lounge | (6,11,17,18,19) | 0.5408 | 0.4574 | +18.2% | +12.9% |
+| Lunch_room | (1,3,5,6,11) | 0.4116 | 0.3633 | +13.3% | +14.5% |
+| Meeting_room | (2,4,9,15,22) | 0.5373 | 0.4776 | +12.5% | +10.2% |
+| Porch | (5,11,17,20,23) | 0.6033 | 0.5618 | +7.4% | +5.7% |
+| Pots | (1,9,17,19,24) | 0.6078 | 0.5865 | +3.6% | +7.6% |
+| Printing_area | (1,12,13,20,24) | 0.5875 | 0.5752 | +2.1% | +3.6% |
+| Cantina | (3,10,13,14,18) | 0.5246 | 0.5281 | −0.7% | +5.3% |
+| Zen | (11,12,16,18,20) | 0.5169 | 0.5213 | −0.9% | +9.0% |
+
+Instance_2 means: best-5 0.5314 vs all-25 0.4824 (**+10.2%**; per-scene-delta
+mean +11.8%) vs uniform-offset mean 0.4543. best-5 > all-25 on 8/10 scenes;
+Cantina/Zen are ties within noise at this shallow budget (both were positive
+on Instance_1 after 6x more search).
+
+Key finding: **the oracle gap is a scene property, not noise.** Per-scene Δ
+correlates across the two change instances at Pearson r = 0.887 (p < 0.001,
+Spearman 0.84) — Playground/Garden lead and Printing_area/Cantina trail in
+BOTH instances, despite different changes, different frames, and different
+search depths. all-25 also loses to a single good uniform offset on several
+Instance_2 scenes (e.g. Garden 0.419 vs 0.507): the toxic-ingestion failure
+mode is not an Instance_1 quirk.
+
+Reproduce:
+
+```bash
+OSCD_INSTANCE=Instance_2 python experiments/oracle_local_search.py \
+  --per-scene 100 --all25-reps 5 --hit-margin-rel 999 --recheck-prev-best 0
+# log: experiments/oracle_local_search_inst2.log
+```

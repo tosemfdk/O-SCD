@@ -35,10 +35,12 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from oracle_search import (CSV_PATH, N_FRAMES, K, REPO, SCENES,  # noqa: E402
+from oracle_search import (CSV_PATH, INSTANCE, INSTANCE_SUFFIX,  # noqa: E402
+                           N_FRAMES, K, REPO, SCENES,
                            load_done, record, run_combo)
 
-ALL25_CSV = os.path.join(REPO, "experiments", "all25_repeats.csv")
+ALL25_CSV = os.path.join(REPO, "experiments",
+                         f"all25_repeats{INSTANCE_SUFFIX}.csv")
 CSV_LOCK = threading.Lock()
 
 
@@ -52,14 +54,17 @@ def detect_gpus() -> list[int]:
     return list(range(n)) if n else [0]
 
 
-def run_all25(scene: str, rep: int) -> tuple[float, float] | None:
+def run_all25(scene: str, rep: int,
+              gpu: int | None = None) -> tuple[float, float] | None:
     """One all-25 run (frames_method=all), evaluated on query_mask."""
     import re
     import shutil
-    import subprocess
-    out_dir = os.path.join(REPO, "output_subset", "oracle", scene, f"all25_rep{rep}")
-    src = os.path.join(REPO, "data", "PASLCD", "Instance_1", scene)
-    env = {**os.environ, "PYTHONPATH": ""}
+    out_dir = os.path.join(REPO, "output_subset", "oracle", INSTANCE, scene,
+                           f"all25_rep{rep}")
+    src = os.path.join(REPO, "data", "PASLCD", INSTANCE, scene)
+    env = {**os.environ, "PYTHONPATH": "", "TORCHDYNAMO_DISABLE": "1"}
+    if gpu is not None:
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu)
     r = subprocess.run(
         [sys.executable, os.path.join(REPO, "subset_oscd.py"),
          "-s", src + "/", "-m", out_dir + "/",
@@ -146,6 +151,47 @@ def restart_center(best_combo: tuple[int, ...], scene_done: dict, rng,
             return combo
 
 
+def ensure_scene_refs(scene: str, scene_done: dict, gpu: int,
+                      all25_reps: int) -> None:
+    """Make sure the scene has its references IN THIS CSV/instance: the 5
+    stride-5 uniform offsets (search seeds) and `all25_reps` all-25 runs.
+    No-op when they already exist (Instance_1); runs them on the scene's
+    own GPU otherwise (fresh instance)."""
+    for off in range(5):
+        combo = tuple(range(off, N_FRAMES, 5))
+        key = "-".join(map(str, combo))
+        if key in scene_done:
+            continue
+        res = run_combo(scene, combo, gpu=gpu)
+        if res is None:
+            print(f"[{scene} gpu{gpu}] uniform off{off} FAILED", flush=True)
+            continue
+        with CSV_LOCK:
+            record(scene, "uniform_off", combo, *res)
+        scene_done[key] = res
+        print(f"[{scene} gpu{gpu}] ref uniform off{off}: {res[0]:.4f}", flush=True)
+    have = 0
+    with CSV_LOCK:
+        if os.path.exists(ALL25_CSV):
+            have = sum(1 for r in csv.DictReader(open(ALL25_CSV))
+                       if r["scene"] == scene)
+    attempts = 0
+    while have < all25_reps and attempts < all25_reps + 3:
+        attempts += 1
+        res = run_all25(scene, have, gpu=gpu)
+        if res is None:
+            continue
+        with CSV_LOCK:
+            new = not os.path.exists(ALL25_CSV)
+            with open(ALL25_CSV, "a", newline="") as f:
+                w = csv.writer(f)
+                if new:
+                    w.writerow(["scene", "rep", "miou_query", "f1_query"])
+                w.writerow([scene, have, f"{res[0]:.6f}", f"{res[1]:.6f}"])
+        have += 1
+        print(f"[{scene} gpu{gpu}] ref all25 rep{have-1}: {res[0]:.4f}", flush=True)
+
+
 def search_scene(scene: str, scene_idx: int, args, gpu_pool: queue.Queue,
                  t0: float):
     """Sequential rev-3 search for one scene, pinned to one GPU."""
@@ -155,8 +201,9 @@ def search_scene(scene: str, scene_idx: int, args, gpu_pool: queue.Queue,
         with CSV_LOCK:
             done = load_done()
         scene_done = {c: v for (sc, c), v in done.items() if sc == scene}
+        ensure_scene_refs(scene, scene_done, gpu, args.all25_reps)
         if not scene_done:
-            raise RuntimeError(f"{scene}: no previous results to seed from")
+            raise RuntimeError(f"{scene}: no results to seed from (refs failed?)")
         best_key = max(scene_done, key=lambda c: scene_done[c][0])
         prev_best = scene_done[best_key][0]
         best_combo = tuple(int(x) for x in best_key.split("-"))
@@ -256,10 +303,8 @@ def main():
     scenes = ([s for s in args.scenes.split(",") if s]
               if args.scenes else list(SCENES))
     t0 = time.time()
-    uni_best, _ = load_references()
-    all25 = all25_means(args.all25_reps, t0)
-    print(f"\nrev3 search: {len(scenes)} scenes on {len(gpus)} GPUs {gpus}, "
-          f"{args.per_scene} evals/scene, HIT = prev_best +"
+    print(f"\nrev3 search [{INSTANCE}]: {len(scenes)} scenes on {len(gpus)} "
+          f"GPUs {gpus}, {args.per_scene} evals/scene, HIT = prev_best +"
           f"{args.hit_margin_rel:.0%}, pool jump after {args.stall_restarts} "
           f"stalled evals\n", flush=True)
 
@@ -274,12 +319,27 @@ def main():
             scene, res = f.result()
             summary[scene] = res
 
-    print("\n=== ORACLE-5 MAP rev3 (Instance_1) ===", flush=True)
+    # references for the summary, straight from the CSVs (workers ensured them)
+    done = load_done()
+    offs = {"-".join(map(str, range(o, N_FRAMES, 5))) for o in range(5)}
+    all25 = {}
+    if os.path.exists(ALL25_CSV):
+        acc = {}
+        for r in csv.DictReader(open(ALL25_CSV)):
+            acc.setdefault(r["scene"], []).append(float(r["miou_query"]))
+        all25 = {s: float(np.mean(v)) for s, v in acc.items()}
+
+    print(f"\n=== ORACLE-5 MAP rev3 ({INSTANCE}) ===", flush=True)
     for scene in scenes:
         bc, b, prev, hit, ev, rs = summary[scene]
+        uni = [v[0] for (sc, c), v in done.items() if sc == scene and c in offs]
+        extra = ""
+        if scene in all25:
+            extra += f", {b/all25[scene]-1:+.1%} vs all25"
+        if uni:
+            extra += f", {b/max(uni)-1:+.1%} vs uniform_best"
         print(f"  {scene:15s}: best5 {b:.4f} ({b/prev-1:+.1%} vs prev_best "
-              f"{prev:.4f}, {b/all25[scene]-1:+.1%} vs all25, "
-              f"{b/uni_best[scene]-1:+.1%} vs uniform_best)  combo {bc}  "
+              f"{prev:.4f}{extra})  combo {bc}  "
               f"hit={hit} evals={ev} restarts={rs}", flush=True)
     print("ALL DONE", flush=True)
     return 0

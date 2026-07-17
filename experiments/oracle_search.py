@@ -28,15 +28,20 @@ import numpy as np
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCENES = ["Cantina", "Garden", "Lounge", "Lunch_room", "Meeting_room",
           "Playground", "Porch", "Pots", "Printing_area", "Zen"]
-CSV_PATH = os.path.join(REPO, "experiments", "oracle_search_results.csv")
+# PASLCD instance selector; scene names repeat across instances, so each
+# instance gets its own results CSVs (bare names = Instance_1, historical).
+INSTANCE = os.environ.get("OSCD_INSTANCE", "Instance_1")
+INSTANCE_SUFFIX = "" if INSTANCE == "Instance_1" else "_" + INSTANCE.lower()
+CSV_PATH = os.path.join(REPO, "experiments",
+                        f"oracle_search_results{INSTANCE_SUFFIX}.csv")
 N_FRAMES, K = 25, 5
 
 
 def run_combo(scene: str, combo: tuple[int, ...],
               gpu: int | None = None) -> tuple[float, float] | None:
     tag = "c" + "-".join(map(str, combo))
-    out_dir = os.path.join(REPO, "output_subset", "oracle", scene, tag)
-    src = os.path.join(REPO, "data", "PASLCD", "Instance_1", scene)
+    out_dir = os.path.join(REPO, "output_subset", "oracle", INSTANCE, scene, tag)
+    src = os.path.join(REPO, "data", "PASLCD", INSTANCE, scene)
     cmd = [sys.executable, os.path.join(REPO, "subset_oscd.py"),
            "-s", src + "/", "-m", out_dir + "/",
            "--resolution", "4", "--test_hold", "5",
