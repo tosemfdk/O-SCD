@@ -108,6 +108,59 @@ def hutchinson_information(model, camera, pixel_weight: torch.Tensor,
     )
 
 
+def hutchinson_block_information(model, camera, pixel_weight: torch.Tensor,
+                                 config: InformationConfig, seed_scope: tuple,
+                                 pipe, background, frame_id: int = -1
+                                 ) -> torch.Tensor:
+    """Per-Gaussian 3x3 POSITION Fisher blocks B_g = sum_p w_p J_g,p^T J_g,p
+    estimated with the same Hutchinson probes: for each probe the xyz-gradient
+    g_g = (J_g)^T xi is a 3-vector and E[g g^T] equals the block. Direction
+    lives here — a ray-aligned revisit adds little, an orthogonal baseline
+    adds a new eigen-direction. Returns (N, 3, 3) float32 on the device."""
+    n = model.get_xyz.shape[0]
+    device = model.get_xyz.device
+    w = pixel_weight.detach().to(device=device, dtype=torch.float32)
+    blocks = torch.zeros(n, 3, 3, dtype=torch.float32, device=device)
+
+    ran = 0
+    for probe_idx in range(config.num_probes):
+        y_raw, radii = _render_raw(model, camera, pipe, background)
+        if not _guard_inputs(radii, w):
+            break
+        y = select_output(y_raw, config.output_space)
+        xi = deterministic_rademacher(
+            y.shape, (*seed_scope, "blk", frame_id, probe_idx), device)
+        scalar = (y * w.sqrt() * xi).sum()
+        g = torch.autograd.grad(scalar, model._xyz, retain_graph=False)[0]
+        if not torch.isfinite(g).all():
+            raise ZeroAdjointError(f"frame {frame_id}: non-finite xyz adjoint")
+        blocks += g.unsqueeze(2) * g.unsqueeze(1)
+        ran += 1
+    if ran:
+        blocks /= ran
+    return blocks
+
+
+def _sym_logdet(mats: torch.Tensor, lam: float) -> torch.Tensor:
+    """Robust batched logdet for (N,3,3) near-PSD matrices: symmetrize,
+    float64 eigvalsh, clamp eigenvalues at lam (float32 outer-product
+    accumulation can leave tiny negative eigenvalues that break Cholesky)."""
+    m = 0.5 * (mats + mats.transpose(1, 2)).double()
+    ev = torch.linalg.eigvalsh(m).clamp_min(lam)
+    return torch.log(ev).sum(dim=1)
+
+
+def block_dopt_gain(H_prior: torch.Tensor, B_cand: torch.Tensor,
+                    weights: torch.Tensor, lam: float) -> float:
+    """sum_g weights_g * [logdet_lam(H_g + B_g) - logdet_lam(H_g)].
+    H_prior/B_cand: (N,3,3) PSD-ish; weights: (N,) >= 0 (suspicion)."""
+    logdet = _sym_logdet(H_prior + B_cand, lam) - _sym_logdet(H_prior, lam)
+    val = float((weights.double() * logdet).sum())
+    if val != val:
+        raise FloatingPointError("block dopt gain is NaN")
+    return val
+
+
 def exact_information(model, camera, pixel_weight: torch.Tensor,
                       output_space: str, pipe, background) -> torch.Tensor:
     """Brute-force b_i = sum_p w_p (dy_p/dc_i)^2 by per-pixel backward on a

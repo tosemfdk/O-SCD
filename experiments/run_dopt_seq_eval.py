@@ -34,7 +34,7 @@ import argparse
 _ap = argparse.ArgumentParser()
 _ap.add_argument("--criterion", default="dopt",
                  choices=["dopt", "trace_reduction", "fisher_ratio",
-                          "candidate_only"])
+                          "candidate_only", "dopt_dir"])
 _ap.add_argument("--weight", default="pose", choices=["pose", "current_map"])
 ARGS = _ap.parse_args()
 TAG = f"{ARGS.criterion}_{ARGS.weight}"

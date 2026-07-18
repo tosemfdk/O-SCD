@@ -107,7 +107,7 @@ def parse_args_subset():
     parser.add_argument('--info_probes', type=int, default=4)
     parser.add_argument('--info_criterion', type=str, default='dopt',
                         choices=['dopt', 'trace_reduction', 'fisher_ratio',
-                                 'candidate_only'])
+                                 'candidate_only', 'dopt_dir'])
     parser.add_argument('--info_weight', type=str, default='pose',
                         choices=['pose', 'current_map'],
                         help="dopt_seq: pixel weight for candidate scoring")
@@ -401,22 +401,56 @@ def main(dataset: Namespace, opt: Namespace, pipe: Namespace, args: Namespace):
         remaining = list(range(1, len(all_views)))
         step_log = []
         while len(selected) < args.budget:
-            infos = {}
-            for i in selected + remaining:  # b on the CURRENT change model
-                w = build_pixel_weight(cfg.weight_mode, gaussians_rgb,
-                                       all_views[i], pipe, background, cfg,
-                                       model_change=gaussians_change)
-                infos[i] = hutchinson_information(
-                    gaussians_change, all_views[i], w, cfg,
-                    (scene_tag, "seq", len(selected)), pipe, background,
-                    frame_id=i, strict=False).diagonal.cuda()
-            lam = derive_relative_lambda(infos.values(), cfg.lambda_rel,
-                                         cfg.lambda_abs)
-            h = torch.full_like(infos[selected[0]], float(lam))
-            for s in selected:
-                h = h + infos[s]
-            scores = {i: score_candidate(args.info_criterion, h, infos[i])
-                      for i in remaining}
+            if args.info_criterion == "dopt_dir":
+                # Direction-aware: per-Gaussian 3x3 POSITION Fisher blocks
+                # (direction lives in the xyz Jacobian), D-opt logdet gain
+                # weighted by per-Gaussian suspicion = current change mass c.
+                # "Revisit what looks changed — from a NEW angle."
+                from view_selection.information import (
+                    block_dopt_gain, hutchinson_block_information)
+                blocks = {}
+                for i in selected + remaining:
+                    w = build_pixel_weight(cfg.weight_mode, gaussians_rgb,
+                                           all_views[i], pipe, background,
+                                           cfg, model_change=gaussians_change)
+                    blocks[i] = hutchinson_block_information(
+                        gaussians_change, all_views[i], w, cfg,
+                        (scene_tag, "seq", len(selected)), pipe, background,
+                        frame_id=i)
+                with torch.no_grad():
+                    c = gaussians_change._features_dc.detach()
+                    susp = c.reshape(c.shape[0], -1).mean(dim=1).clamp_min(0.0)
+                    susp = susp / susp.sum().clamp_min(1e-12)
+                tr = torch.stack([torch.diagonal(b, dim1=1, dim2=2).sum(dim=1)
+                                  for b in blocks.values()])
+                pos = tr[tr > 0]
+                lam = max(cfg.lambda_abs,
+                          cfg.lambda_rel * float(pos.median()) / 3.0
+                          if pos.numel() else cfg.lambda_abs)
+                H = torch.zeros_like(blocks[selected[0]])
+                for s in selected:
+                    H = H + blocks[s]
+                scores = {i: block_dopt_gain(H, blocks[i], susp, lam)
+                          for i in remaining}
+                del blocks
+                torch.cuda.empty_cache()
+            else:
+                infos = {}
+                for i in selected + remaining:  # b on the CURRENT change model
+                    w = build_pixel_weight(cfg.weight_mode, gaussians_rgb,
+                                           all_views[i], pipe, background, cfg,
+                                           model_change=gaussians_change)
+                    infos[i] = hutchinson_information(
+                        gaussians_change, all_views[i], w, cfg,
+                        (scene_tag, "seq", len(selected)), pipe, background,
+                        frame_id=i, strict=False).diagonal.cuda()
+                lam = derive_relative_lambda(infos.values(), cfg.lambda_rel,
+                                             cfg.lambda_abs)
+                h = torch.full_like(infos[selected[0]], float(lam))
+                for s in selected:
+                    h = h + infos[s]
+                scores = {i: score_candidate(args.info_criterion, h, infos[i])
+                          for i in remaining}
             pick = min((-v, i) for i, v in scores.items())[1]
             step_log.append({"step": len(selected), "pick": pick,
                              "score": scores[pick], "lambda": lam})
