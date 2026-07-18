@@ -25,13 +25,36 @@ def pose_weight(model_ref, camera, pipe, background,
     return (a >= alpha_threshold).float()
 
 
+def current_map_weight(model_ref, model_change, camera, pipe, background,
+                       alpha_threshold: float, epsilon: float) -> torch.Tensor:
+    """V(p) * [eps + (1-eps) * m(p)] with m = 1[z(p) > 0.5], the pipeline's
+    own current-change-mask definition (subset_oscd query threshold): a
+    re-observation bonus on pixels the CURRENT change scene already flags.
+    (sigmoid(z) was tried first and is nearly flat — ~0.59 vs ~0.7 — so it
+    left candidate rankings unchanged; the binary mask has 1/eps contrast.)
+    Uses only the model state, never candidate content."""
+    from gaussian_renderer import render_change
+
+    v = pose_weight(model_ref, camera, pipe, background, alpha_threshold)
+    with torch.no_grad():
+        z = render_change(camera, model_change, pipe, background)["render"].mean(dim=0)
+        m = (z > 0.5).float()
+    return (v * (epsilon + (1.0 - epsilon) * m)).detach()
+
+
 def build_pixel_weight(mode: str, model_ref, camera, pipe, background,
-                       config) -> torch.Tensor:
+                       config, model_change=None) -> torch.Tensor:
     if mode == "pose":
         return pose_weight(model_ref, camera, pipe, background,
                            config.alpha_threshold).detach()
-    if mode in ("current_map", "cue", "consensus"):
+    if mode == "current_map":
+        if model_change is None:
+            raise ValueError("current_map weight needs the change model")
+        return current_map_weight(model_ref, model_change, camera, pipe,
+                                  background, config.alpha_threshold,
+                                  config.epsilon)
+    if mode in ("cue", "consensus"):
         raise NotImplementedError(
-            f"weight mode {mode!r} is a later-phase feature (spec §29 commits "
-            f"14-15); refusing to silently fall back to pose")
+            f"weight mode {mode!r} is a later-phase feature; refusing to "
+            f"silently fall back to pose")
     raise ValueError(f"unknown weight mode {mode!r}")

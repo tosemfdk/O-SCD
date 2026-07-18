@@ -108,6 +108,9 @@ def parse_args_subset():
     parser.add_argument('--info_criterion', type=str, default='dopt',
                         choices=['dopt', 'trace_reduction', 'fisher_ratio',
                                  'candidate_only'])
+    parser.add_argument('--info_weight', type=str, default='pose',
+                        choices=['pose', 'current_map'],
+                        help="dopt_seq: pixel weight for candidate scoring")
     parser.add_argument('--info_lambda_rel', type=float, default=1e-3)
     parser.add_argument('--info_lambda_abs', type=float, default=1e-8)
     parser.add_argument('--info_alpha_threshold', type=float, default=0.5)
@@ -385,7 +388,7 @@ def main(dataset: Namespace, opt: Namespace, pipe: Namespace, args: Namespace):
 
         assert 0 < args.budget <= len(all_views), "dopt_seq needs --budget"
         cfg = InformationConfig(
-            output_space=args.info_output, weight_mode="pose",
+            output_space=args.info_output, weight_mode=args.info_weight,
             num_probes=args.info_probes,
             alpha_threshold=args.info_alpha_threshold,
             lambda_rel=args.info_lambda_rel, lambda_abs=args.info_lambda_abs)
@@ -400,8 +403,9 @@ def main(dataset: Namespace, opt: Namespace, pipe: Namespace, args: Namespace):
         while len(selected) < args.budget:
             infos = {}
             for i in selected + remaining:  # b on the CURRENT change model
-                w = build_pixel_weight("pose", gaussians_rgb, all_views[i],
-                                       pipe, background, cfg)
+                w = build_pixel_weight(cfg.weight_mode, gaussians_rgb,
+                                       all_views[i], pipe, background, cfg,
+                                       model_change=gaussians_change)
                 infos[i] = hutchinson_information(
                     gaussians_change, all_views[i], w, cfg,
                     (scene_tag, "seq", len(selected)), pipe, background,
@@ -411,7 +415,8 @@ def main(dataset: Namespace, opt: Namespace, pipe: Namespace, args: Namespace):
             h = torch.full_like(infos[selected[0]], float(lam))
             for s in selected:
                 h = h + infos[s]
-            scores = {i: score_candidate("dopt", h, infos[i]) for i in remaining}
+            scores = {i: score_candidate(args.info_criterion, h, infos[i])
+                      for i in remaining}
             pick = min((-v, i) for i, v in scores.items())[1]
             step_log.append({"step": len(selected), "pick": pick,
                              "score": scores[pick], "lambda": lam})

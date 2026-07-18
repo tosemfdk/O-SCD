@@ -29,7 +29,16 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from oracle_search import SCENES, load_done, run_combo  # noqa: E402
 
-OUT_CSV = os.path.join(REPO, "experiments", "dopt_seq_results.csv")
+import argparse
+
+_ap = argparse.ArgumentParser()
+_ap.add_argument("--criterion", default="dopt",
+                 choices=["dopt", "trace_reduction", "fisher_ratio",
+                          "candidate_only"])
+_ap.add_argument("--weight", default="pose", choices=["pose", "current_map"])
+ARGS = _ap.parse_args()
+TAG = f"{ARGS.criterion}_{ARGS.weight}"
+OUT_CSV = os.path.join(REPO, "experiments", f"dopt_seq_results_{TAG}.csv")
 
 
 def eval_masks(scene: str, pred_dir: str):
@@ -44,14 +53,15 @@ def eval_masks(scene: str, pred_dir: str):
 
 
 def one_scene(scene: str, gpu: int, t0: float):
-    out_dir = os.path.join(REPO, "output_subset", "dopt_seq", scene)
+    out_dir = os.path.join(REPO, "output_subset", "dopt_seq", TAG, scene)
     env = {**os.environ, "PYTHONPATH": "", "TORCHDYNAMO_DISABLE": "1",
            "CUDA_VISIBLE_DEVICES": str(gpu)}
     r = subprocess.run(
         [sys.executable, os.path.join(REPO, "subset_oscd.py"),
          "-s", os.path.join(REPO, "data/PASLCD/Instance_1", scene) + "/",
          "-m", out_dir + "/", "--resolution", "4", "--test_hold", "5",
-         "--frames_method", "dopt_seq", "--budget", "5"],
+         "--frames_method", "dopt_seq", "--budget", "5",
+         "--info_criterion", ARGS.criterion, "--info_weight", ARGS.weight],
         capture_output=True, text=True, cwd=REPO, env=env)
     if r.returncode != 0:
         print(f"[{scene}] SELECTION FAILED: {r.stderr[-300:]}", flush=True)
