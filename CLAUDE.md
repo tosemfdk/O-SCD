@@ -52,3 +52,16 @@ python utils/evaluate.py --gt data/PASLCD/Instance_1/Garden/gt_mask/ --pred_bina
 - `--test_hold 5`는 플래그만 세팅하고 실제로는 25프레임 전부 `R_change`를 업데이트함 —
   Phase 1 all-query-view 평가는 자체 홀드아웃 구현 필요.
 - 데이터셋 `data/PASLCD/`(15GB)와 `output/`은 git에 추적하지 않음.
+
+## 실험 결과 공유 규칙 (필수, 2026-07-18 사용자 지시)
+
+**실험을 돌렸으면 그 결과를 반드시 커밋하고 `develop-claude` 브랜치에 push할 것.**
+웹 세션·다른 머신·다른 에이전트가 이 브랜치를 pull 해서 맥락을 이어받으므로,
+push 안 된 실험은 없는 실험이다.
+
+- 커밋 대상: 결과 CSV(`experiments/*.csv`), 실험 리포트(`experiments/*.md`),
+  종합 문서(`docs/budgeted_view_findings.md`, `docs/experiment_results_tables.md`),
+  실험 드라이버·그림 스크립트 변경분.
+- untracked 유지: 실행 로그(`*.log`), PNG 그림(스크립트로 재생성),
+  `output_subset/`, 데이터셋.
+- 실험 하나가 끝날 때마다 위 문서들을 갱신 → 커밋 → push가 한 사이클.
