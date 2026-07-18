@@ -1,0 +1,35 @@
+{
+  "summary": {
+    "candidate_only": {
+      "median_rho": 0.1986,
+      "zen_rho": 0.3745,
+      "median_regret": 0.0403
+    },
+    "dopt_pose": {
+      "median_rho": -0.02,
+      "zen_rho": 0.0395,
+      "median_regret": 0.1106
+    },
+    "fisher_ratio": {
+      "median_rho": -0.1057,
+      "zen_rho": -0.0534,
+      "median_regret": 0.1089
+    },
+    "max_alpha": {
+      "median_rho": 0.2101,
+      "zen_rho": 0.3286,
+      "median_regret": 0.0713
+    },
+    "max_cue_area": {
+      "median_rho": -0.0998,
+      "zen_rho": -0.6069,
+      "median_regret": 0.1819
+    },
+    "trace_reduction": {
+      "median_rho": -0.0652,
+      "zen_rho": -0.0262,
+      "median_regret": 0.1184
+    }
+  },
+  "go_recommended": false
+}

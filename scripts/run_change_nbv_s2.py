@@ -156,6 +156,17 @@ def _load_cue_area():
     return out
 
 
+def _load_map_marginals():
+    """AUXILIARY leverage of the Instance_1 oracle map: per-frame marginal
+    mIoU estimated from ~1,018 K=5 sets/scene (hill-climb-biased, mixed
+    batches) — reported separately, never mixed into the gate numbers."""
+    path = os.path.join(REPO, "experiments", "frame_features.csv")
+    out = {}
+    for r in csv.DictReader(open(path)):
+        out[(r["scene"], int(r["frame"]))] = float(r["marginal_miou"])
+    return out
+
+
 def phase_report():
     from scipy.stats import spearmanr
 
@@ -220,6 +231,28 @@ def phase_report():
     with open(os.path.join(OUT, "score_validity.csv"), "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         w.writeheader(); w.writerows(rows)
+
+    # ---- auxiliary: correlation vs the existing oracle-map marginals --------
+    map_marg = _load_map_marginals()
+    print("\n--- auxiliary (NOT gate): rho vs Instance_1 map marginals "
+          "(~1,018 sets/scene, K=5-biased, mixed batches) ---")
+    aux = {}
+    for scene in SCENES:
+        diags = load_diagonals(scene)
+        infos = {i: d for i, (d, _m) in diags.items()}
+        alpha = {i: m.get("alpha_coverage", 0.0) for i, (_d, m) in diags.items()}
+        lam = derive_relative_lambda(infos.values(), 1e-3, 1e-8)
+        prior = torch.full_like(infos[0], float(lam))
+        y = np.array([map_marg[(scene, v)] for v in range(N_FRAMES)])
+        for name, fn in [
+                ("max_cue_area", lambda v: cue_area[(scene, v)]),
+                ("max_alpha", lambda v: alpha[v]),
+                ("candidate_only", lambda v: score_candidate("candidate_only", prior, infos[v])),
+                ("dopt_pose", lambda v: score_candidate("dopt", prior, infos[v]))]:
+            s = np.array([fn(v) for v in range(N_FRAMES)])
+            aux.setdefault(name, {})[scene] = round(float(spearmanr(s, y).statistic), 3)
+    for name, per in aux.items():
+        print(f"  {name:16s} {per}")
 
     # ---- verdict summary ----------------------------------------------------
     print("\n=== Gate S2: Spearman rho (score vs conditional oracle marginal) ===")
