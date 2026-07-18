@@ -86,7 +86,7 @@ def parse_args_subset():
     # Selection args
     parser.add_argument('--frames_method', type=str, default='all',
                         choices=['all', 'random', 'uniform', 'nbv', 'nbv_dopt',
-                                 'manual', 'dopt_pose'],
+                                 'manual', 'dopt_pose', 'dopt_seq'],
                         help="How to select which inference frames update R_change")
     parser.add_argument('--frames_list', type=str, default='',
                         help="manual: comma-separated image names (no extension) or indices")
@@ -155,8 +155,9 @@ def main(dataset: Namespace, opt: Namespace, pipe: Namespace, args: Namespace):
 
     reference_dataset = ImageDataset(args, instance='ref')
 
-    if args.frames_method in ("nbv", "nbv_dopt", "manual", "dopt_pose"):
-        selected = []  # nbv*: adaptive; manual/dopt_pose: resolved after Phase A
+    if args.frames_method in ("nbv", "nbv_dopt", "manual", "dopt_pose",
+                              "dopt_seq"):
+        selected = []  # nbv*/dopt_seq: adaptive; manual/dopt_pose: post-Phase A
     else:
         selected = select_frames(args.frames_method, len(dataset), args.budget, args.select_seed)
 
@@ -371,7 +372,59 @@ def main(dataset: Namespace, opt: Namespace, pipe: Namespace, args: Namespace):
             change_mask = (change_mask > 0.5).float()
             change_masks[view.image_name] = change_mask
 
-    if args.frames_method in ("nbv", "nbv_dopt"):
+    if args.frames_method == "dopt_seq":
+        # User-requested recipe: learn the change scene from the FIRST frame,
+        # then repeatedly pick the pose-known candidate whose observation most
+        # constrains the CURRENT change scene (D-opt on the change channel,
+        # recomputed on the evolving model), fuse it, repeat until K frames.
+        from view_selection.criteria import score_candidate
+        from view_selection.information import (derive_relative_lambda,
+                                                hutchinson_information)
+        from view_selection.types import InformationConfig
+        from view_selection.weights import build_pixel_weight
+
+        assert 0 < args.budget <= len(all_views), "dopt_seq needs --budget"
+        cfg = InformationConfig(
+            output_space=args.info_output, weight_mode="pose",
+            num_probes=args.info_probes,
+            alpha_threshold=args.info_alpha_threshold,
+            lambda_rel=args.info_lambda_rel, lambda_abs=args.info_lambda_abs)
+        scene_tag = os.path.basename(os.path.normpath(args.source_path))
+        pbar_inf = tqdm(range(args.budget),
+                        desc=f"Running OSCD subset (dopt_seq, K={args.budget})")
+        selected = [0]                      # seed: chronologically first frame
+        process_view(all_views[0], pbar_inf)
+        pbar_inf.update(1)
+        remaining = list(range(1, len(all_views)))
+        step_log = []
+        while len(selected) < args.budget:
+            infos = {}
+            for i in selected + remaining:  # b on the CURRENT change model
+                w = build_pixel_weight("pose", gaussians_rgb, all_views[i],
+                                       pipe, background, cfg)
+                infos[i] = hutchinson_information(
+                    gaussians_change, all_views[i], w, cfg,
+                    (scene_tag, "seq", len(selected)), pipe, background,
+                    frame_id=i, strict=False).diagonal.cuda()
+            lam = derive_relative_lambda(infos.values(), cfg.lambda_rel,
+                                         cfg.lambda_abs)
+            h = torch.full_like(infos[selected[0]], float(lam))
+            for s in selected:
+                h = h + infos[s]
+            scores = {i: score_candidate("dopt", h, infos[i]) for i in remaining}
+            pick = min((-v, i) for i, v in scores.items())[1]
+            step_log.append({"step": len(selected), "pick": pick,
+                             "score": scores[pick], "lambda": lam})
+            remaining.remove(pick)
+            selected.append(pick)
+            process_view(all_views[pick], pbar_inf)
+            pbar_inf.update(1)
+        pbar_inf.close()
+        with open(os.path.join(args.model_path, "dopt_seq_steps.json"), "w") as f:
+            json.dump(step_log, f, indent=2)
+        processing_order = list(selected)
+        selected = sorted(selected)
+    elif args.frames_method in ("nbv", "nbv_dopt"):
         # Adaptive selection (uses ONLY poses + current change state, never a
         # candidate frame's RGB/cue).
         #   nbv:      direction-blind — one Beta-EIG-weighted probe render per
