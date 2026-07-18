@@ -85,7 +85,8 @@ def parse_args_subset():
     parser.add_argument('--iters_miniba_incr', type=int, default=20)
     # Selection args
     parser.add_argument('--frames_method', type=str, default='all',
-                        choices=['all', 'random', 'uniform', 'nbv', 'nbv_dopt', 'manual'],
+                        choices=['all', 'random', 'uniform', 'nbv', 'nbv_dopt',
+                                 'manual', 'dopt_pose'],
                         help="How to select which inference frames update R_change")
     parser.add_argument('--frames_list', type=str, default='',
                         help="manual: comma-separated image names (no extension) or indices")
@@ -97,6 +98,21 @@ def parse_args_subset():
                         help="Seed for the random selector (independent of global RNG)")
     parser.add_argument('--nbv_count_scale', type=float, default=0.05,
                         help="nbv: Beta pseudo-count scale for responsibility counts")
+    # ChangeNBV (view_selection) args — dopt_pose, batch mode (M1)
+    parser.add_argument('--select_mode', type=str, default='batch',
+                        choices=['batch'],
+                        help="dopt_pose: selection protocol (M1 batch only for now)")
+    parser.add_argument('--info_output', type=str, default='raw',
+                        choices=['raw', 'sigmoid'])
+    parser.add_argument('--info_probes', type=int, default=4)
+    parser.add_argument('--info_criterion', type=str, default='dopt',
+                        choices=['dopt', 'trace_reduction', 'fisher_ratio',
+                                 'candidate_only'])
+    parser.add_argument('--info_lambda_rel', type=float, default=1e-3)
+    parser.add_argument('--info_lambda_abs', type=float, default=1e-8)
+    parser.add_argument('--info_alpha_threshold', type=float, default=0.5)
+    parser.add_argument('--info_cache_root', type=str,
+                        default='outputs/change_nbv/cache')
 
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
@@ -139,8 +155,8 @@ def main(dataset: Namespace, opt: Namespace, pipe: Namespace, args: Namespace):
 
     reference_dataset = ImageDataset(args, instance='ref')
 
-    if args.frames_method in ("nbv", "nbv_dopt", "manual"):
-        selected = []  # nbv*: chosen adaptively; manual: resolved after Phase A
+    if args.frames_method in ("nbv", "nbv_dopt", "manual", "dopt_pose"):
+        selected = []  # nbv*: adaptive; manual/dopt_pose: resolved after Phase A
     else:
         selected = select_frames(args.frames_method, len(dataset), args.budget, args.select_seed)
 
@@ -260,6 +276,29 @@ def main(dataset: Namespace, opt: Namespace, pipe: Namespace, args: Namespace):
             else:
                 raise ValueError(f"unknown frame {r!r}; known: {sorted(name_to_idx)}")
         selected = sorted(set(selected))
+
+    if args.frames_method == "dopt_pose":
+        # ChangeNBV M1 (batch-static): score all poses on the REFERENCE scoring
+        # state (R_change is still c = 0 here — no fusion has run), greedy
+        # select, then fall through to the standard chronological replay below.
+        # FrameAccessGuard inside makes any candidate-image access fail loudly.
+        from view_selection.m1 import select_dopt_pose
+        from view_selection.types import InformationConfig
+        assert 0 < args.budget <= len(all_views), "dopt_pose needs --budget"
+        cfg = InformationConfig(
+            output_space=args.info_output, weight_mode="pose",
+            num_probes=args.info_probes,
+            alpha_threshold=args.info_alpha_threshold,
+            lambda_rel=args.info_lambda_rel, lambda_abs=args.info_lambda_abs)
+        selected, _manifest = select_dopt_pose(
+            gaussians_change, gaussians_rgb, all_views, pipe, background,
+            cfg, args.budget, args.info_criterion,
+            scene_id=os.path.basename(os.path.normpath(args.source_path)),
+            checkpoint_path=os.path.join(
+                args.source_path, "reference_reconstruction", "point_cloud",
+                "iteration_30000", "point_cloud.ply"),
+            cache_root=args.info_cache_root,
+            manifest_path=os.path.join(args.model_path, "selection_manifest.json"))
 
     # ---- Phase B: process the selected frames (cue + 16 fusion iterations).
     # Static methods (uniform/random/all/manual) process their precomputed set

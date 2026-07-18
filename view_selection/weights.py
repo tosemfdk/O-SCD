@@ -7,15 +7,14 @@ import torch
 
 
 def alpha_map(model_ref, camera, pipe, background) -> torch.Tensor:
-    """Accumulated reference alpha per pixel in [0, 1]: render the reference
-    model with override_color = 1 so the composite equals sum_g r_g,p."""
-    from gaussian_renderer import render
+    """Accumulated reference alpha per pixel in [0, 1] = sum_g r_g,p, via the
+    verified counts.py probe render with unit weights. (The fastgs fork's
+    override_color path is broken — dc stays unbound — so it cannot be used.)"""
+    from target_nbv.change.counts import responsibility_probe_render
 
     n = model_ref.get_xyz.shape[0]
-    ones = torch.ones((n, 3), device=model_ref.get_xyz.device)
-    with torch.no_grad():
-        pkg = render(camera, model_ref, pipe, background, override_color=ones)
-    return pkg["render"].mean(dim=0).clamp(0.0, 1.0)
+    ones = torch.ones(n, device=model_ref.get_xyz.device)
+    return responsibility_probe_render(model_ref, camera, ones, pipe).clamp(0.0, 1.0)
 
 
 def pose_weight(model_ref, camera, pipe, background,
