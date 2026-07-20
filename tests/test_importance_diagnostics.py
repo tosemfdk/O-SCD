@@ -232,20 +232,27 @@ needs_gctx = pytest.mark.skipif(find_gctx() is None,
                                 reason="no cached all-25 R_change for Garden")
 
 
+@pytest.fixture(scope="session")
+def garden_cams():
+    """Built once: XFeat's Detector/DenseExtractor capture CUDA graphs that
+    break when a second instance is created while the first is alive (the same
+    reason the scene runner uses one subprocess per scene)."""
+    from experiments.visualize_rchange_importance import build_cameras
+    return build_cameras("Garden")
+
+
 @pytest.mark.gpu
 @needs_gctx
-def test_raw_c_render_matches_stored_all25_soft_mask(pipe):
+def test_raw_c_render_matches_stored_all25_soft_mask(pipe, garden_cams):
     """§21.1: rendering sigmoid(c) through the responsibility probe must
     reproduce the soft mask the pipeline itself stored at the same pose."""
     from target_nbv.change.counts import responsibility_probe_render
     from view_selection.global_context import load_frozen_change_model
-    from experiments.visualize_rchange_importance import build_cameras
-
     gdir = find_gctx()
     model = load_frozen_change_model(os.path.join(gdir, "r_global.ply"))
     stored = torch.load(os.path.join(gdir, "all25_rendered_soft_masks.pt"),
                         map_location="cpu", weights_only=False)
-    cams = build_cameras("Garden")
+    cams = garden_cams
     c = model._features_dc.detach()[:, 0, :].mean(dim=1)
     weights = torch.sigmoid(c)
     ours = responsibility_probe_render(model, cams[0], weights, pipe).cpu()
@@ -259,13 +266,13 @@ def test_raw_c_render_matches_stored_all25_soft_mask(pipe):
 
 @pytest.mark.gpu
 @needs_gctx
-def test_checkpoint_untouched_by_the_diagnostic(pipe):
+def test_checkpoint_untouched_by_the_diagnostic(pipe, garden_cams):
     """§21.2/21.3: same Gaussian count and byte-identical parameters after a
     full state pass."""
     import hashlib
 
     from view_selection.global_context import load_frozen_change_model
-    from experiments.visualize_rchange_importance import build_cameras, scene_state
+    from experiments.visualize_rchange_importance import scene_state
 
     gdir = find_gctx()
     ply = os.path.join(gdir, "r_global.ply")
@@ -280,8 +287,7 @@ def test_checkpoint_untouched_by_the_diagnostic(pipe):
         return h.hexdigest()
 
     before = digest()
-    scene_state("Garden", model, build_cameras("Garden")[:2], pipe,
-                num_probes=2)
+    scene_state("Garden", model, garden_cams[:2], pipe, num_probes=2)
     assert model.get_xyz.shape[0] == n0
     assert digest() == before
 
