@@ -94,7 +94,13 @@ image-space soft mask로 결합하는 6개 kf_* 변형 vs 같은 배치의 unifo
   질량 kf_glu_nodir(0.3863), Δ+0.050.
 - **Playground 경고**: oracle 조합에 frame 0이 포함된(frame 0이 앵커인)
   씬에서는 seed 자유화가 소폭 손해 — 유일하게 전 kf_*가 4차 이하.
-- GO 조건은 kf_l_dir_gseed만 충족. 10씬 full sweep은 승인 대기 상태로 정지.
+- GO 조건은 kf_l_dir_gseed만 충족. 승인 후 10씬 full eval 실행:
+  **10씬 평균은 4차와 동률(0.4872 vs 0.4869, uniform +0.006)** — pilot의
+  +0.035는 실패-씬 편중 효과. 대신 win/loss가 정확히 상보적: 실패 3씬
+  +0.06~+0.10 회복 vs 4차 성공 6씬 손실(Lunch_room −0.094 최대). 결론:
+  **seed 자유화는 "실패 씬 치료제"이지 만능 개선이 아니다** — frame 0이
+  좋은 seed인 씬에선 global seed가 더 나쁜 출발점을 고른다. 다음 후보 =
+  seed guard(frame 0의 global rank가 하위권일 때만 교체하는 조건부 자유화).
 
 ## 4. 핵심 결과: Oracle-5 지도 (rev3, 씬당 ~590 evals)
 

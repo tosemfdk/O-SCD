@@ -145,5 +145,18 @@ clean replay. 상세: `docs/change_nbv_keyframe_pilot_report.md`.
 global score로 풀어준 kf_l_dir_gseed가 실패 3씬 전부 회복(+0.035 paired,
 oracle overlap 0.53→0.73). global/local mask 성분은 seed 이후 라운드에선
 역효과(R_global 오신호 전파, Zen·Playground), 3×3 방향 블록 기여는 재확인
-(glu_dir vs nodir +0.050). GO 조건은 kf_l_dir_gseed만 충족 — 10씬 full
-sweep은 승인 대기. 데이터: `experiments/keyframe_gl_{results,all25}.csv`.
+(glu_dir vs nodir +0.050). 데이터: `experiments/keyframe_gl_{results,all25}.csv`.
+
+**Full 10씬 (승인 후, 같은 배치 3-seed):**
+
+| 방법 | mIoU | 백분위 | Δuniform | Δ4차 |
+|---|---|---|---|---|
+| uniform | 0.4813 | 19.0% | — | −0.006 |
+| dopt_seq 4차 | 0.4869 | 27.0% | +0.006 | — |
+| kf_l_dir_gseed | 0.4872 | 24.5% | +0.006 | +0.000 |
+
+10씬 평균은 4차와 동률 — pilot의 +0.035는 실패-씬 편중 씬셋 효과.
+단, win/loss가 상보적: 실패 3씬 +0.06~+0.10 회복 vs 4차 성공 씬 6곳
+손실(최대 Lunch_room −0.094). frame 0이 좋은 seed인 씬에서 자유화가
+해롭다 → 다음 후보 = seed guard(frame 0의 global rank 하위일 때만 교체).
+상세: `docs/change_nbv_keyframe_pilot_report.md` full-eval 섹션.
