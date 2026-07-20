@@ -153,15 +153,45 @@ indistinguishable from the rest (AUPRC 0.961 vs 0.959, prevalence 0.899 vs
 0.888). Whatever makes it toxic is not in support, agreement, observability, or
 belief.
 
-**Garden — the render-failure FP survives everything.** Frame 23's lower-left
-FP blob (the 3DGS floor corner the reference render fails on) is bright in `m`,
-`S`, `A`, `O` *and* `Conf` — see
-`montages/state_frame_23.png`. Not one state axis suppresses it. Garden still
-posts the largest AUPRC lift (+0.063) because its *other* FP — the halo — is
-suppressed. Frame 15 (clean render) behaves as expected: importance concentrates
-on the TP cores.
+**Garden — the render-failure FP is lit, but it does not rank.** Frame 23's
+lower-left FP blob (the 3DGS floor corner the reference render fails on) is
+visibly bright in `m`, `S`, `A`, `O` *and* `Conf` — see
+`montages/state_frame_23.png`. On absolute brightness no state axis suppresses
+it. But brightness is not what the metrics use: the blob ranks *below* the true
+changes, so cutting to the top slice removes it outright
+(`experiments/figures/highlight_Garden_f23.png`):
 
-## Honest limitations
+```
+kept of the prediction   100%    50%    30%    20%    10%
+TP fraction of the lit    13%    25%    42%    60%    77%
+recall of true change    1.00   1.00   0.99   0.95   0.61
+```
+
+At top-20% the blob is gone entirely, the lit region goes from 13% real to 60%
+real, and 95% of the true change is still there. This is the clearest single
+case in the study, and it corrects the reading of the state montage: judge the
+ranking, not the heat. Frame 15 (clean render) behaves the same way, from a
+better starting point: 61% → 96% at top-10%.
+
+## The highlight picture (§13 D, visualized)
+
+`experiments/rchange_highlight_vs_tp.py` renders the operating point directly:
+keep only the top-k% of the prediction by importance and colour the survivors
+TP/FP. Scene means with `I2 = m·S`:
+
+```
+scene            whole prediction   top 10%   top 1%
+Zen                        0.616      0.920    0.992
+Porch                      0.719      0.906    0.934
+Garden                     0.500      0.929    1.000
+Printing_area              0.888      0.990    1.000
+```
+
+The per-frame curves (`highlight_curve_<scene>.png`) show the spread: the mean
+is smooth but individual frames fan out badly at 50–100%, which is where the
+toxic frames live. Zen/4 is the worst case in the study — its prediction is
+**1.8%** precise and the top-10% cut only reaches 18.4%: a 10× lift that is
+still almost entirely false. Some frames cannot be rescued by re-ranking.
 
 1. **Part of the apparent FP rejection is just alpha.** `M_I = Σ_g r_g,p I_g` is
    responsibility-weighted, so pixels with little Gaussian coverage score low
