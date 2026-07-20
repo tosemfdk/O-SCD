@@ -1,4 +1,4 @@
-# Budgeted View Selection for O-SCD — 발견 정리 (2026-07-17 기준, rev3 반영)
+# Budgeted View Selection for O-SCD — 발견 정리 (2026-07-20 기준, Part 2 셀렉터 사다리 반영)
 
 연구 질문의 진화, 실측 결과, 그리고 "현상"의 종합 해석.
 상세 수치·재현 방법은 각 리포트 참조 (문서 끝 인덱스).
@@ -51,6 +51,31 @@
   단일 Gaussian의 기하 불확실성 기준, exact D-opt는 **2장으로 uniform
   5장의 정보량 도달** (10/10 target), blind 선택은 예산의 26–28%를
   target이 안 보이는 view에 낭비.
+
+**Part 2 셀렉터 사다리 (2026-07-19~20, ChangeNBV):** 첫 프레임 seed →
+순차 선택 → clean replay 채점의 공통 루프에서 채점 기준만 바꾼 4개 변형.
+10씬 K=5, 지도 백분위 병기 (uniform 평균 = 18.9%, all-25 = 47.6% 보정):
+
+| 변형 | 성분 | mIoU | 백분위 | 실패/성공 모드 |
+|---|---|---|---|---|
+| candidate_only | 정보질량만 | 0.4574 | 16.4% | 연속 프레임 중복 선택 (Meeting_room 17·18·19) |
+| +의심 재관측 | binary change-mask 가중 | 0.4673 | 19.2% | 절반의 씬만 개선 |
+| dopt (스칼라 c) | 중복 할인 | 0.4778 | 22.3% | 재관측 회피가 역효과 |
+| **dopt_dir** | **재관측 + 3×3 방향블록** | **0.4883** | **28.3%** | **최초 uniform 상회, Zen 51%** |
+
+- **핵심 기제 발견 (Gate S2, 222 same-batch 조건부 실측)**: "이미 본 것
+  할인" 항은 컨텍스트가 생기는 순간 순위상관을 반전시킨다 (Porch ρ
+  +0.22→−0.68). **SCD의 한계가치는 재관측을 선호** — nbv 실패 진단의
+  세 번째 독립 확인, 최초의 criterion-수준 정량화.
+  상세: `docs/change_nbv_s2_report.md`.
+- **dopt_dir**: 의심 Gaussian(현재 c 상승분)별 xyz 3×3 Fisher 블록의
+  logdet 이득 = "변해 보이는 곳을, 새 각도에서, 다시". 성공 7씬에서
+  oracle 갭의 **11–58% 회수**, 오라클 조합·앵커와 실제 겹침. exact
+  Jacobian이 기하 proxy의 1/d² 근접 편향을 대체하며 **Zen 붕괴(0.22)가
+  씬 최고 성적(0.515)으로 반전** — 그 진단 서사 종결.
+- **잔여 실패 3씬(Cantina·Porch·Meeting_room)**: 오라클 조합 겹침 0/5,
+  공통 원인 = 고정 seed. Porch frame 0은 그 씬 최악 독성(−0.077).
+  단일런 기준 uniform 상회 +0.007은 노이즈(±0.02) 경계 — 반복 확정 필요.
 
 ## 4. 핵심 결과: Oracle-5 지도 (rev3, 씬당 ~590 evals)
 
@@ -127,7 +152,15 @@
 
 - 독성의 나머지 절반(Porch/0류)의 기제는? (셋 조건부 특징 필요)
 - oracle 조합의 시차 구조 — 변화 영역 기준 baseline 분포로 설명되는가?
-- 1/d² 근접 편향 수정 시 nbv_dopt가 K≤3에서 uniform을 넘는가?
+  **부분 답 (07-20)**: dopt_dir의 성공이 "의심 영역의 각도 다양성"이 실제
+  구동 변수임을 시사 — 남은 건 실패 3씬의 seed 조건부 구조.
+- ~~1/d² 근접 편향 수정 시 nbv_dopt가 K≤3에서 uniform을 넘는가?~~
+  **해결 (07-20)**: exact xyz-Jacobian 블록(dopt_dir)이 proxy를 대체하자
+  Zen이 0.22 → 0.515로 반전. K=5에서 uniform 상회; K≤3은 미측정.
+- **신규 (07-20)**: 고정 seed(첫 프레임)의 안전화 — 실패 3씬의 유일한
+  공통 인자. uniform 2장 seed 또는 seed 한정 독성 가드가 후보.
+- **신규 (07-20)**: dopt_dir의 uniform 상회 +0.007이 노이즈 위인지 반복
+  런으로 확정; scale/rotation 블록 확장과 Instance_2 전이도 미측정.
 - ~~Instance_2에서 oracle-5 지도가 재현되는가?~~ **해결 (07-17): 재현됨.**
   100 evals/씬만으로 평균 +10.2% (8/10 씬 양수, Cantina/Zen은 동률권),
   씬별 갭이 인스턴스 간 r=0.89로 상관 — **oracle 갭은 씬의 고유 속성**.
@@ -147,7 +180,10 @@
 | Instance_1 셀렉터 비교 + 진단 | `experiments/paslcd_nbv_report.md` |
 | oracle-5 지도 | `experiments/oracle5_map_report.md` |
 | 프레임 특징 분석 | `experiments/frame_features_report.md` |
-| 러너/드라이버 | `subset_oscd.py`, `experiments/{oracle_search,oracle_local_search,frame_feature_analysis}.py` |
+| ChangeNBV 스펙·게이트 리포트 | `docs/{changenbv_plan,change_nbv_code_map,change_nbv_s1_report,change_nbv_s2_report}.md` |
+| 셀렉터 구현 (Part 2) | `view_selection/`, `subset_oscd.py --frames_method {dopt_pose,dopt_seq}` |
+| 셀렉터 결과 (Part 2) | `experiments/dopt_seq_results*.csv`, `outputs/change_nbv/s2/*.csv` |
+| 러너/드라이버 | `subset_oscd.py`, `experiments/{oracle_search,oracle_local_search,frame_feature_analysis,run_dopt_seq_eval}.py`, `scripts/run_change_nbv_s2.py` |
 | 원시 데이터 (전부 tracked, 61e209b 결정) | `experiments/{paslcd_nbv_results,garden_nbv_results,garden_sweep_results,oracle_search_results,all25_repeats,frame_features}.csv` |
 | rev3 탐색 로그 (untracked) | `experiments/oracle_local_search_r3{,b}.log` |
 

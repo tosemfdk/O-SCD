@@ -101,3 +101,25 @@ recheck3 기준 −0.007~+0.017로 무시 가능.)
 속성이다. 전 과정이 동일 머신·동일 배치(레퍼런스 포함)라 Instance_1 지도보다
 방법론적으로 깨끗하다. 원시 데이터:
 `experiments/{oracle_search_results,all25_repeats}_instance_2.csv`.
+
+## 6. Part 2 셀렉터 사다리 — GT-free 순차 선택 4변형 (K=5, clean replay)
+
+공통 루프: 첫 프레임 seed → 채점(포즈+모델 상태만) → 픽·fusion 반복 →
+선택 5장을 표준 파이프라인으로 재학습 후 평가. 채점 기준만 다름.
+
+| 변형 | 성분 | mIoU | 지도 백분위 | 진단 |
+|---|---|---|---|---|
+| candidate_only | 정보질량만 | 0.4574 | 16.4% | 연속 프레임 중복 |
+| +의심 재관측 | change-mask 가중 | 0.4673 | 19.2% | 절반의 씬만 |
+| dopt (스칼라) | 중복 할인 | 0.4778 | 22.3% | 재관측 회피 역효과 |
+| **dopt_dir** | **재관측+방향블록** | **0.4883** | **28.3%** | **최초 uniform 상회** |
+| (기준) uniform 평균 | — | 0.4817 | 18.9% | |
+| (기준) all-25 / oracle | — | 0.5237 / 0.5875 | 47.6% / 100% | |
+
+dopt_dir 씬별 oracle 갭 회수율: Zen +58% / Lounge +43% / Lunch_room +29% /
+Garden +26% / Playground +24% / Pots +15% / Printing_area +11% vs
+Cantina −14% / Porch −82% / Meeting_room −84% (실패 3씬 = 오라클 조합 겹침
+0/5, 공통 원인 고정 seed; Porch frame 0 = 그 씬 최악 독성 −0.077).
+근거 실측: Gate S2 222 replay — 할인 항이 컨텍스트 발생 시 순위상관을
+반전(Porch +0.22→−0.68), 재관측 가치의 criterion-수준 정량화. 데이터:
+`experiments/dopt_seq_results*.csv`, `outputs/change_nbv/s2/`.
