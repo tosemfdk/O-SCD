@@ -155,6 +155,10 @@ def parse_args_subset():
                              "historical runs); nonzero reseeds torch/np/random "
                              "right after Phase A so poses stay fixed across "
                              "seeds and only fusion/selection randomness varies")
+    parser.add_argument('--dump_cues', action='store_true',
+                        help="diagnostic: after Phase A, save every frame's "
+                             "SAM2 change cue (cues.pt) and exit — offline "
+                             "cue-vs-consensus analysis only, no fusion runs")
     parser.add_argument('--save_change_model', action='store_true',
                         help="save the final change model (r_change.ply, c "
                              "preserved) plus per-pose soft change masks and "
@@ -322,6 +326,23 @@ def main(dataset: Namespace, opt: Namespace, pipe: Namespace, args: Namespace):
         torch.cuda.manual_seed_all(args.train_seed)
         np.random.seed(args.train_seed)
         random.seed(args.train_seed)
+
+    if args.dump_cues:
+        # Diagnostic path (offline-pool scope): the SAM2 change cue of EVERY
+        # inference frame at its estimated pose. Selection never runs here —
+        # this feeds the cue-vs-R_global toxicity analysis.
+        cues, cue_names = [], []
+        with torch.no_grad():
+            for view in tqdm(all_views, desc="Dumping cues"):
+                image_rgb = render(view, gaussians_rgb, pipe, background)["render"]
+                cmap = generate_candidate_map(view.original_image[:3, ...],
+                                              image_rgb, model, patch_size,
+                                              height, width)
+                cues.append(cmap.detach().float().cpu())
+                cue_names.append(view.image_name)
+        torch.save({"image_names": cue_names, "cues": torch.stack(cues)},
+                   os.path.join(args.model_path, "cues.pt"))
+        return
 
     if args.frames_method == "manual":
         req = [s.strip() for s in args.frames_list.split(",") if s.strip()]
