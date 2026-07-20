@@ -86,7 +86,9 @@ def parse_args_subset():
     # Selection args
     parser.add_argument('--frames_method', type=str, default='all',
                         choices=['all', 'random', 'uniform', 'nbv', 'nbv_dopt',
-                                 'manual', 'dopt_pose', 'dopt_seq'],
+                                 'manual', 'dopt_pose', 'dopt_seq',
+                                 'kf_g_dir', 'kf_l_dir_gseed', 'kf_gu_dir',
+                                 'kf_gl_dir', 'kf_glu_dir', 'kf_glu_nodir'],
                         help="How to select which inference frames update R_change")
     parser.add_argument('--frames_list', type=str, default='',
                         help="manual: comma-separated image names (no extension) or indices")
@@ -116,6 +118,48 @@ def parse_args_subset():
     parser.add_argument('--info_alpha_threshold', type=float, default=0.5)
     parser.add_argument('--info_cache_root', type=str,
                         default='outputs/change_nbv/cache')
+    # Global-local keyframe selection args (Part 2 cycle 2, kf_* methods).
+    # Claim scope is offline_pool_keyframe_selection: R_global consumed all 25
+    # inference images before selection, so these are NOT active-NBV methods.
+    parser.add_argument('--keyframe_budget', type=int, default=-1,
+                        help="kf_*: number of keyframes (falls back to --budget)")
+    parser.add_argument('--global_context_source', type=str,
+                        default='all25_clean', choices=['all25_clean'],
+                        help="kf_*: recipe that produced R_global (only the "
+                             "standard all-25 pipeline is allowed)")
+    parser.add_argument('--global_context_checkpoint', type=str, default='',
+                        help="kf_*: explicit r_global.ply path (bypasses cache "
+                             "lookup)")
+    parser.add_argument('--global_context_seed', type=int, default=-1,
+                        help="kf_*: train_seed of the R_global build "
+                             "(-1 = same as --train_seed)")
+    parser.add_argument('--global_context_root', type=str,
+                        default='outputs/change_nbv/global_context')
+    parser.add_argument('--local_rebuild_each_round', action='store_true',
+                        default=True,
+                        help="kf_*: rebuild R_local(S) from the reference "
+                             "checkpoint every round (always on; incremental "
+                             "updates are a future speed ablation)")
+    parser.add_argument('--keyframe_rank_fusion', type=str,
+                        default='percentile_mean', choices=['percentile_mean'])
+    parser.add_argument('--save_round_models', action='store_true',
+                        help="kf_*: persist per-round R_local checkpoints and "
+                             "component masks")
+    parser.add_argument('--selection_only', action='store_true',
+                        help="kf_*: stop after writing selection_manifest.json "
+                             "(final metrics come from the driver's clean "
+                             "replay through the standard manual path)")
+    # Replicate / checkpoint args (Part 2 cycle 2)
+    parser.add_argument('--train_seed', type=int, default=0,
+                        help="0 = legacy RNG stream (bitwise-identical to "
+                             "historical runs); nonzero reseeds torch/np/random "
+                             "right after Phase A so poses stay fixed across "
+                             "seeds and only fusion/selection randomness varies")
+    parser.add_argument('--save_change_model', action='store_true',
+                        help="save the final change model (r_change.ply, c "
+                             "preserved) plus per-pose soft change masks and "
+                             "reference alpha masks under model_path — used by "
+                             "the all-25 global-context builder")
 
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
@@ -158,9 +202,10 @@ def main(dataset: Namespace, opt: Namespace, pipe: Namespace, args: Namespace):
 
     reference_dataset = ImageDataset(args, instance='ref')
 
-    if args.frames_method in ("nbv", "nbv_dopt", "manual", "dopt_pose",
-                              "dopt_seq"):
-        selected = []  # nbv*/dopt_seq: adaptive; manual/dopt_pose: post-Phase A
+    if (args.frames_method in ("nbv", "nbv_dopt", "manual", "dopt_pose",
+                               "dopt_seq")
+            or args.frames_method.startswith("kf_")):
+        selected = []  # nbv*/dopt_seq/kf_*: adaptive; manual/dopt_pose: post-Phase A
     else:
         selected = select_frames(args.frames_method, len(dataset), args.budget, args.select_seed)
 
@@ -266,6 +311,17 @@ def main(dataset: Namespace, opt: Namespace, pipe: Namespace, args: Namespace):
         cam_centers.append(view.camera_center)
         all_views.append(view)
     pbar_pose.close()
+
+    # Replicate seeding (Part 2 cycle 2): reseed AFTER Phase A so poses are
+    # identical across train seeds and only Phase B fusion/selection randomness
+    # varies. train_seed 0 keeps the legacy stream untouched (bitwise-identical
+    # to all historical runs).
+    if args.train_seed != 0:
+        torch.manual_seed(args.train_seed)
+        torch.cuda.manual_seed(args.train_seed)
+        torch.cuda.manual_seed_all(args.train_seed)
+        np.random.seed(args.train_seed)
+        random.seed(args.train_seed)
 
     if args.frames_method == "manual":
         req = [s.strip() for s in args.frames_list.split(",") if s.strip()]
@@ -516,6 +572,218 @@ def main(dataset: Namespace, opt: Namespace, pipe: Namespace, args: Namespace):
         pbar_inf.close()
         processing_order = list(selected)
         selected = sorted(selected)
+    elif args.frames_method.startswith("kf_"):
+        # Global-local consensus keyframe selection (Part 2 cycle 2).
+        # Offline pool setting: R_global was built from ALL 25 inference
+        # frames by the standard all-25 pipeline (driver Stage 1) and is only
+        # looked up here — never built silently, so its cost stays visible.
+        # Selection combines R_global's rendered soft change masks with the
+        # clean-rebuilt subset state R_local(S); no GT, no forced first frame,
+        # no Gaussian-index comparison across models.
+        import csv as _csv
+        import time as _time
+
+        from view_selection.global_context import (file_sha256,
+                                                   find_cached_context,
+                                                   global_context_key,
+                                                   load_frozen_change_model)
+        from view_selection.global_local_keyframe import select_keyframes_gl
+        from view_selection.types import InformationConfig
+
+        budget = args.keyframe_budget if args.keyframe_budget > 0 else args.budget
+        assert 0 < budget <= len(all_views), \
+            "kf_* needs --keyframe_budget (or --budget)"
+        cfg = InformationConfig(
+            output_space=args.info_output, weight_mode="pose",
+            num_probes=args.info_probes,
+            alpha_threshold=args.info_alpha_threshold,
+            lambda_rel=args.info_lambda_rel, lambda_abs=args.info_lambda_abs)
+        scene_tag = os.path.basename(os.path.normpath(args.source_path))
+        instance_tag = os.path.basename(
+            os.path.dirname(os.path.normpath(args.source_path)))
+        ref_ply = os.path.join(args.source_path, "reference_reconstruction",
+                               "point_cloud", "iteration_30000",
+                               "point_cloud.ply")
+
+        t_gctx = _time.time()
+        gseed = (args.global_context_seed if args.global_context_seed >= 0
+                 else args.train_seed)
+        if args.global_context_checkpoint:
+            gctx_ply = args.global_context_checkpoint
+            gctx_cache = "explicit_path"
+        else:
+            key = global_context_key(
+                scene_tag, instance_tag, file_sha256(ref_ply),
+                [v.image_name for v in all_views], gseed,
+                int(args.resolution), cfg.alpha_threshold,
+                repo_root=os.path.dirname(os.path.abspath(__file__)))
+            hit = find_cached_context(args.global_context_root, scene_tag,
+                                      instance_tag, key)
+            if hit is None:
+                raise FileNotFoundError(
+                    f"no cached R_global for {scene_tag}/{instance_tag} "
+                    f"seed {gseed} under {args.global_context_root}; build it "
+                    f"first (experiments/run_keyframe_gl_eval.py Stage 1)")
+            gctx_ply = os.path.join(hit, "r_global.ply")
+            gctx_cache = "hit"
+        r_global = load_frozen_change_model(gctx_ply,
+                                            gaussians_change.max_sh_degree)
+        gctx_hash = file_sha256(gctx_ply)
+        gctx_seconds = _time.time() - t_gctx
+
+        def _candidate_map_for(view):
+            # Cue computed once per frame, the first time it enters S. Only
+            # SELECTED frames ever reach here (scoring runs under
+            # FrameAccessGuard, so a candidate's content access would raise).
+            if getattr(view, "candidate_map", None) is None:
+                with torch.no_grad():
+                    image_rgb = render(view, gaussians_rgb, pipe,
+                                       background)["render"]
+                    view.candidate_map = generate_candidate_map(
+                        view.original_image[:3, ...], image_rgb, model,
+                        patch_size, height, width).detach().clone()
+            return view.candidate_map
+
+        def fuse_frames_clean(model_change, views_sorted, rng):
+            # Mirror of process_view's 16-iteration fusion on an explicit
+            # model + RNG: fresh optimizer state, chronological order, own lr
+            # counter — so R_local depends on the SET S only (spec §2B), not
+            # on greedy order or on how often this function ran before.
+            viewpoints_local = []
+            titer = 0
+            extent = None
+            for view in views_sorted:
+                viewpoints_local.append(view)
+                for iteration in range(16):
+                    titer += 1
+                    if rng.rand() > 0.33:
+                        keyframe_idx = int(rng.randint(0, len(viewpoints_local)))
+                    else:
+                        keyframe_idx = len(viewpoints_local) - 1
+                    viewpoint = viewpoints_local[keyframe_idx]
+                    model_change.update_learning_rate(titer)
+                    pkg = render_change(viewpoint, model_change, pipe, background)
+                    change_mask, viewspace_point_tensor = pkg["render"], pkg["viewspace_points"]
+                    visibility_filter, radii = pkg["visibility_filter"], pkg["radii"]
+                    gt_change = viewpoint.candidate_map
+                    change_mask = torch.sigmoid(change_mask.mean(dim=0, keepdim=True))
+                    d_loss = (gt_change * (1.0 - change_mask)).mean()
+                    d_reg = torch.log(change_mask.mean() ** 2 + 1.0)
+                    (d_loss + d_reg).backward()
+                    model_change.optimizer.step()
+                    model_change.optimizer.zero_grad(set_to_none=True)
+                    with torch.no_grad():
+                        model_change.max_radii2D[visibility_filter] = torch.max(
+                            model_change.max_radii2D[visibility_filter],
+                            radii[visibility_filter])
+                        model_change.add_densification_stats(
+                            viewspace_point_tensor, visibility_filter)
+                        if iteration == 4:
+                            grads = (model_change.xyz_gradient_accum
+                                     / model_change.denom)
+                            grads[grads.isnan()] = 0.0
+                            model_change.tmp_radii = radii
+                            if extent is None:
+                                scene_center = torch.stack(cam_centers, dim=0).mean(dim=0)
+                                extent = torch.max(torch.linalg.norm(
+                                    torch.stack([v for v in cam_centers], dim=0)
+                                    - scene_center.unsqueeze(0), dim=-1)).item() * 1.1
+                            model_change.densify_and_clone(
+                                grads, opt.densify_grad_threshold * 5, extent)
+                            model_change.densify_and_split(
+                                grads, opt.densify_grad_threshold * 5, extent)
+                            model_change.tmp_radii = None
+                            torch.cuda.empty_cache()
+            return model_change
+
+        run_id = f"ts{args.train_seed}_{_time.strftime('%Y%m%d_%H%M%S')}"
+        kf_out_root = os.path.join("outputs", "change_nbv", "keyframe",
+                                   scene_tag, args.frames_method, run_id)
+        os.makedirs(kf_out_root, exist_ok=True)
+
+        def rebuild_local_fn(S_sorted):
+            from view_selection.global_local_keyframe import local_rebuild_seed
+            for i in S_sorted:
+                _candidate_map_for(all_views[i])
+            rng = np.random.RandomState(
+                local_rebuild_seed(args.train_seed, S_sorted))
+            model_local = GaussianModel(gaussians_change.max_sh_degree, 0)
+            model_local.load_ply_change(ref_ply)
+            model_local.training_setup_change(opt)
+            fuse_frames_clean(model_local,
+                              [all_views[i] for i in S_sorted], rng)
+            if args.save_round_models:
+                rd = os.path.join(kf_out_root,
+                                  f"round_{len(S_sorted) + 1:02d}")
+                os.makedirs(rd, exist_ok=True)
+                model_local.save_ply_change(
+                    os.path.join(rd, "local_checkpoint.ply"))
+            return model_local
+
+        round_artifact_fn = None
+        if args.save_round_models:
+            def round_artifact_fn(round_idx, masks):
+                rd = os.path.join(kf_out_root, f"round_{round_idx:02d}",
+                                  "component_masks")
+                os.makedirs(rd, exist_ok=True)
+                torch.save({str(i): {k: v.cpu() for k, v in masks[i].items()}
+                            for i in masks},
+                           os.path.join(rd, "masks.pt"))
+
+        manifest = select_keyframes_gl(
+            args.frames_method, all_views, gaussians_rgb, r_global, budget,
+            cfg, pipe, background, rebuild_local_fn, scene_tag,
+            args.train_seed, round_artifact_fn=round_artifact_fn)
+        manifest.update({
+            "scene": scene_tag, "instance": instance_tag,
+            "global_context_source": args.global_context_source,
+            "global_context_checkpoint": os.path.abspath(gctx_ply),
+            "global_context_checkpoint_hash": gctx_hash,
+            "global_context_seed": gseed,
+            "global_context_cache": gctx_cache,
+            "global_context_load_seconds": round(gctx_seconds, 2),
+            "local_rebuild_each_round": True,
+            "selection_output_root": os.path.abspath(kf_out_root),
+        })
+        for dst in (os.path.join(args.model_path, "selection_manifest.json"),
+                    os.path.join(kf_out_root, "selection_manifest.json")):
+            with open(dst, "w") as f:
+                json.dump(manifest, f, indent=2)
+        mass_names = ("global", "local", "unresolved", "overlap", "local_only")
+        for rnd in manifest["rounds"]:
+            rd = os.path.join(kf_out_root, f"round_{rnd['round']:02d}")
+            os.makedirs(rd, exist_ok=True)
+            with open(os.path.join(rd, "candidate_scores.csv"), "w",
+                      newline="") as f:
+                wcsv = _csv.writer(f)
+                comps = rnd["components"]
+                wcsv.writerow(["candidate"]
+                              + [f"raw_{c}" for c in comps]
+                              + [f"rank_{c}" for c in comps] + ["total"]
+                              + [f"mass_{m_}" for m_ in mass_names])
+                for i in rnd["candidates"]:
+                    si = str(i)
+                    wcsv.writerow(
+                        [i] + [rnd["raw_scores"][c][si] for c in comps]
+                        + [rnd["percentile_ranks"][c][si] for c in comps]
+                        + [rnd["total_score"][si]]
+                        + [rnd["mask_mass"][m_][si] for m_ in mass_names])
+
+        processing_order = list(manifest["greedy_order"])
+        selected = sorted(processing_order)
+        del r_global
+        torch.cuda.empty_cache()
+        if not args.selection_only:
+            # Final evaluation model (spec §2C): all selection working models
+            # are discarded; gaussians_change is still the untouched reference
+            # state, so a chronological process_view pass here is exactly the
+            # standard clean replay.
+            pbar_inf = tqdm(selected,
+                            desc=f"Running OSCD subset ({args.frames_method} "
+                                 f"replay, K={len(selected)})")
+            for frameID in pbar_inf:
+                process_view(all_views[frameID], pbar_inf)
+            pbar_inf.close()
     else:
         pbar_inf = tqdm(selected, desc=f"Running OSCD subset ({args.frames_method}, K={len(selected)})")
         for frameID in pbar_inf:
@@ -528,18 +796,46 @@ def main(dataset: Namespace, opt: Namespace, pipe: Namespace, args: Namespace):
 
     # All-query-view evaluation: render the final R_change at every inference pose.
     # Held-out frames contribute only their pose here; their RGB/cues never updated R_change.
-    with torch.no_grad():
-        for view in all_views:
-            render_pkg_change = render_change(view, gaussians_change, pipe, background)
-            change_mask = render_pkg_change["render"].mean(dim=0)
-            change_mask = (change_mask > 0.5).float()
-            cv2.imwrite(os.path.join(renders_path, "query_mask", f"{view.image_name}.png"), (change_mask.cpu().numpy() * 255).astype(np.uint8))
+    # --selection_only (kf_*): no fusion ran in this process, so query masks
+    # would be meaningless — the driver's clean replay produces the metrics.
+    if not args.selection_only:
+        with torch.no_grad():
+            for view in all_views:
+                render_pkg_change = render_change(view, gaussians_change, pipe, background)
+                change_mask = render_pkg_change["render"].mean(dim=0)
+                change_mask = (change_mask > 0.5).float()
+                cv2.imwrite(os.path.join(renders_path, "query_mask", f"{view.image_name}.png"), (change_mask.cpu().numpy() * 255).astype(np.uint8))
+
+    if args.save_change_model:
+        # Global-context artifacts (Part 2 cycle 2): the final change model with
+        # c preserved, plus per-pose soft change masks (sigmoid of the raw
+        # channel-mean logit) and reference alpha masks for every inference pose.
+        from view_selection.weights import alpha_map
+        gaussians_change.save_ply_change(
+            os.path.join(args.model_path, "r_change.ply"))
+        soft_masks, alpha_masks, names = [], [], []
+        with torch.no_grad():
+            for view in all_views:
+                z = render_change(view, gaussians_change, pipe,
+                                  background)["render"].mean(dim=0)
+                soft_masks.append(torch.sigmoid(z).cpu())
+                alpha_masks.append(
+                    alpha_map(gaussians_rgb, view, pipe, background).cpu())
+                names.append(view.image_name)
+        torch.save({"image_names": names,
+                    "soft_masks": torch.stack(soft_masks)},
+                   os.path.join(args.model_path,
+                                "all25_rendered_soft_masks.pt"))
+        torch.save({"image_names": names,
+                    "alpha_masks": torch.stack(alpha_masks)},
+                   os.path.join(args.model_path, "alpha_masks.pt"))
 
     with open(os.path.join(args.model_path, "selection.json"), 'w') as f:
         json.dump({
             "frames_method": args.frames_method,
             "budget": len(selected),
             "select_seed": args.select_seed,
+            "train_seed": args.train_seed,
             "processing_order": processing_order,
             "selected_indices": selected,
             "selected_names": [all_views[i].image_name for i in selected],

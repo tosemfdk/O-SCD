@@ -38,8 +38,14 @@ N_FRAMES, K = 25, 5
 
 
 def run_combo(scene: str, combo: tuple[int, ...],
-              gpu: int | None = None) -> tuple[float, float] | None:
+              gpu: int | None = None,
+              train_seed: int = 0,
+              tag_suffix: str = "") -> tuple[float, float] | None:
     tag = "c" + "-".join(map(str, combo))
+    if train_seed:
+        tag += f"_ts{train_seed}"
+    if tag_suffix:  # disambiguates concurrent replays of the SAME combo
+        tag += f"_{tag_suffix}"
     out_dir = os.path.join(REPO, "output_subset", "oracle", INSTANCE, scene, tag)
     src = os.path.join(REPO, "data", "PASLCD", INSTANCE, scene)
     cmd = [sys.executable, os.path.join(REPO, "subset_oscd.py"),
@@ -47,6 +53,10 @@ def run_combo(scene: str, combo: tuple[int, ...],
            "--resolution", "4", "--test_hold", "5",
            "--frames_method", "manual",
            "--frames_list", ",".join(map(str, combo))]
+    if train_seed:
+        # nonzero only — the flag's 0 default is the legacy stream, and omitting
+        # it keeps historical oracle/all25 invocations bitwise identical
+        cmd += ["--train_seed", str(train_seed)]
     env = {**os.environ, "PYTHONPATH": ""}
     # torch.compile(max-autotune) on SAM2 embeddings breaks under torch 2.5.1
     # (V100 server env); eager is numerically fine and less noisy.
