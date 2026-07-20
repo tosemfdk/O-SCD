@@ -331,16 +331,20 @@ def main(dataset: Namespace, opt: Namespace, pipe: Namespace, args: Namespace):
         # Diagnostic path (offline-pool scope): the SAM2 change cue of EVERY
         # inference frame at its estimated pose. Selection never runs here —
         # this feeds the cue-vs-R_global toxicity analysis.
-        cues, cue_names = [], []
+        cues, cue_names, originals, renders = [], [], [], []
         with torch.no_grad():
             for view in tqdm(all_views, desc="Dumping cues"):
                 image_rgb = render(view, gaussians_rgb, pipe, background)["render"]
-                cmap = generate_candidate_map(view.original_image[:3, ...],
-                                              image_rgb, model, patch_size,
-                                              height, width)
+                orig = view.original_image[:3, ...]
+                cmap = generate_candidate_map(orig, image_rgb, model,
+                                              patch_size, height, width)
                 cues.append(cmap.detach().float().cpu())
+                originals.append(orig.detach().float().cpu())
+                renders.append(image_rgb.detach().float().cpu())
                 cue_names.append(view.image_name)
-        torch.save({"image_names": cue_names, "cues": torch.stack(cues)},
+        torch.save({"image_names": cue_names, "cues": torch.stack(cues),
+                    "originals": torch.stack(originals),
+                    "renders": torch.stack(renders)},
                    os.path.join(args.model_path, "cues.pt"))
         return
 
