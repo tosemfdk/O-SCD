@@ -123,3 +123,27 @@ Cantina −14% / Porch −82% / Meeting_room −84% (실패 3씬 = 오라클 조
 근거 실측: Gate S2 222 replay — 할인 항이 컨텍스트 발생 시 순위상관을
 반전(Porch +0.22→−0.68), 재관측 가치의 criterion-수준 정량화. 데이터:
 `experiments/dopt_seq_results*.csv`, `outputs/change_nbv/s2/`.
+
+## 7. Part 2 사이클 2 — GL-Keyframe pilot (2026-07-20, offline pool, 5씬 × 3시드)
+
+claim scope = offline_pool_keyframe_selection (25장 전체로 R_global을 먼저
+만들므로 active NBV 아님). 실패 3씬 + Zen + Playground, 3-seed 평균,
+clean replay. 상세: `docs/change_nbv_keyframe_pilot_report.md`.
+
+| 방법 | mIoU | 백분위 | Δuniform | Δ4차 | 실패3씬 win | Zen |
+|---|---|---|---|---|---|---|
+| uniform (같은 배치) | 0.4547 | 19.5% | — | +0.008 | — | 0.4190 |
+| dopt_seq 4차 (재실행) | 0.4472 | 20.1% | −0.008 | — | — | 0.5147 |
+| kf_g_dir | 0.4367 | 32.3% | −0.018 | −0.011 | 3/3 | **0.3183 붕괴** |
+| **kf_l_dir_gseed** | **0.4823** | **37.7%** | **+0.028** | **+0.035** | **3/3** | 0.4770 |
+| kf_gu_dir | 0.4165 | 19.7% | −0.038 | −0.031 | 3/3 | 0.3183 |
+| kf_gl_dir | 0.4317 | 29.9% | −0.023 | −0.015 | 2/3 | 0.3639 |
+| kf_glu_dir (main 후보) | 0.4364 | 23.5% | −0.018 | −0.011 | 3/3 | 0.3639 |
+| kf_glu_nodir | 0.3863 | 7.6% | −0.068 | −0.061 | 1/3 | 0.2826 |
+
+판정: **frame-0 고정 seed가 실패 3씬의 주 원인으로 확정** — 첫 프레임만
+global score로 풀어준 kf_l_dir_gseed가 실패 3씬 전부 회복(+0.035 paired,
+oracle overlap 0.53→0.73). global/local mask 성분은 seed 이후 라운드에선
+역효과(R_global 오신호 전파, Zen·Playground), 3×3 방향 블록 기여는 재확인
+(glu_dir vs nodir +0.050). GO 조건은 kf_l_dir_gseed만 충족 — 10씬 full
+sweep은 승인 대기. 데이터: `experiments/keyframe_gl_{results,all25}.csv`.

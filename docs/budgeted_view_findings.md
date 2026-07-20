@@ -77,6 +77,25 @@
   공통 원인 = 고정 seed. Porch frame 0은 그 씬 최악 독성(−0.077).
   단일런 기준 uniform 상회 +0.007은 노이즈(±0.02) 경계 — 반복 확정 필요.
 
+**Part 2 사이클 2 — GL-Keyframe pilot (2026-07-20, offline pool 5씬 × 3시드):**
+25장 전체로 만든 R_global(all-25 context)과 clean-rebuild R_local(S)을
+image-space soft mask로 결합하는 6개 kf_* 변형 vs 같은 배치의 uniform·4차.
+결과 (`docs/change_nbv_keyframe_pilot_report.md`):
+
+- **seed 자유화가 실질 발견**: 첫 프레임만 global directional score로 고르고
+  이후를 4차 criterion에 맡긴 `kf_l_dir_gseed`가 0.4823 (uniform +0.028,
+  4차 +0.035, 백분위 37.7%), **실패 3씬 전부 회복** (Cantina 0.42→0.52,
+  Meeting_room 0.45→0.51, Porch 0.45→0.53) — 고정 seed 원인론이 실측 확정.
+- **global/local mask 성분은 seed 이후엔 역효과**: kf_g/gl/gu/glu 전부
+  uniform 이하. R_global이 약한 씬(Playground: all-25 0.358)에서 오신호를
+  전파하고 Zen을 붕괴시킴(kf_g_dir 0.318) — "R_global을 hard 신호로 쓰지
+  말 것"(해석 F) 확인.
+- **3×3 방향 블록 기여 재확인**: kf_glu_dir(0.4364) vs 동일 성분 scalar
+  질량 kf_glu_nodir(0.3863), Δ+0.050.
+- **Playground 경고**: oracle 조합에 frame 0이 포함된(frame 0이 앵커인)
+  씬에서는 seed 자유화가 소폭 손해 — 유일하게 전 kf_*가 4차 이하.
+- GO 조건은 kf_l_dir_gseed만 충족. 10씬 full sweep은 승인 대기 상태로 정지.
+
 ## 4. 핵심 결과: Oracle-5 지도 (rev3, 씬당 ~590 evals)
 
 **잘 고른 5장은 25장 전부보다 낫다 — 10/10 씬, 평균 +12.2% (+4.3~+45.2%).**
@@ -157,8 +176,13 @@
 - ~~1/d² 근접 편향 수정 시 nbv_dopt가 K≤3에서 uniform을 넘는가?~~
   **해결 (07-20)**: exact xyz-Jacobian 블록(dopt_dir)이 proxy를 대체하자
   Zen이 0.22 → 0.515로 반전. K=5에서 uniform 상회; K≤3은 미측정.
-- **신규 (07-20)**: 고정 seed(첫 프레임)의 안전화 — 실패 3씬의 유일한
-  공통 인자. uniform 2장 seed 또는 seed 한정 독성 가드가 후보.
+- ~~고정 seed(첫 프레임)의 안전화 — 실패 3씬의 유일한 공통 인자.~~
+  **해결 (07-20, 사이클 2)**: global directional score로 첫 프레임을 자유
+  선택(kf_l_dir_gseed)하자 실패 3씬 전부 회복, 5씬 paired +0.035. 남은 것:
+  frame 0이 실제 앵커인 씬(Playground)의 소폭 손실 보호 가드.
+- **신규 (07-20, 사이클 2)**: R_global soft mask 성분이 seed 이후 라운드에서
+  역효과인 이유 — sigmoid 평탄함인가, all-25 오신호 자체인가? binary 대비
+  마스크(1/eps 컨트라스트)로 W_global을 재정의하는 ablation이 다음 후보.
 - **신규 (07-20)**: dopt_dir의 uniform 상회 +0.007이 노이즈 위인지 반복
   런으로 확정; scale/rotation 블록 확장과 Instance_2 전이도 미측정.
 - ~~Instance_2에서 oracle-5 지도가 재현되는가?~~ **해결 (07-17): 재현됨.**
