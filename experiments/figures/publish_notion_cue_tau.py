@@ -1,12 +1,16 @@
 # Append the tau=0.5 vs 0.9 case-montage section to the Notion write-up.
-#   export NOTION_TOKEN=...  &&  python experiments/figures/publish_notion_cue_tau.py
+# Target: "SCD-NBV Part 3 - change feature quality difference".
+# The key is read from <repo>/.notion_token (gitignored); NOTION_TOKEN wins if set.
+#   python experiments/figures/publish_notion_cue_tau.py
 import json
 import os
 import subprocess
 
 S = os.path.dirname(os.path.abspath(__file__))
-TOKEN = os.environ["NOTION_TOKEN"]
-PAGE = "3a3cbb7d793780f5999cf6e18767e6db"
+REPO = os.path.dirname(os.path.dirname(S))
+TOKEN = os.environ.get("NOTION_TOKEN") or \
+    open(os.path.join(REPO, ".notion_token")).read().strip()
+PAGE = "3a3cbb7d7937808aa48ef3185963afab"
 H = ["-H", f"Authorization: Bearer {TOKEN}", "-H", "Notion-Version: 2022-06-28"]
 
 

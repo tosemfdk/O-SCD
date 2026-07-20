@@ -5,3 +5,6 @@ __pycache__/
 /data/PASLCD
 /output_subset/**
 !/output_subset/.gitkeep
+
+# Notion API key (local only, never commit)
+.notion_token
