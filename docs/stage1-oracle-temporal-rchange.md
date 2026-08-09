@@ -1,14 +1,15 @@
 # Stage 1 — Oracle Temporal `R_change` Vertical Slice
 
-> 상태: **부분 구현 — lifespan selection과 synthetic CUDA renderer vertical slice 완료**
+> 상태: **E3 구현·검증 완료 — lifespan DC, corrected cue, state-specific geometry**
 > 목표: changepoint를 정확히 안다고 가정했을 때, timestamp-conditioned temporal `R_change`가 서로 다른 시간대의 change cue 충돌을 분리할 수 있는지 검증한다.
 
-현재 첫 구현은 `state_change_dc`, `state_start`, `state_end`, `state_valid`만 포함한다. 아래 전체 Stage 1 계약의 `state_status`, `num_states`, `transition_state()`는 automatic lifecycle transition을 구현하는 다음 단계까지 명시적으로 보류한다. 따라서 이후 절에서 이 두 metadata를 “필수”라고 표현한 부분은 **완성된 Stage 1의 목표 계약**을 뜻하며 현재 lifespan-only slice의 구현 계약은 아니다. Oracle boundary는 manual global segment를 제공할 뿐이며 BOCD 또는 event detector는 아직 구현하지 않는다.
+현재 checkpoint는 `state_change_dc`, `state_start`, `state_end`, `state_valid`와 state별 `xyz`/`opacity`/`scale`/`rotation` delta를 포함한다. 아래 전체 Stage 1 계약의 `state_status`, `num_states`, `transition_state()`는 automatic lifecycle transition을 구현하는 다음 단계까지 명시적으로 보류한다. 따라서 이후 절에서 이 metadata를 “필수”라고 표현한 부분은 **완성된 Stage 1의 목표 계약**을 뜻하며 현재 oracle-boundary 구현 계약은 아니다. Oracle boundary는 manual global segment를 제공할 뿐이며 BOCD 또는 event detector는 구현하지 않는다.
 
 - 현재 결과와 시각화: [`temporal-lifespan-smoke.md`](temporal-lifespan-smoke.md)
-- 현재 구현 범위: checked selector, temporal DC sidecar, renderer `override_dc`/`override_opacity` opacity gating, CUDA gradient isolation
+- E3 결과: [`instance1-state-geometry-lifespan-comparison-ko.md`](instance1-state-geometry-lifespan-comparison-ko.md)
+- 현재 구현 범위: checked selector, temporal DC/geometry sidecar, renderer attribute override와 opacity gating, CUDA gradient isolation, exact-120 runner와 checkpoint
 - 정리된 계약: `-1` local state는 tensor에 남기되 renderer에서 zero effective opacity로 숨긴다.
-- 아직 미구현: state transition, replay/fusion, checkpoint, online-loop integration, BOCD
+- 아직 미구현: automatic state transition, online-loop integration, BOCD
 
 ## 1. 이번 단계가 답해야 하는 질문
 

@@ -1,5 +1,8 @@
 # Instance_1 state-specific geometry lifespan 실험
 
+> 저장소 checkpoint: 현재 `develop`은 이 E3 구현 단계까지만 유지하며 MCMC,
+> SGLD, relocation 코드는 포함하지 않는다.
+
 ## 1. 질문과 결론
 
 이 실험의 질문은 다음과 같다.

@@ -53,10 +53,11 @@ g_i: {(change state, start time, end time, confidence)}
 
 ## 현재 구현 및 연구 단계
 
-Oracle changepoint 기반 temporal `R_change`와 fixed-capacity MCMC ablation 구현 및 Instance 1 pilot을 완료했다.
+현재 저장소 checkpoint는 oracle boundary 기반 lifespan separation과 **E3 state-specific geometry optimization**까지만 포함한다.
 
-- Stage 1 lifespan separation: 구현 및 검증 완료. Timestamp별 state 분리는 naive persistent O-SCD보다 성능과 과거 state 보존이 개선되었다.
-- Geometry/SGLD/MCMC pilot: 구현 완료. 현재 SSF 목적에서 geometry 최적화와 공식 live-target relocation은 DC-only lifespan을 개선하지 못했다.
-- 현재 우선순위: cue/SSF/hard-gating matched audit 후 immutable reference layer와 movable residual layer를 분리한다.
-- 다음 실험: [`docs/experiment-retrospective-2026-08-09-ko.md`](docs/experiment-retrospective-2026-08-09-ko.md)의 N0 -> N1 -> N2 stop gate를 따른다.
-- BOCD, automatic boundary discovery, object trajectory tracking은 manual-boundary representation gate가 통과할 때까지 추가하지 않는다.
+- Lifespan separation: state별 DC와 half-open interval을 구현하고 naive persistent O-SCD보다 과거 state 보존이 개선되는 것을 확인했다.
+- Corrected cue experiment: O-SCD pixel + SAM2.1 cue, fixed pose, 304 frames, 이미지당 120 updates로 DC-only lifespan을 검증했다.
+- E3 geometry: Gaussian index와 topology는 고정한 채 state별 xyz/DC/opacity/scale/rotation delta와 S0 soft anchor를 학습한다.
+- E3 결과: geometry는 SSF loss를 낮췄지만 DC-only보다 overall mIoU/F1이 소폭 낮았다. 상세 내용은 [`docs/instance1-state-geometry-lifespan-comparison-ko.md`](docs/instance1-state-geometry-lifespan-comparison-ko.md)에 기록한다.
+- 이 checkpoint에는 MCMC, SGLD, relocation, BOCD, automatic boundary discovery, densification, pruning을 포함하지 않는다.
+- 다음 연구 확장은 E3의 표현과 failure mode를 충분히 검토한 뒤 별도 계획으로 시작한다.
