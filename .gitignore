@@ -1,0 +1,15 @@
+# Python caches and local test state
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local datasets and generated experiment artifacts
+/data/
+/outputs/
+
+# OMX/runtime-local state
+/.omx/
+
+# Editor and OS metadata
+.DS_Store
+*.swp

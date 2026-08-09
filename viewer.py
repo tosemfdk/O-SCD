@@ -23,6 +23,7 @@ import time
 import threading
 import argparse
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional, List, Dict
 
 import cv2
@@ -36,6 +37,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from scene.gaussian_model import GaussianModel
 from scene.cameras import MiniCam
 from gaussian_renderer import render, render_change
+from temporal.viewer_export import ensure_dc_state_viewer_export
 from utils.graphics_utils import getProjectionMatrix
 
 
@@ -176,6 +178,8 @@ class GaussianViewer:
         sh_degree: int = 3,
         port: int = 8080,
         resolution: int = 4,
+        initial_scene: str = "reference",
+        change_display: str = "binary",
     ):
         self.port = port
         self.sh_degree = sh_degree
@@ -190,7 +194,8 @@ class GaussianViewer:
         self._current_viewpoint_idx = 0
         
         self.render_width = 1008
-        self.active_scene = "reference"
+        self.active_scene = initial_scene
+        self.change_display = change_display
         self._render_lock = threading.Lock()
         
         print(f"Loading reference model from: {ref_ply}")
@@ -225,6 +230,11 @@ class GaussianViewer:
         else:
             if change_ply:
                 print(f"Warning: Change PLY not found at {change_ply}")
+
+        if self.active_scene == "change" and self.gaussians_change is None:
+            self.active_scene = "reference"
+        elif self.active_scene == "updated" and self.gaussians_upd is None:
+            self.active_scene = "reference"
 
         cameras_path = cameras_json
         if not cameras_path or not os.path.exists(cameras_path):
@@ -353,7 +363,27 @@ class GaussianViewer:
             self.gui_scene = self.server.gui.add_dropdown(
                 "Active Scene",
                 options=scene_options,
-                initial_value="Reference 3DGS",
+                initial_value={
+                    "reference": "Reference 3DGS",
+                    "updated": "Updated 3DGS",
+                    "change": "Change 3DGS",
+                }[self.active_scene],
+            )
+
+            self.gui_change_display = self.server.gui.add_dropdown(
+                "R_change Display",
+                options=["Raw Response", "Binary Mask"],
+                initial_value="Raw Response" if self.change_display == "raw" else "Binary Mask",
+                disabled=self.gaussians_change is None,
+            )
+
+            self.gui_change_threshold = self.server.gui.add_slider(
+                "R_change Threshold",
+                min=0.0,
+                max=1.0,
+                step=0.01,
+                initial_value=0.5,
+                disabled=self.gaussians_change is None,
             )
 
             # Add Overlay Checkbox
@@ -378,7 +408,7 @@ class GaussianViewer:
                 initial_value="White",
                 disabled=self.gaussians_change is None
             )
-        
+
         if self.viewpoints:
             with self.server.gui.add_folder("Camera Viewpoints"):
                 self.gui_viewpoint = self.server.gui.add_dropdown(
@@ -448,6 +478,19 @@ class GaussianViewer:
                 return
             self._render_for_client(event.client)
 
+        @self.gui_change_display.on_update
+        def _on_change_display(event: viser.GuiEvent) -> None:
+            if event.client is None:
+                return
+            self.change_display = "raw" if self.gui_change_display.value == "Raw Response" else "binary"
+            self._render_for_client(event.client)
+
+        @self.gui_change_threshold.on_update
+        def _on_change_threshold(event: viser.GuiEvent) -> None:
+            if event.client is None:
+                return
+            self._render_for_client(event.client)
+
         @self.gui_render_width.on_update
         def _on_width_change(event: viser.GuiEvent) -> None:
             if event.client is None:
@@ -506,7 +549,17 @@ class GaussianViewer:
     
     def _update_inference_thumbnail(self, idx: int):
         pass # Now handled dynamically in _render_for_client
-    
+
+    @staticmethod
+    def _raw_change_response(rendered: torch.Tensor) -> torch.Tensor:
+        return rendered.mean(dim=0, keepdim=True).clamp(0.0, 1.0)
+
+    def _display_change_response(self, rendered: torch.Tensor, *, force_binary: bool = False) -> torch.Tensor:
+        response = self._raw_change_response(rendered)
+        if force_binary or self.change_display == "binary":
+            response = (response > float(self.gui_change_threshold.value)).float()
+        return response.repeat(3, 1, 1)
+
     @torch.no_grad()
     def _render_for_client(self, client: viser.ClientHandle):
         if not self._render_lock.acquire(blocking=False):
@@ -535,22 +588,22 @@ class GaussianViewer:
             cam = create_mini_cam(wxyz, position, fov, aspect, width, height)
             
             gaussians = self._get_active_gaussians()
+            change_render = None
             
             if self.active_scene == "change":
                 result = render_change(cam, gaussians, self.pipe, self.background)
-                rendered = result["render"]
-                rendered = rendered.mean(dim=0, keepdim=True)
-                rendered = (rendered > 0.5).float().repeat(3, 1, 1)
+                change_render = result["render"]
+                rendered = self._display_change_response(change_render)
 
             else:
                 result = render(cam, gaussians, self.pipe, self.background)
                 rendered = result["render"]
 
                 if self.gui_overlay.value and self.gaussians_change is not None:
-                    res_overlay = render_change(cam, self.gaussians_change, self.pipe, self.background)["render"]
+                    change_render = render_change(cam, self.gaussians_change, self.pipe, self.background)["render"]
                     # Process overlay mask
-                    mask_1ch = res_overlay.mean(dim=0, keepdim=True)
-                    mask_binary = (mask_1ch > 0.5).float()
+                    mask_1ch = change_render.mean(dim=0, keepdim=True)
+                    mask_binary = (mask_1ch > float(self.gui_change_threshold.value)).float()
                     
                     # Determine overlay color
                     color_map = {
@@ -569,7 +622,7 @@ class GaussianViewer:
                     # Blend
                     alpha = self.gui_overlay_opacity.value
                     rendered = rendered * (1 - alpha * mask_binary) + colored_overlay * alpha
-            
+
             image = rendered.clamp(0.0, 1.0)
             image_hwc = (image.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
             
@@ -584,6 +637,7 @@ class GaussianViewer:
                 thumb_cam = create_mini_cam(wxyz, position, fov, aspect, thumb_w, thumb_h)
                 render_ref_thumb = None
                 render_change_thumb = None
+                render_change_mask_thumb = None
                 render_upd_thumb = None
                 
                 if getattr(self, 'gaussians_ref', None) is not None:
@@ -593,10 +647,16 @@ class GaussianViewer:
                     
                 if getattr(self, 'gaussians_change', None) is not None:
                     res_chg = render_change(thumb_cam, self.gaussians_change, self.pipe, self.background)["render"]
-                    
-                    res_chg = (res_chg.mean(dim=0, keepdim=True) > 0.5).float().repeat(3, 1, 1)
-                    res_chg = res_chg.clamp(0.0, 1.0).permute(1, 2, 0).cpu().numpy() * 255
-                    render_change_thumb = np.ascontiguousarray(res_chg.astype(np.uint8))
+                    raw_response = self._raw_change_response(res_chg)
+                    binary_mask = (
+                        raw_response > float(self.gui_change_threshold.value)
+                    ).float()
+                    raw_response = raw_response.repeat(3, 1, 1)
+                    binary_mask = binary_mask.repeat(3, 1, 1)
+                    raw_response = raw_response.permute(1, 2, 0).cpu().numpy() * 255
+                    binary_mask = binary_mask.permute(1, 2, 0).cpu().numpy() * 255
+                    render_change_thumb = np.ascontiguousarray(raw_response.astype(np.uint8))
+                    render_change_mask_thumb = np.ascontiguousarray(binary_mask.astype(np.uint8))
 
                 if getattr(self, 'gaussians_upd', None) is not None:
                     res_upd = render(thumb_cam, self.gaussians_upd, self.pipe, self.background)["render"]
@@ -615,8 +675,15 @@ class GaussianViewer:
                     # Enforce exact shape
                     if render_change_thumb.shape[0] != thumb_h or render_change_thumb.shape[1] != thumb_w:
                         render_change_thumb = cv2.resize(render_change_thumb, (thumb_w, thumb_h))
-                    cv2.putText(render_change_thumb, "Change Mask", (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                    cv2.putText(render_change_thumb, "R_change Raw Response", (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
                     panels.append(render_change_thumb)
+
+                if render_change_mask_thumb is not None:
+                    if render_change_mask_thumb.shape[0] != thumb_h or render_change_mask_thumb.shape[1] != thumb_w:
+                        render_change_mask_thumb = cv2.resize(render_change_mask_thumb, (thumb_w, thumb_h))
+                    threshold_label = f"R_change Mask > {float(self.gui_change_threshold.value):.2f}"
+                    cv2.putText(render_change_mask_thumb, threshold_label, (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                    panels.append(render_change_mask_thumb)
                     
                 if render_upd_thumb is not None:
                     # Enforce exact shape
@@ -646,12 +713,18 @@ class GaussianViewer:
 
 def main():
     parser = argparse.ArgumentParser(description="Interactive Gaussian Splatting Viewer")
-    parser.add_argument("--ref_ply", type=str, required=True,
-                        help="Path to reference 3DGS point_cloud.ply")
+    parser.add_argument("--ref_ply", type=str, default=None,
+                        help="Path to reference 3DGS point_cloud.ply (inferred from temporal checkpoint)")
     parser.add_argument("--updated_ply", type=str, default=None,
                         help="Path to updated scene PLY (optional)")
     parser.add_argument("--change_ply", type=str, default=None,
                         help="Path to change scene PLY (optional)")
+    parser.add_argument("--temporal_checkpoint", type=str, default=None,
+                        help="DC-only temporal checkpoint to materialize for inspection")
+    parser.add_argument("--temporal_state", type=int, default=0,
+                        help="Temporal state slot to inspect (default: 0)")
+    parser.add_argument("--temporal_export_ply", type=str, default=None,
+                        help="Optional path for the materialized temporal change PLY")
     parser.add_argument("--cameras_json", type=str, default=None,
                         help="Path to cameras.json (auto-detected from ref_ply if not given)")
     parser.add_argument("--inference_dir", type=str, default=None,
@@ -662,7 +735,52 @@ def main():
                         help="Viser server port (default: 8080)")
     parser.add_argument("--resolution", type=int, default=1,
                         help="Resolution downscale factor (default: 1, matching training)")
+    parser.add_argument("--initial_scene", choices=("auto", "reference", "updated", "change"), default="auto",
+                        help="Scene selected when the viewer opens")
+    parser.add_argument("--change_display", choices=("auto", "raw", "binary"), default="auto",
+                        help="Initial R_change visualization (raw is useful for checkpoint inspection)")
     args = parser.parse_args()
+
+    if args.temporal_checkpoint and args.change_ply:
+        parser.error("--temporal_checkpoint and --change_ply are mutually exclusive")
+
+    temporal_export = None
+    if args.temporal_checkpoint:
+        temporal_export = ensure_dc_state_viewer_export(
+            args.temporal_checkpoint,
+            state_id=args.temporal_state,
+            output_ply=args.temporal_export_ply,
+        )
+        args.change_ply = temporal_export["output_ply"]
+        if args.ref_ply is None:
+            args.ref_ply = temporal_export["base_ply"]
+
+        config_path = Path(args.temporal_checkpoint).expanduser().resolve().parent / "config.json"
+        if config_path.is_file():
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            if args.cameras_json is None and config.get("fixed_cameras_json"):
+                args.cameras_json = str(Path(config["fixed_cameras_json"]).expanduser())
+            if args.inference_dir is None and config.get("source_path"):
+                source_path = Path(config["source_path"]).expanduser()
+                if not source_path.is_absolute():
+                    source_path = (Path.cwd() / source_path).resolve()
+                args.inference_dir = str(source_path / "inference_scene" / "images")
+
+        print("Temporal R_change viewer export:")
+        print(f"  state: {temporal_export['state_id']}")
+        print(f"  active Gaussians: {temporal_export['active_gaussian_count']:,} / {temporal_export['source_gaussian_count']:,}")
+        print(f"  PLY: {temporal_export['output_ply']}")
+        print(f"  manifest: {temporal_export['manifest']}")
+
+    if args.ref_ply is None:
+        parser.error("--ref_ply is required unless --temporal_checkpoint provides it")
+
+    initial_scene = args.initial_scene
+    if initial_scene == "auto":
+        initial_scene = "change" if args.temporal_checkpoint else "reference"
+    change_display = args.change_display
+    if change_display == "auto":
+        change_display = "raw" if args.temporal_checkpoint else "binary"
     
     viewer = GaussianViewer(
         ref_ply=args.ref_ply,
@@ -673,6 +791,8 @@ def main():
         sh_degree=args.sh_degree,
         port=args.port,
         resolution=args.resolution,
+        initial_scene=initial_scene,
+        change_display=change_display,
     )
     viewer.run()
 
