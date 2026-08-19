@@ -28,10 +28,20 @@ from typing import Iterator, Sequence
 import torch
 
 from experiments import run_online_bayesian_lifespan_thaw as runner
-from temporal.beam2_bocd import (
-    BeamTwoBernoulliFilter,
-    beam2_persistent_state_bytes,
-)
+from temporal.beam2_bocd import BeamTwoBernoulliFilter
+
+
+def beam2_persistent_state_bytes(
+    gaussian_count: int, dtype: torch.dtype = torch.float32
+) -> int:
+    """Estimate all persistent beam-2 tensors, including diagnostics."""
+    if gaussian_count < 1:
+        raise ValueError("gaussian_count must be positive")
+    if not torch.empty((), dtype=dtype).is_floating_point():
+        raise TypeError("dtype must be floating")
+    float_bytes = torch.empty((), dtype=dtype).element_size()
+    long_bytes = torch.empty((), dtype=torch.long).element_size()
+    return int(gaussian_count) * (13 * float_bytes + 9 * long_bytes)
 
 
 DEFAULT_OUTPUT_ROOT = Path("outputs/escd_bocd_branch_ablation")
@@ -91,9 +101,17 @@ def sanitize_runner_args(values: Sequence[str]) -> list[str]:
     if args and args[0] == "--":
         args = args[1:]
     for token in args:
-        if token in FORBIDDEN_RUNNER_ARGUMENTS:
+        matched = next(
+            (
+                flag
+                for flag in FORBIDDEN_RUNNER_ARGUMENTS
+                if token == flag or token.startswith(f"{flag}=")
+            ),
+            None,
+        )
+        if matched is not None:
             raise ValueError(
-                f"{token} is controlled by this ablation; remove it from runner args"
+                f"{matched} is controlled by this ablation; remove it from runner args"
             )
     return args
 
@@ -164,6 +182,8 @@ def read_mode_summary(output_dir: Path) -> dict:
         "transition_diagnostics": summary.get(
             "transition_diagnostics_after_inference"
         ),
+        # Kept in machine-readable output only. Detector-only zero-initialized
+        # change DC makes these unsuitable as detector acceptance metrics.
         "mean_frame_iou": metrics.get("mean_frame_iou"),
         "mean_frame_f1": metrics.get("mean_frame_f1"),
         "aggregate_iou": metrics.get("aggregate_iou"),
@@ -204,8 +224,7 @@ def write_comparison(output_root: Path, results: dict[str, dict]) -> None:
         f"| OPEN events | {map_result.get('event_action_counts', {}).get('OPEN', 0)} | {beam_result.get('event_action_counts', {}).get('OPEN', 0)} |",
         f"| CLOSE events | {map_result.get('event_action_counts', {}).get('CLOSE', 0)} | {beam_result.get('event_action_counts', {}).get('CLOSE', 0)} |",
         f"| REOPEN | {map_result.get('reopen_count')} | {beam_result.get('reopen_count')} |",
-        f"| Mean-frame IoU | {map_result.get('mean_frame_iou')} | {beam_result.get('mean_frame_iou')} |",
-        f"| Mean-frame F1 | {map_result.get('mean_frame_f1')} | {beam_result.get('mean_frame_f1')} |",
+        f"| UNCERTAIN frame-actions | {map_result.get('frame_action_totals', {}).get('uncertain_count', 0)} | {beam_result.get('frame_action_totals', {}).get('uncertain_count', 0)} |",
         f"| Runtime (s) | {map_result.get('runtime_seconds')} | {beam_result.get('runtime_seconds')} |",
         f"| BOCD state (GiB) | {map_result.get('persistent_state_gib')} | {beam_result.get('persistent_state_gib')} |",
         "",
@@ -214,6 +233,7 @@ def write_comparison(output_root: Path, results: dict[str, dict]) -> None:
         "- Beam-2 CLOSE/REOPEN with MAP-reset CLOSE=0 supports the branch-discard diagnosis.",
         "- CLOSE=0 in both modes moves the blocker to evidence observability/scale.",
         "- Many off-boundary CLOSE/OPEN events indicate that hazard/threshold calibration is too permissive.",
+        "- This adapter is detector-only; rendered-mask IoU/F1 is not a detector acceptance metric.",
     ]
     (output_root / "comparison.md").write_text(
         "\n".join(lines) + "\n", encoding="utf-8"
