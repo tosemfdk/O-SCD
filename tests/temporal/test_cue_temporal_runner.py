@@ -15,7 +15,7 @@ from experiments.train_real_temporal_rchange import (
     support_metric_map,
     training_target,
 )
-from temporal import compute_ssf_loss
+from temporal import compute_growth_replay_regularization, compute_ssf_loss
 
 
 def test_ssf_loss_matches_original_oscd_formula_and_gradient():
@@ -41,6 +41,177 @@ def test_ssf_loss_matches_original_oscd_formula_and_gradient():
     assert torch.equal(actual, expected.detach())
     assert torch.equal(rendered.grad, expected_rendered.grad)
     assert torch.equal(parts["loss"], actual)
+
+
+def test_local_ssf_regularization_matches_pixelwise_formula_and_gradient():
+    cue = torch.tensor([[[0.2, 0.8], [1.4, 0.4]]], dtype=torch.float64)
+    support = (cue / 2.0).clamp(0.0, 1.0)
+    rendered = torch.tensor(
+        [
+            [[0.2, -0.1], [0.4, 0.7]],
+            [[0.1, 0.3], [-0.2, 0.5]],
+            [[-0.1, 0.2], [0.6, 0.0]],
+        ],
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+    expected_rendered = rendered.detach().clone().requires_grad_(True)
+
+    probability = torch.sigmoid(expected_rendered.mean(dim=0, keepdim=True))
+    expected_detection = (cue * (1.0 - probability)).mean()
+    expected_regularization = ((1.0 - support) * probability).mean()
+    expected = expected_detection + 0.75 * expected_regularization
+    actual, parts = compute_ssf_loss(
+        cue,
+        rendered,
+        regularization_mode="local",
+        local_support=support,
+        regularization_weight=0.75,
+    )
+
+    expected.backward()
+    actual.backward()
+    assert torch.equal(actual, expected.detach())
+    assert torch.equal(rendered.grad, expected_rendered.grad)
+    assert torch.equal(parts["detection"], expected_detection.detach())
+    assert torch.equal(parts["regularization"], expected_regularization.detach())
+
+
+def test_local_ssf_regularization_does_not_couple_other_pixel_activation():
+    cue = torch.zeros((1, 1, 2), dtype=torch.float64)
+    support = torch.zeros_like(cue)
+
+    def first_pixel_gradient(second_pixel_logit: float) -> float:
+        rendered = torch.tensor(
+            [[[0.0, second_pixel_logit]]] * 3,
+            dtype=torch.float64,
+            requires_grad=True,
+        )
+        loss, _ = compute_ssf_loss(
+            cue,
+            rendered,
+            regularization_mode="local",
+            local_support=support,
+        )
+        loss.backward()
+        return float(rendered.grad[0, 0, 0])
+
+    assert first_pixel_gradient(-4.0) == pytest.approx(first_pixel_gradient(4.0))
+
+
+def test_previous_update_global_regularization_scales_original_global_term():
+    cue = torch.tensor([[[0.2, 0.8], [1.4, 0.4]]], dtype=torch.float64)
+    rendered = torch.tensor(
+        [
+            [[0.2, -0.1], [0.4, 0.7]],
+            [[0.1, 0.3], [-0.2, 0.5]],
+            [[-0.1, 0.2], [0.6, 0.0]],
+        ],
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+    expected_rendered = rendered.detach().clone().requires_grad_(True)
+    previous_growth = 0.125
+
+    probability = torch.sigmoid(expected_rendered.mean(dim=0, keepdim=True))
+    expected_detection = (cue * (1.0 - probability)).mean()
+    expected_regularization = previous_growth * torch.log(
+        probability.mean() ** 2 + 1.0
+    )
+    expected = expected_detection + expected_regularization
+    actual, parts = compute_ssf_loss(
+        cue,
+        rendered,
+        regularization_mode="previous_update_global",
+        previous_growth=previous_growth,
+    )
+
+    expected.backward()
+    actual.backward()
+    assert torch.equal(actual, expected.detach())
+    assert torch.equal(rendered.grad, expected_rendered.grad)
+    assert torch.equal(parts["regularization"], expected_regularization.detach())
+
+
+def test_local_plus_previous_update_global_matches_combined_formula():
+    cue = torch.tensor([[[0.2, 0.8], [1.4, 0.4]]], dtype=torch.float64)
+    support = (cue / 2.0).clamp(0.0, 1.0)
+    rendered = torch.tensor(
+        [
+            [[0.2, -0.1], [0.4, 0.7]],
+            [[0.1, 0.3], [-0.2, 0.5]],
+            [[-0.1, 0.2], [0.6, 0.0]],
+        ],
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+    expected_rendered = rendered.detach().clone().requires_grad_(True)
+    previous_growth = 0.125
+
+    probability = torch.sigmoid(expected_rendered.mean(dim=0, keepdim=True))
+    expected_detection = (cue * (1.0 - probability)).mean()
+    expected_local = ((1.0 - support) * probability).mean()
+    expected_global = previous_growth * torch.log(probability.mean() ** 2 + 1.0)
+    expected = expected_detection + expected_local + expected_global
+    actual, parts = compute_ssf_loss(
+        cue,
+        rendered,
+        regularization_mode="local_plus_previous_update_global",
+        local_support=support,
+        previous_growth=previous_growth,
+    )
+
+    expected.backward()
+    actual.backward()
+    assert torch.equal(actual, expected.detach())
+    assert torch.equal(rendered.grad, expected_rendered.grad)
+    assert torch.equal(
+        parts["regularization"], (expected_local + expected_global).detach()
+    )
+
+
+@pytest.mark.parametrize("previous_growth", [-0.1, 1.1, float("nan")])
+def test_previous_update_global_rejects_invalid_growth(previous_growth):
+    with pytest.raises(ValueError):
+        compute_ssf_loss(
+            torch.zeros((1, 2, 2)),
+            torch.zeros((3, 2, 2)),
+            regularization_mode="previous_update_global",
+            previous_growth=previous_growth,
+        )
+
+
+def test_growth_replay_regularization_matches_elementwise_formula_and_gradient():
+    support = torch.tensor(
+        [[[0.0, 0.25], [0.75, 1.0]]], dtype=torch.float64
+    )
+    growth = torch.tensor(
+        [[[0.0, 0.2], [0.4, 0.8]]], dtype=torch.float64, requires_grad=True
+    )
+    probability = torch.tensor(
+        [[[0.2, 0.4], [0.6, 0.8]]], dtype=torch.float64, requires_grad=True
+    )
+    expected_probability = probability.detach().clone().requires_grad_(True)
+    expected = (growth.detach() * (1.0 - support) * expected_probability).mean()
+
+    actual = compute_growth_replay_regularization(
+        support, probability, growth
+    )
+    expected.backward()
+    actual.backward()
+
+    assert torch.equal(actual, expected.detach())
+    assert torch.equal(probability.grad, expected_probability.grad)
+    assert growth.grad is None
+
+
+def test_growth_replay_regularization_rejects_mismatched_maps():
+    with pytest.raises(ValueError):
+        compute_growth_replay_regularization(
+            torch.zeros((1, 2, 2)),
+            torch.zeros((1, 2, 2)),
+            torch.zeros((1, 2, 3)),
+        )
 
 
 @pytest.mark.parametrize(

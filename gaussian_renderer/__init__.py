@@ -3,7 +3,7 @@
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
 # All rights reserved.
 #
-# This software is free for non-commercial, research and evaluation use 
+# This software is free for non-commercial, research and evaluation use
 # under the terms of the LICENSE.md file.
 #
 # For inquiries contact  george.drettakis@inria.fr
@@ -17,11 +17,11 @@ from diff_gaussian_rasterization_fastgs import GaussianRasterizationSettingsFast
 
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, mult=0.5, scaling_modifier = 1.0, override_color = None, get_flag=None, metric_map = None):
     """
-    Render the scene. 
-    
+    Render the scene.
+
     Background tensor (bg_color) must be on GPU!
     """
- 
+
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
     # screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
     screenspace_points = torch.zeros((pc.get_xyz.shape[0], 4), dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
@@ -89,7 +89,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     else:
         colors_precomp = override_color
 
-    # Rasterize visible Gaussians to image, obtain their radii (on screen). 
+    # Rasterize visible Gaussians to image, obtain their radii (on screen).
     rendered_image, radii, accum_metric_counts = rasterizer(
         means3D = means3D,
         means2D = means2D,
@@ -165,13 +165,14 @@ def render_change(
     override_xyz=None,
     override_scaling=None,
     override_rotation=None,
+    clamp_output=True,
 ):
     """
-    Render the scene. 
-    
+    Render the scene.
+
     Background tensor (bg_color) must be on GPU!
     """
- 
+
     if override_color is not None and override_dc is not None:
         raise ValueError("override_color and override_dc cannot be used together")
     if override_dc is not None:
@@ -272,7 +273,7 @@ def render_change(
     else:
         dc, shs = pc._features_dc, pc._features_rest
 
-    # Rasterize visible Gaussians to image, obtain their radii (on screen). 
+    # Rasterize visible Gaussians to image, obtain their radii (on screen).
     rendered_image, radii, accum_metric_counts = rasterizer(
         means3D = means3D,
         means2D = means2D,
@@ -286,7 +287,8 @@ def render_change(
 
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
-    rendered_image = torch.clamp(rendered_image, 0.0, 1.0)
+    if clamp_output:
+        rendered_image = torch.clamp(rendered_image, 0.0, 1.0)
     return {"render": rendered_image,
             "viewspace_points": screenspace_points,
             "visibility_filter" : (radii > 0).nonzero(),

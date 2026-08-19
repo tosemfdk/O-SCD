@@ -39,12 +39,12 @@ from experiments.train_real_temporal_rchange import (
 from experiments.visualize_temporal_state_switch import (
     DEFAULT_RUN_DIR,
     load_font,
-    load_temporal_model,
     resize_panel,
     tensor_to_pil,
 )
 from gaussian_renderer import render_change_temporal
 from poses.feature_detector import Detector
+from temporal import load_temporal_model
 
 
 DEFAULT_OUTPUT_DIR = Path("outputs/instance1_scene_change1_2_3_temporal_confusion")
@@ -247,6 +247,12 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Render temporal confusion maps for every inference frame")
     parser.add_argument("--run-dir", type=Path, default=DEFAULT_RUN_DIR)
+    parser.add_argument(
+        "--checkpoint-path",
+        type=Path,
+        default=None,
+        help="Override the run's final checkpoint, e.g. a state-boundary snapshot",
+    )
     parser.add_argument("--source-path", type=Path, default=Path(DEFAULT_SOURCE))
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--threshold", type=float, default=0.5)
@@ -311,7 +317,12 @@ def main() -> None:
         poses = estimate_or_load_poses(records, args, detector, ref_frames, k_matrix, pose_cache_path)
 
     views, gt_masks = build_views(records, poses, args, focal, fovx, fovy, split="all_inference")
-    model = load_temporal_model(args.run_dir / "temporal_rchange_checkpoint.pt")
+    checkpoint_path = (
+        args.checkpoint_path
+        if args.checkpoint_path is not None
+        else args.run_dir / "temporal_rchange_checkpoint.pt"
+    )
+    model = load_temporal_model(checkpoint_path)
     pipe = SimpleNamespace(compute_cov3D_python=False, convert_SHs_python=False, debug=False)
     background = torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32, device="cuda")
 
@@ -391,6 +402,7 @@ def main() -> None:
     summary_out = {
         "script": "experiments/render_temporal_confusion_maps.py",
         "run_dir": str(args.run_dir),
+        "checkpoint_path": str(checkpoint_path),
         "source_path": str(args.source_path),
         "output_dir": str(args.output_dir),
         "threshold": args.threshold,

@@ -1,5 +1,8 @@
 import pytest
 import torch
+import math
+from types import SimpleNamespace
+from torch import nn
 
 
 pytestmark = pytest.mark.cuda
@@ -15,7 +18,16 @@ from experiments.temporal_lifespan_smoke import (  # noqa: E402
     run_temporal_lifespan_smoke,
 )
 from gaussian_renderer import render_change, render_change_temporal  # noqa: E402
-from temporal import TemporalGeometryChangeModel  # noqa: E402
+from scene.cameras import MiniCam  # noqa: E402
+from scene.gaussian_model import GaussianModel  # noqa: E402
+from temporal import opacity_removal_influence  # noqa: E402
+from utils.general_utils import inverse_sigmoid  # noqa: E402
+from utils.graphics_utils import getProjectionMatrix  # noqa: E402
+from utils.sh_utils import RGB2SH  # noqa: E402
+from temporal import (  # noqa: E402
+    TemporalGeometryChangeModel,
+    TemporalSharedGeometryChangeModel,
+)
 
 
 EXPECTED_TIMESTAMPS = (94.0, 95.0, 199.0)
@@ -192,6 +204,52 @@ def test_temporal_renderer_checks_timestamp_and_override_contracts():
     assert torch.allclose(python_sh_render, override_render, atol=1e-6)
 
 
+def test_signed_removal_influence_marks_dark_occluder_and_bright_change():
+    device = torch.device("cuda")
+    base = GaussianModel(sh_degree=3, active_sh_degree=0)
+    base._xyz = nn.Parameter(
+        torch.tensor([[0.0, 0.0, 2.0], [0.0, 0.0, 3.0]], device=device)
+    )
+    rgb = torch.tensor([[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]], device=device)
+    base._features_dc = nn.Parameter(RGB2SH(rgb).view(2, 1, 3))
+    base._features_rest = nn.Parameter(torch.zeros((2, 15, 3), device=device))
+    base._opacity = nn.Parameter(
+        inverse_sigmoid(torch.full((2, 1), 0.8, device=device))
+    )
+    base._scaling = nn.Parameter(
+        torch.full((2, 3), math.log(0.3), device=device)
+    )
+    rotation = torch.zeros((2, 4), device=device)
+    rotation[:, 0] = 1.0
+    base._rotation = nn.Parameter(rotation)
+
+    fov = math.radians(60.0)
+    world_view = torch.eye(4, device=device)
+    projection = getProjectionMatrix(0.01, 100.0, fov, fov).t().to(device)
+    full_projection = world_view.unsqueeze(0).bmm(projection.unsqueeze(0)).squeeze(0)
+    camera = MiniCam(64, 64, fov, fov, 0.01, 100.0, world_view, full_projection)
+    pipe = SimpleNamespace(
+        compute_cov3D_python=False,
+        convert_SHs_python=False,
+        debug=False,
+    )
+    opacity = base.get_opacity.detach().clone().requires_grad_(True)
+    rendered = render_change(
+        camera,
+        base,
+        pipe,
+        torch.zeros(3, device=device),
+        override_dc=base._features_dc.detach(),
+        override_opacity=opacity,
+        clamp_output=False,
+    )["render"]
+
+    signed = opacity_removal_influence(rendered, opacity)
+
+    assert signed[0] < 0  # dark front Gaussian suppresses the bright one
+    assert signed[1] > 0  # bright rear Gaussian adds change brightness
+
+
 def test_geometry_overrides_validate_and_receive_only_active_state_gradients():
     dc_model, camera, pipe, background = build_synthetic_temporal_scene(image_size=64)
     model = TemporalGeometryChangeModel.from_gaussians(
@@ -262,3 +320,42 @@ def test_geometry_override_python_covariance_path_is_supported():
     )["render"]
     assert rendered.is_cuda
     assert torch.isfinite(rendered).all()
+
+
+def test_shared_geometry_renderer_updates_only_currently_valid_rows():
+    dc_model, camera, pipe, background = build_synthetic_temporal_scene(
+        image_size=64
+    )
+    model = TemporalSharedGeometryChangeModel.from_gaussians(
+        dc_model.base,
+        max_states=dc_model.max_states,
+    )
+    with torch.no_grad():
+        model.state_change_dc.copy_(dc_model.state_change_dc)
+        model.state_start.copy_(dc_model.state_start)
+        model.state_end.copy_(dc_model.state_end)
+        model.state_valid.copy_(dc_model.state_valid)
+        model.shared_xyz_delta[:, 0] = 0.01
+        model.shared_scaling_delta[:] = 0.02
+        model.shared_rotation_delta[:, 1] = 0.01
+
+    rendered = render_change_temporal(
+        camera,
+        model,
+        pipe,
+        background,
+        timestamp=95.0,
+    )["render"]
+    rendered.sum().backward()
+
+    active = torch.tensor(EXPECTED_MASKS[95.0], device="cuda")
+    dc_pairs = model.state_change_dc.grad.flatten(start_dim=2).abs().sum(dim=2) > 0
+    assert not dc_pairs[:, 0].any()
+    assert not dc_pairs[:, 2].any()
+    assert not dc_pairs[~active, 1].any()
+    for _name, parameter in model.shared_geometry_parameter_items():
+        row_has_gradient = parameter.grad.flatten(start_dim=1).abs().sum(dim=1) > 0
+        assert not row_has_gradient[~active].any()
+    assert model.shared_xyz_delta.grad[active].abs().sum() > 0
+    assert model.shared_opacity_delta.grad[active].abs().sum() > 0
+    assert model.shared_scaling_delta.grad[active].abs().sum() > 0

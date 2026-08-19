@@ -25,7 +25,6 @@ from experiments.visualize_temporal_state_switch import (
     heatmap_fixed,
     hstack,
     load_font,
-    load_temporal_model,
     make_fixed_camera,
     metrics,
     overlay_change,
@@ -37,6 +36,7 @@ from experiments.visualize_temporal_state_switch import (
     total_frames_from_summary,
     vstack,
 )
+from temporal import load_temporal_model
 
 DEFAULT_CAMERA_TIMESTAMP = 181
 DEFAULT_LEFT_TIMESTAMP = 94

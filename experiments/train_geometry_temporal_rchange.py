@@ -98,7 +98,10 @@ def make_geometry_optimizer(
     groups = [
         {"params": [parameter], "lr": learning_rates[name], "name": name}
         for name, parameter in model.state_parameter_items()
+        if parameter.requires_grad
     ]
+    if not groups:
+        raise ValueError("At least one state parameter must remain trainable")
     return torch.optim.Adam(groups, lr=0.0, eps=1e-15)
 
 
@@ -208,6 +211,7 @@ def train_geometry_slots(
     invalid_gradient_violations = 0
     max_inactive_slot_gradient = 0.0
     max_invalid_active_gradient = 0.0
+    inheritance_audit: dict[str, Any] = {}
     anchor_counts = {
         str(state): int((strong_state0 & model.state_valid[:, state]).sum().item())
         if state > 0
@@ -229,6 +233,26 @@ def train_geometry_slots(
         if state_changed:
             if optimizer_state is not None:
                 snapshots[optimizer_state] = snapshot_state(model, optimizer_state)
+            if args.inherit_previous_state and step.state > 0:
+                source_state = step.state - 1
+                model.inherit_state_parameters(source_state, step.state)
+                parameter_max_abs = {
+                    name: float(
+                        (parameter[:, step.state] - parameter[:, source_state])
+                        .detach()
+                        .abs()
+                        .max()
+                        .item()
+                    )
+                    for name, parameter in model.state_parameter_items()
+                }
+                inheritance_audit[str(step.state)] = {
+                    "source_state": source_state,
+                    "target_state": step.state,
+                    "gaussian_count": int(model.state_change_dc.shape[0]),
+                    "parameter_max_abs_after_copy": parameter_max_abs,
+                    "exact": max(parameter_max_abs.values(), default=0.0) == 0.0,
+                }
             optimizer = make_geometry_optimizer(model, args)
             optimizer_state = step.state
 
@@ -363,6 +387,8 @@ def train_geometry_slots(
         "optimizer_reset_on_state_boundary": True,
         "completed_state_drift": drift,
         "state0_anchor_gaussian_counts": anchor_counts,
+        "previous_state_inheritance": bool(args.inherit_previous_state),
+        "state_inheritance_audit": inheritance_audit,
     }
     return logs, audit_summary, schedule_audit
 
@@ -421,9 +447,16 @@ def save_run(
     checkpoint_path = output_dir / "temporal_rchange_checkpoint.pt"
     summary_path = output_dir / "summary.json"
     base_ply = (Path(args.source_path) / BASE_PLY_REL).resolve()
+    contract_suffix = (
+        "previous_state_inheritance"
+        if args.inherit_previous_state
+        else "independent_state_initialization"
+    )
+    if args.xyz_anchor_weight > 0:
+        contract_suffix += "_state0_xyz_anchor"
     contract = (
         "fixed_topology_temporal_geometry_dc_oscd_pixel_sam_cue_"
-        "manual_boundaries_state0_xyz_anchor"
+        f"manual_boundaries_{contract_suffix}"
     )
     metadata = {
         "schema_version": 3,
@@ -446,6 +479,7 @@ def save_run(
             args.state0_anchor_min_support_views
         ),
         "strong_state0_anchor_mask_checksum": tensor_checksum(strong_state0),
+        "inherit_previous_state": bool(args.inherit_previous_state),
     }
     state_dict = {
         name: value.detach().cpu() for name, value in model.state_dict().items()
@@ -489,6 +523,11 @@ def save_run(
         ],
         "fixed_parameters": ["base._features_rest"],
         "densify_prune": False,
+        "state_initialization": (
+            "copy_completed_predecessor_state"
+            if args.inherit_previous_state
+            else "independent_from_base"
+        ),
         "resolution": float(args.resolution),
         "boundaries": list(args.boundaries),
         "fixed_cameras_json": str(Path(args.fixed_cameras_json).resolve()),
@@ -513,6 +552,7 @@ def save_run(
             "state0_anchor_min_support_views": int(
                 args.state0_anchor_min_support_views
             ),
+            "inherit_previous_state": bool(args.inherit_previous_state),
             "support_map_threshold": float(args.support_map_threshold),
             "support_count_threshold": int(args.support_threshold),
             "seed": int(args.seed),
@@ -586,6 +626,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--opacity-lr", type=nonnegative_float, default=0.025)
     parser.add_argument("--scaling-lr", type=nonnegative_float, default=0.005)
     parser.add_argument("--rotation-lr", type=nonnegative_float, default=0.001)
+    parser.add_argument(
+        "--inherit-previous-state",
+        action="store_true",
+        help="Copy every learned state attribute into the next slot at each boundary",
+    )
     parser.add_argument("--xyz-anchor-weight", type=nonnegative_float, default=1.0)
     parser.add_argument(
         "--state0-anchor-min-support-views",

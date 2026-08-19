@@ -361,3 +361,8 @@ Geometry 실험 자체는 다음을 확인했다.
 다음 geometry ablation에서는 `xyz-only`, `opacity-only`, `scale/rotation-only`를
 분리하고, S0 anchor weight와 이동 outlier penalty를 각각 검증해야 한다. BOCD는
 이 representation/optimization ablation이 끝난 뒤 연결하는 것이 맞다.
+
+Temporal coupling과 S0 anchor를 완전히 제거한 실제 독립
+`Ref -> scene_change1/2/3` 비교는
+[`instance1-independent-reference-geometry-ablation-ko.md`](instance1-independent-reference-geometry-ablation-ko.md)에
+별도로 기록했다.

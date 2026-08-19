@@ -130,3 +130,24 @@ def test_state0_xyz_anchor_is_soft_and_updates_only_the_later_slot():
     assert model.state_xyz_delta.grad[1].abs().sum() == 0
     assert model.state_xyz_delta.grad[anchor_indices, 1].abs().sum() > 0
     assert model.state_xyz_delta.grad[:, 2].abs().sum() == 0
+
+
+def test_state_parameter_inheritance_copies_attributes_but_not_lifespan_metadata():
+    model = TemporalGeometryChangeModel.from_gaussians(make_base(n=3), max_states=3)
+    configure_three_states(model)
+    with torch.no_grad():
+        for offset, (_name, parameter) in enumerate(model.state_parameter_items()):
+            parameter[:, 0].fill_(float(offset + 1))
+            parameter[:, 1].fill_(-1.0)
+        model.state_valid[:, 1] = torch.tensor([True, False, True])
+    target_valid_before = model.state_valid[:, 1].clone()
+    target_start_before = model.state_start[:, 1].clone()
+    target_end_before = model.state_end[:, 1].clone()
+
+    model.inherit_state_parameters(0, 1)
+
+    for _name, parameter in model.state_parameter_items():
+        assert torch.equal(parameter[:, 1], parameter[:, 0])
+    assert torch.equal(model.state_valid[:, 1], target_valid_before)
+    assert torch.equal(model.state_start[:, 1], target_start_before)
+    assert torch.equal(model.state_end[:, 1], target_end_before)

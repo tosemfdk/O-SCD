@@ -87,6 +87,24 @@ class TemporalGeometryChangeModel(TemporalChangeModel):
             ("rotation", self.state_rotation_delta),
         )
 
+    @torch.no_grad()
+    def inherit_state_parameters(self, source: int, target: int) -> None:
+        """Initialize one state slot from a completed predecessor slot.
+
+        Lifespan metadata and ``state_valid`` are intentionally not copied:
+        the target state keeps its own temporal interval and support gate while
+        inheriting the same Gaussian identities and learned attributes.
+        """
+        for name, value in (("source", source), ("target", target)):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"{name} must be an integer")
+            if value < 0 or value >= self.max_states:
+                raise ValueError(f"{name} must be in [0, {self.max_states})")
+        if source == target:
+            raise ValueError("source and target states must differ")
+        for _name, parameter in self.state_parameter_items():
+            parameter[:, target].copy_(parameter[:, source])
+
     def get_active_render_attributes(self, timestamp) -> dict[str, torch.Tensor]:
         """Return activated renderer inputs for the state selected at ``timestamp``."""
         self._validate_base_alignment()

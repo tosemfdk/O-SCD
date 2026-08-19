@@ -19,9 +19,8 @@ import torch
 from PIL import Image, ImageDraw, ImageFont
 
 from gaussian_renderer import render_change_temporal
-from scene import GaussianModel
 from scene.cameras import Camera
-from temporal import TemporalChangeModel, TemporalGeometryChangeModel
+from temporal import TemporalChangeModel, load_temporal_model
 
 
 DEFAULT_RUN_DIR = Path("outputs/instance1_scene_change1_2_3_temporal_rchange")
@@ -269,33 +268,6 @@ def make_fixed_camera(record: dict[str, Any], pose: dict[str, Any], summary: dic
     return view
 
 
-def load_temporal_model(
-    checkpoint_path: Path,
-) -> TemporalChangeModel | TemporalGeometryChangeModel:
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
-    base_ply = Path(checkpoint["base_ply"])
-    if not base_ply.exists():
-        raise FileNotFoundError(base_ply)
-    state_dict = checkpoint["state_dict"]
-    max_states = int(state_dict["state_change_dc"].shape[1])
-    base = GaussianModel(sh_degree=3, active_sh_degree=0)
-    base.load_ply_change(str(base_ply))
-    model_class = (
-        TemporalGeometryChangeModel
-        if "state_xyz_delta" in state_dict
-        else TemporalChangeModel
-    )
-    model = model_class.from_gaussians(
-        base,
-        max_states=max_states,
-        initial_time=0.0,
-    )
-    cuda_state = {k: v.cuda(non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in state_dict.items()}
-    model.load_state_dict(cuda_state, strict=True)
-    model.eval()
-    return model
-
-
 def render_timestamps(view: Camera, model: TemporalChangeModel, timestamps: list[int]) -> dict[int, torch.Tensor]:
     pipe = SimpleNamespace(compute_cov3D_python=False, convert_SHs_python=False, debug=False)
     background = torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32, device="cuda")
@@ -462,7 +434,8 @@ def main() -> None:
 
     run_dir = args.run_dir
     summary = read_json(run_dir / "summary.json")
-    pose_cache = read_json(run_dir / "pose_cache.json")
+    pose_cache_path = run_dir / "pose_cache.json"
+    pose_cache = read_json(pose_cache_path) if pose_cache_path.exists() else {}
     checkpoint_path = run_dir / "temporal_rchange_checkpoint.pt"
     boundaries = [int(x) for x in summary["boundaries"]]
     total_frames = total_frames_from_summary(summary)
