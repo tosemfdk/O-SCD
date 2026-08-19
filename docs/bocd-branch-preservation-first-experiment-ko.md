@@ -61,8 +61,8 @@ incumbent와 candidate를 정규화한다. Candidate posterior가
 이 방식은 full exact BOCD가 아니다. 그러나 threshold 아래 reset branch를 폐기하지
 않는다는 핵심 차이를 O(N) 메모리로 직접 검사한다.
 
-Serialized persistent state는 Gaussian당 float vector 9개와 int64 vector 8개다.
-Instance_1의 `N=1,283,501`, float32 기준 예상 BOCD state는 약 `0.120 GiB`다.
+Runtime persistent state는 Gaussian당 float vector 13개와 int64 vector 9개다.
+Instance_1의 `N=1,283,501`, float32 기준 예상 BOCD state는 약 `0.148 GiB`다.
 현재 MAP estimator 약 `0.067 GiB`보다 크지만 bounded exact `R=128`의 약
 `4.97 GiB`보다 훨씬 작다.
 
@@ -204,19 +204,21 @@ Branch 보존은 성공했지만 detector가 과민하다.
 - 최소 candidate visible count 및 evidence concentration 증가
 - 3D neighborhood 또는 multi-view agreement gate 추가
 
-### 2D metric 예상
+### 2D metric은 이번 detector-only 판정에서 제외
 
-Detector-only branch의 목표는 lifecycle recovery이지 geometry mIoU 향상이 아니다.
-Beam-2가 stale active slot을 실제로 닫으면 DC-only current mask의 SC2/SC3 false-positive
-잔상이 줄 가능성이 있다. 반대로 false CLOSE가 많으면 recall이 떨어질 수 있다.
-따라서 첫 판정은 mIoU보다 다음 순서로 한다.
+이 adapter는 detector와 controller만 비교하기 위해 optimization을 끈다. 기본
+`open_initialization=zero`에서는 change DC가 학습되지 않으므로 렌더 mask mIoU/F1은
+lifecycle detector 성능을 나타내지 않는다. 첫 판정 순서는 다음과 같다.
 
 ```text
 1. CLOSE/REOPEN 존재 여부
 2. transition 인접 decision delay
 3. off-transition event 수
-4. mean-frame IoU/F1
+4. active lifespan count와 UNCERTAIN count
 ```
+
+Beam-2가 실제 transition을 복원하면 그 다음 별도 실험에서 `--thaw-parameters dc`를
+사용해 current-mask mIoU/F1을 비교한다.
 
 ## 5. 테스트
 
