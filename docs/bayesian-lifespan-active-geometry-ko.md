@@ -198,9 +198,13 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=. \
 git diff --check
 ```
 
+## 실험 결과
+
+독립 `ref -> SC1/SC2/SC3`와 연속 `ref -> SC1 -> SC2 -> SC3` 304-frame 결과, lifecycle failure 분석, raw-render GIF 경로는 [`escd-bayesian-lifespan-experiment-results-ko.md`](escd-bayesian-lifespan-experiment-results-ko.md)에 기록한다. 연속 MAP-reset run에서는 OPEN `81,268`, CLOSE/REOPEN `0`이었으며, all-geometry가 같은 OPEN slot을 morphing해 lifecycle 실패를 가리는 현상을 확인했다.
+
 ## 제한사항
 
-- Full 304-frame experiment 결과는 이 implementation checkpoint에 포함하지 않는다.
+- 연속 full run의 `MAPResetBernoulliFilter`는 changepoint branch를 threshold 아래에서 폐기하므로 exact BOCD와 동등하지 않다.
 - Exact BOCD는 bounded이어도 1.28M Gaussian에서 수 GB의 persistent state가 필요하다. `map_reset`은 이름과 output에서 근사 알고리즘임을 명시한다.
 - Inactive drift runtime audit는 `--inactive-audit-max-pairs`까지 closed pair를 exact 비교하며, 전체를 덮지 못하면 `exhaustive=false`를 기록한다. Unit test는 모든 inactive pair의 parameter와 optimizer state를 exact 검증한다.
 - Global manual boundary에는 per-Gaussian binary lifecycle GT가 없으므로 false OPEN/CLOSE rate는 정확히 정의할 수 없다. Runner는 이를 `null`과 사유로 기록하며 geometry improvement를 주장하지 않는다.
