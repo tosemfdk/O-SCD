@@ -111,6 +111,18 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             "accum_metric_counts" : accum_metric_counts}
 
 
+
+def _validate_override_color(pc: GaussianModel, override_color: torch.Tensor) -> None:
+    if not isinstance(override_color, torch.Tensor):
+        raise TypeError("override_color must be a tensor")
+    expected_shape = (pc.get_xyz.shape[0], 3)
+    if override_color.shape != expected_shape:
+        raise ValueError(f"override_color must have shape {expected_shape}")
+    if override_color.dtype != pc._features_dc.dtype:
+        raise ValueError("override_color must match the base DC dtype")
+    if override_color.device != pc._features_dc.device:
+        raise ValueError("override_color must be on the same device as the base DC")
+
 def _validate_override_dc(pc: GaussianModel, override_dc: torch.Tensor) -> None:
     if not isinstance(override_dc, torch.Tensor):
         raise TypeError("override_dc must be a tensor")
@@ -175,6 +187,8 @@ def render_change(
 
     if override_color is not None and override_dc is not None:
         raise ValueError("override_color and override_dc cannot be used together")
+    if override_color is not None:
+        _validate_override_color(pc, override_color)
     if override_dc is not None:
         _validate_override_dc(pc, override_dc)
     if override_opacity is not None:

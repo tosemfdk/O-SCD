@@ -53,11 +53,13 @@ g_i: {(change state, start time, end time, confidence)}
 
 ## 현재 구현 및 연구 단계
 
-현재 저장소 checkpoint는 oracle boundary 기반 lifespan separation과 **E3 state-specific geometry optimization**까지만 포함한다.
+현재 저장소 checkpoint는 기존 oracle-boundary lifespan/E3 control과 causal Bayesian lifespan + active-only state geometry 구현을 함께 포함한다.
 
 - Lifespan separation: state별 DC와 half-open interval을 구현하고 naive persistent O-SCD보다 과거 state 보존이 개선되는 것을 확인했다.
 - Corrected cue experiment: O-SCD pixel + SAM2.1 cue, fixed pose, 304 frames, 이미지당 120 updates로 DC-only lifespan을 검증했다.
 - E3 geometry: Gaussian index와 topology는 고정한 채 state별 xyz/DC/opacity/scale/rotation delta와 S0 soft anchor를 학습한다.
 - E3 결과: geometry는 SSF loss를 낮췄지만 DC-only보다 overall mIoU/F1이 소폭 낮았다. 상세 내용은 [`docs/instance1-state-geometry-lifespan-comparison-ko.md`](docs/instance1-state-geometry-lifespan-comparison-ko.md)에 기록한다.
-- 이 checkpoint에는 MCMC, SGLD, relocation, BOCD, automatic boundary discovery, densification, pruning을 포함하지 않는다.
-- 다음 연구 확장은 E3의 표현과 failure mode를 충분히 검토한 뒤 별도 계획으로 시작한다.
+- Bayesian lifespan: immutable reference의 lifespan-agnostic alpha-T evidence, bounded Beta-Bernoulli BOCD와 명시적 MAP-reset 근사, binary OPEN/KEEP/CLOSE/REOPEN lifecycle, row-slot masked Adam, causal frame-major runner를 구현한다. `active -> active`는 항상 같은 slot의 `KEEP`이다.
+- Bayesian ESCD 평가: 독립 `ref -> SC1/SC2/SC3`와 상태를 유지한 연속 `ref -> SC1 -> SC2 -> SC3` 304-frame 실험을 완료했다. 연속 MAP-reset run은 OPEN `81,268`, CLOSE/REOPEN `0`으로 lifespan separation에 실패했다. DC-only mean-frame mIoU는 `0.4264`, all-geometry는 `0.6208`이었지만 geometry가 동일 OPEN slot을 morphing해 failure를 가린 결과이므로 lifespan 개선으로 해석하지 않는다. 상세 내용은 [`docs/escd-bayesian-lifespan-experiment-results-ko.md`](docs/escd-bayesian-lifespan-experiment-results-ko.md)에 기록한다.
+- 현재 핵심 failure mode: capped evidence와 hazard `0.01` 조건의 `MAPResetBernoulliFilter`가 threshold 아래 changepoint branch를 폐기하고, controller가 reset 없는 label 반전을 `UNCERTAIN`으로 유지해 CLOSE가 발생하지 않는다. 다음 단계는 전환부 Bayes-factor 진단과 exact/branch-preserving 대안 비교다.
+- 이 checkpoint에는 MCMC, SGLD, relocation, densification, pruning을 포함하지 않는다.

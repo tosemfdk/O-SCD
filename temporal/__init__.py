@@ -1,7 +1,32 @@
-from .change_model import TemporalChangeModel
+from .bayesian_lifespan_controller import (
+    BayesianLifespanController,
+    BayesianLifespanControllerConfig,
+    LifespanAction,
+    LifespanDecision,
+)
+from .bernoulli_bocd import (
+    BOCDUpdate,
+    BernoulliBOCDConfig,
+    BetaBernoulliBOCD,
+    MAPResetBernoulliFilter,
+    beta_binomial_log_predictive,
+)
+from .change_evidence import (
+    ChangeEvidence,
+    EvidenceResult,
+    accumulate_alpha_t_evidence,
+    accumulate_change_evidence,
+    alpha_t_evidence_vjp,
+    counts_from_evidence,
+    cue_to_change_probability,
+    cue_to_probability,
+    evidence_counts,
+)
+from .change_model import CLOSED, EMPTY, OPEN, TemporalChangeModel
 from .checkpoint import load_temporal_model
 from .fusion import compute_growth_replay_regularization, compute_ssf_loss
 from .geometry_change_model import TemporalGeometryChangeModel
+from .masked_optimizer import MaskedRowSlotAdam
 from .lifespan import get_active_state_indices, temporal_gate
 from .picking import GaussianRayPick, pick_gaussian_along_ray
 from .shared_geometry_change_model import TemporalSharedGeometryChangeModel
@@ -54,6 +79,28 @@ from .signed_influence import (
 )
 
 __all__ = [
+    "evidence_counts",
+    "cue_to_change_probability",
+    "alpha_t_evidence_vjp",
+    "accumulate_change_evidence",
+    "EvidenceResult",
+    "LifespanDecision",
+    "beta_binomial_log_predictive",
+    "BOCDUpdate",
+    "MaskedRowSlotAdam",
+    "cue_to_probability",
+    "counts_from_evidence",
+    "accumulate_alpha_t_evidence",
+    "ChangeEvidence",
+    "MAPResetBernoulliFilter",
+    "BetaBernoulliBOCD",
+    "BernoulliBOCDConfig",
+    "LifespanAction",
+    "BayesianLifespanControllerConfig",
+    "BayesianLifespanController",
+    "CLOSED",
+    "OPEN",
+    "EMPTY",
     "CausalPC1",
     "CausalPC1Update",
     "FollowEvidence",

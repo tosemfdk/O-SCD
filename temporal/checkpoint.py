@@ -6,9 +6,32 @@ import torch
 
 from scene import GaussianModel
 
-from .change_model import TemporalChangeModel
+from .change_model import CLOSED, OPEN, TemporalChangeModel
 from .geometry_change_model import TemporalGeometryChangeModel
 from .shared_geometry_change_model import TemporalSharedGeometryChangeModel
+
+
+def _infer_lifecycle_buffers(migrated: dict[str, torch.Tensor]) -> None:
+    if not {"state_valid", "state_end"}.issubset(migrated):
+        return
+    valid = migrated["state_valid"].bool()
+    end = migrated["state_end"]
+    status = torch.zeros(valid.shape, dtype=torch.int8, device=valid.device)
+    finite = torch.isfinite(end)
+    positive_inf = torch.isposinf(end)
+    if bool((valid & ~(finite | positive_inf)).any()):
+        raise ValueError(
+            "valid legacy state_end values must be finite or positive infinity"
+        )
+    status[valid & finite] = CLOSED
+    status[valid & positive_inf] = OPEN
+    slot_ids = torch.arange(valid.shape[1], device=valid.device).expand_as(valid)
+    migrated["num_states"] = valid.sum(dim=1, dtype=torch.long)
+    open_slot = torch.where(
+        status == OPEN, slot_ids, torch.full_like(slot_ids, -1)
+    ).amax(dim=1)
+    migrated["current_state_index"] = open_slot.long()
+    migrated["state_status"] = status
 
 
 def migrate_temporal_state_dict(
@@ -16,6 +39,7 @@ def migrate_temporal_state_dict(
 ) -> dict[str, torch.Tensor]:
     """Add deterministic defaults required by newer temporal schemas."""
     migrated = dict(state_dict)
+    _infer_lifecycle_buffers(migrated)
     if "shared_xyz_delta" in migrated and "geometry_frozen" not in migrated:
         gaussian_count = int(migrated["shared_xyz_delta"].shape[0])
         migrated["geometry_frozen"] = torch.zeros(
@@ -62,5 +86,6 @@ def load_temporal_model(
         for name, value in state_dict.items()
     }
     model.load_state_dict(cuda_state, strict=True)
+    model.validate_lifecycle()
     model.eval()
     return model
