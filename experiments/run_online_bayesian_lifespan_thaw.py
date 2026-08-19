@@ -679,6 +679,15 @@ def prediction_overlay(rgb: np.ndarray, prediction: np.ndarray) -> np.ndarray:
     return overlay
 
 
+def target_overlay(rgb: np.ndarray, target: np.ndarray) -> np.ndarray:
+    overlay = rgb.copy()
+    mask = target.astype(bool, copy=False)
+    overlay[mask] = np.round(
+        0.45 * overlay[mask] + 0.55 * np.array([0, 255, 255])
+    ).astype(np.uint8)
+    return overlay
+
+
 def confusion_rgb(prediction: np.ndarray, target: np.ndarray) -> np.ndarray:
     pred = prediction.astype(bool, copy=False)
     gt = target.astype(bool, copy=False)
@@ -693,11 +702,13 @@ def labeled_panel(array: np.ndarray, title: str, subtitle: str, width: int) -> I
     image = Image.fromarray(array.astype(np.uint8, copy=False)).convert("RGB")
     height = max(1, int(round(image.height * width / image.width)))
     image = image.resize((width, height), Image.BILINEAR)
-    header = 44
+    header = 58
     canvas = Image.new("RGB", (width, height + header), "white")
     draw = ImageDraw.Draw(canvas)
     draw.text((6, 5), title, fill="black", font=_font(14))
-    draw.text((6, 24), subtitle[:80], fill=(70, 70, 70), font=_font(11))
+    draw.multiline_text(
+        (6, 24), subtitle[:150], fill=(70, 70, 70), font=_font(11), spacing=2
+    )
     canvas.paste(image, (0, header))
     return canvas
 
@@ -756,17 +767,55 @@ def choose_visualization_indices(
     return sorted(chosen)
 
 
-def save_timeline_chart(frame_rows: Sequence[Mapping[str, Any]], path: Path) -> None:
+def visualization_reason(
+    index: int, frame_rows: Sequence[Mapping[str, Any]]
+) -> str:
+    tags: list[str] = []
+    if index == 0:
+        tags.append("early")
+    if index == len(frame_rows) - 1:
+        tags.append("late")
+    finite = [
+        (i, float(row["iou"]))
+        for i, row in enumerate(frame_rows)
+        if row.get("iou") is not None and math.isfinite(float(row["iou"]))
+    ]
+    if finite:
+        ranked = sorted(finite, key=lambda item: item[1])
+        labels = {
+            ranked[0][0]: "worst IoU",
+            ranked[len(ranked) // 2][0]: "median IoU",
+            ranked[-1][0]: "best IoU",
+        }
+        if index in labels:
+            tags.append(labels[index])
+    if index == len(frame_rows) // 2:
+        tags.append("midpoint")
+    return " / ".join(dict.fromkeys(tags)) or "coverage sample"
+
+
+def save_timeline_chart(
+    frame_rows: Sequence[Mapping[str, Any]], path: Path, scene_name: str = ""
+) -> None:
     width, height = 1400, 760
     margin_left, margin_right = 86, 36
-    margin_top, margin_bottom = 72, 92
+    margin_top, margin_bottom = 96, 92
     plot_w = width - margin_left - margin_right
     plot_h = height - margin_top - margin_bottom
     canvas = Image.new("RGB", (width, height), "white")
     draw = ImageDraw.Draw(canvas)
     font = _font(18)
     small = _font(13)
-    draw.text((margin_left, 22), "Causal Bayesian lifespan timeline", fill="black", font=font)
+    title = "Causal Bayesian lifespan timeline"
+    if scene_name:
+        title = f"{scene_name}: {title}"
+    draw.text((margin_left, 18), title, fill="black", font=font)
+    draw.text(
+        (margin_left, 48),
+        "Independent ref-to-SC stream: no internal CLOSE/REOPEN boundary is expected.",
+        fill=(60, 60, 60),
+        font=small,
+    )
     for tick in range(0, 11):
         value = tick / 10.0
         y = margin_top + plot_h - int(value * plot_h)
@@ -791,7 +840,12 @@ def save_timeline_chart(frame_rows: Sequence[Mapping[str, Any]], path: Path) -> 
     series = [
         ("IoU", "iou", (0, 120, 210), 1.0),
         ("F1", "f1", (0, 170, 75), 1.0),
-        ("Predicted + fraction", "predicted_positive_fraction", (255, 140, 0), 1.0),
+        (
+            "Predicted mask area fraction",
+            "predicted_positive_fraction",
+            (255, 140, 0),
+            1.0,
+        ),
     ]
     for label, key, color, scale in series:
         pts = points(key, scale)
@@ -803,13 +857,28 @@ def save_timeline_chart(frame_rows: Sequence[Mapping[str, Any]], path: Path) -> 
     active_pts = points("active_lifespan_count", max(1.0, float(max_active)))
     if len(active_pts) > 1:
         draw.line(active_pts, fill=(140, 90, 210), width=2)
-    draw.text((margin_left, margin_top + plot_h + 16), "frame index", fill="black", font=small)
+    frame_label = "frame index"
+    label_box = draw.textbbox((0, 0), frame_label, font=small)
+    draw.text(
+        (margin_left + (plot_w - (label_box[2] - label_box[0])) // 2, margin_top + plot_h + 16),
+        frame_label,
+        fill="black",
+        font=small,
+    )
     legend_x = margin_left
     legend_y = height - 42
-    for label, _key, color, _scale in series + [("Active count (scaled)", "active_lifespan_count", (140, 90, 210), 1.0)]:
+    legend_series = series + [
+        (
+            f"Active count / max ({max_active:,})",
+            "active_lifespan_count",
+            (140, 90, 210),
+            1.0,
+        )
+    ]
+    for label, _key, color, _scale in legend_series:
         draw.line((legend_x, legend_y + 8, legend_x + 28, legend_y + 8), fill=color, width=4)
         draw.text((legend_x + 36, legend_y), label, fill="black", font=small)
-        legend_x += 260
+        legend_x += 305
     path.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(path)
 
@@ -839,6 +908,7 @@ def write_visualization_artifacts(
 
     selected = choose_visualization_indices(frame_rows, frame_indices, sample_count)
     panel_paths: list[str] = []
+    selected_reasons: list[str] = []
     for index in selected:
         record = records[index]
         prediction = predictions[index].astype(bool, copy=False)
@@ -860,16 +930,24 @@ def write_visualization_artifacts(
         Image.fromarray(score_u8).save(score_dir / f"{stem}.png")
         Image.fromarray(confusion).save(confusion_dir / f"{stem}.png")
         row = frame_rows[index]
+        reason = visualization_reason(index, frame_rows)
+        selected_reasons.append(reason)
         subtitle = (
-            f"IoU={float(row['iou']):.3f} F1={float(row['f1']):.3f} "
-            f"open={row['open_count']} active={row['active_lifespan_count']}"
+            "yellow=prediction\n"
+            f"IoU={float(row['iou']):.3f} F1={float(row['f1']):.3f} | "
+            f"OPEN={row['open_count']} active={row['active_lifespan_count']}"
         )
         panel = hstack(
             [
-                labeled_panel(rgb, f"RGB | {stem}", "current frame", panel_width),
+                labeled_panel(rgb, f"RGB | {reason}", stem, panel_width),
                 labeled_panel(cue_heatmap(cue), "Cue C_t", "blue=low, yellow/red=high", panel_width),
                 labeled_panel(prediction_overlay(rgb, prediction), "Prediction overlay", subtitle, panel_width),
-                labeled_panel(mask_rgb(gt_mask, (255, 255, 255)), "GT mask", "post-inference eval only", panel_width),
+                labeled_panel(
+                    target_overlay(rgb, gt_mask),
+                    "GT overlay",
+                    "cyan=GT\npost-inference evaluation only",
+                    panel_width,
+                ),
                 labeled_panel(confusion, "Confusion", "green TP, pink FP, blue FN", panel_width),
             ]
         )
@@ -877,12 +955,13 @@ def write_visualization_artifacts(
         panel.save(panel_path)
         panel_paths.append(str(panel_path))
     timeline_path = output_dir / "timeline_metrics.png"
-    save_timeline_chart(frame_rows, timeline_path)
+    save_timeline_chart(frame_rows, timeline_path, source_path.name)
     payload = {
         "schema_version": 1,
         "contract": "online_bayesian_ref_scene_visualization",
         "frames": len(frame_rows),
         "selected_frame_indices": selected,
+        "selected_frame_reasons": selected_reasons,
         "panel_paths": panel_paths,
         "timeline_metrics_png": str(timeline_path),
         "confusion_legend": {"tp": "green", "fp": "pink", "fn": "blue", "tn": "black"},

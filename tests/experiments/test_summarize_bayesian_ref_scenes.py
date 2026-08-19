@@ -20,6 +20,11 @@ def _write_run(path: Path, scene: str, iou: float, f1: float):
                 "active_to_active_false_split_count": 0,
                 "runtime_seconds": 1.5,
                 "cuda_peak_memory_bytes": 10,
+                "run_config": {
+                    "updates_per_frame": 120,
+                    "bayes_cue_mode": "binary",
+                    "evidence_count_mode": "capped",
+                },
                 "run_arguments": {"source_path": f"data/Instance_1/{scene}"},
                 "metrics": {
                     "evaluated": True,
@@ -56,6 +61,7 @@ def test_summarize_scene_reads_metrics_and_frame_counts(tmp_path: Path):
 
     assert row["scene"] == "scene_change1"
     assert row["aggregate_iou"] == 0.3
+    assert row["updates_per_frame"] == 120
     assert row["mean_active_lifespan_count"] == 1.5
     assert row["total_keep_count"] == 2.0
 

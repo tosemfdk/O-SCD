@@ -204,5 +204,7 @@ def test_optional_visualizations_write_separate_pngs_and_summary(tmp_path: Path)
 
     assert Path(summary["timeline_metrics_png"]).is_file()
     assert len(summary["panel_paths"]) == 2
+    assert len(summary["selected_frame_reasons"]) == 2
+    assert "early" in summary["selected_frame_reasons"][0]
     assert all(Path(path).is_file() for path in summary["panel_paths"])
     assert (tmp_path / "visuals" / "visual_summary.json").is_file()

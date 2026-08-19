@@ -54,12 +54,16 @@ def summarize_scene(run_dir: Path, label: str | None = None) -> dict[str, Any]:
     keep_counts = np.asarray([_float(row.get("keep_count")) for row in frames])
     pred_fracs = np.asarray([_float(row.get("predicted_positive_fraction")) for row in frames])
     scene = label or Path(summary.get("run_arguments", {}).get("source_path", run_dir.name)).name
+    run_config = summary.get("run_config", {})
     return {
         "scene": scene,
         "run_dir": str(run_dir),
         "frames": int(summary.get("frames", len(frames))),
         "algorithm": summary.get("algorithm", ""),
         "optimized_parameters": ",".join(summary.get("optimized_parameters", [])),
+        "updates_per_frame": int(run_config.get("updates_per_frame", 0)),
+        "bayes_cue_mode": run_config.get("bayes_cue_mode", ""),
+        "evidence_count_mode": run_config.get("evidence_count_mode", ""),
         "aggregate_iou": _float(metrics.get("aggregate_iou")),
         "aggregate_f1": _float(metrics.get("aggregate_f1")),
         "precision": _float(metrics.get("precision")),
@@ -90,8 +94,8 @@ def write_csv(rows: Sequence[Mapping[str, Any]], path: Path) -> None:
 
 
 def write_comparison_chart(rows: Sequence[Mapping[str, Any]], path: Path) -> None:
-    width, height = 1100, 700
-    margin_left, margin_top, margin_bottom, margin_right = 90, 70, 130, 40
+    width, height = 1100, 730
+    margin_left, margin_top, margin_bottom, margin_right = 90, 104, 130, 40
     plot_w = width - margin_left - margin_right
     plot_h = height - margin_top - margin_bottom
     canvas = Image.new("RGB", (width, height), "white")
@@ -99,7 +103,18 @@ def write_comparison_chart(rows: Sequence[Mapping[str, Any]], path: Path) -> Non
     title_font = _font(18)
     font = _font(13)
     small = _font(11)
-    draw.text((margin_left, 25), "Independent ESCD ref→SC Bayesian lifespan comparison", fill="black", font=title_font)
+    draw.text((margin_left, 25), "Independent ESCD ref->SC Bayesian lifespan comparison", fill="black", font=title_font)
+    first = rows[0] if rows else {}
+    method = first.get("optimized_parameters") or "detector-only"
+    draw.text(
+        (margin_left, 52),
+        f"{method} | {first.get('updates_per_frame', 0)} updates/frame | "
+        f"{first.get('bayes_cue_mode', '')} cue | "
+        f"{first.get('evidence_count_mode', '')} evidence | "
+        f"{first.get('algorithm', '')}",
+        fill=(60, 60, 60),
+        font=small,
+    )
     for tick in range(0, 11):
         value = tick / 10.0
         y = margin_top + plot_h - int(value * plot_h)
@@ -108,8 +123,8 @@ def write_comparison_chart(rows: Sequence[Mapping[str, Any]], path: Path) -> Non
     metrics = [
         ("aggregate_iou", (31, 119, 180), "IoU"),
         ("aggregate_f1", (44, 160, 44), "F1"),
-        ("precision", (214, 39, 40), "P"),
-        ("recall", (148, 103, 189), "R"),
+        ("precision", (214, 39, 40), "Precision"),
+        ("recall", (148, 103, 189), "Recall"),
     ]
     n = max(1, len(rows))
     group_w = plot_w / n
@@ -129,8 +144,13 @@ def write_comparison_chart(rows: Sequence[Mapping[str, Any]], path: Path) -> Non
     for _key, color, label in metrics:
         draw.rectangle((legend_x, legend_y, legend_x + 24, legend_y + 14), fill=color)
         draw.text((legend_x + 32, legend_y - 1), label, fill="black", font=font)
-        legend_x += 120
-    draw.text((margin_left, height - 30), "Bars use post-inference GT metrics; lifecycle decisions stayed causal.", fill=(60, 60, 60), font=small)
+        legend_x += 185
+    draw.text(
+        (margin_left, height - 30),
+        "GT is used only for post-inference evaluation; lifecycle decisions remain causal.",
+        fill=(50, 50, 50),
+        font=font,
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(path)
 
