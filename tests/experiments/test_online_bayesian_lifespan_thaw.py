@@ -12,10 +12,13 @@ from experiments.run_online_bayesian_lifespan_thaw import (
     build_causal_records,
     enforce_bocd_memory_limit,
     parse_thaw_parameters,
+    parse_visualization_frame_indices,
     run_detector_only_synthetic_smoke,
     run_detector_sequence,
     main,
+    choose_visualization_indices,
     SyntheticTemporalModel,
+    write_visualization_artifacts,
 )
 from types import SimpleNamespace
 
@@ -36,6 +39,13 @@ def test_parse_thaw_parameters_requires_ordered_known_unique_names():
     for value in ["xyz,dc", "dc,dc", "dc,birth"]:
         with pytest.raises(Exception):
             parse_thaw_parameters(value)
+
+
+def test_parse_visualization_frame_indices_deduplicates_and_rejects_negative():
+    assert parse_visualization_frame_indices("2,0,2") == (2, 0)
+    assert parse_visualization_frame_indices("") is None
+    with pytest.raises(Exception):
+        parse_visualization_frame_indices("-1")
 
 
 def test_causal_record_construction_does_not_require_gt_or_boundaries(tmp_path: Path):
@@ -125,3 +135,75 @@ def test_detector_only_smoke_writes_only_machine_readable_outputs(tmp_path: Path
     assert {"change_probability", "changepoint_probability", "observed"} <= set(stats.files)
     assert stats["observed"].shape == (5,)
     assert stats["change_probability"].shape == (5, 5)
+
+
+def test_visualization_selection_uses_anchors_and_metric_extremes():
+    rows = [
+        {"timestamp": i, "iou": value}
+        for i, value in enumerate([0.5, 0.1, 0.7, 0.2, 0.9])
+    ]
+
+    assert choose_visualization_indices(rows, explicit=[4, 2], sample_count=3) == [4, 2]
+    selected = choose_visualization_indices(rows, explicit=None, sample_count=9)
+
+    assert 0 in selected
+    assert 4 in selected
+    assert 1 in selected  # worst IoU
+
+
+def test_optional_visualizations_write_separate_pngs_and_summary(tmp_path: Path):
+    pytest.importorskip("matplotlib")
+    source = tmp_path / "scene_change_tiny"
+    image_dir = source / "inference_scene" / "images"
+    mask_dir = source / "gt_mask"
+    cue_dir = tmp_path / "cue_cache" / "cues"
+    image_dir.mkdir(parents=True)
+    mask_dir.mkdir(parents=True)
+    cue_dir.mkdir(parents=True)
+    records = []
+    frame_rows = []
+    predictions = []
+    for i in range(2):
+        name = f"frame_{i:06d}.png"
+        image = np.full((8, 8, 3), 40 + i * 60, dtype=np.uint8)
+        cv2 = pytest.importorskip("cv2")
+        cv2.imwrite(str(image_dir / name), image)
+        mask = np.zeros((8, 8), dtype=np.uint8)
+        mask[2:6, 2:6] = 255
+        cv2.imwrite(str(mask_dir / name), mask)
+        torch.save(torch.full((1, 8, 8), 0.25 + i * 0.5), cue_dir / f"frame_{i:06d}.pt")
+        records.append(SimpleNamespace(name=name, image_path=str(image_dir / name)))
+        pred = np.zeros((8, 8), dtype=bool)
+        pred[2:6, 2:6] = i == 1
+        predictions.append(pred)
+        frame_rows.append(
+            {
+                "timestamp": i,
+                "iou": float(i),
+                "f1": float(i),
+                "precision": float(i),
+                "recall": float(i),
+                "active_lifespan_count": 10 + i,
+                "open_count": i,
+                "keep_count": 2 * i,
+                "predicted_positive_fraction": float(pred.mean()),
+            }
+        )
+
+    summary = write_visualization_artifacts(
+        source_path=source,
+        cue_cache_root=tmp_path / "cue_cache",
+        records=records,
+        predictions=predictions,
+        score_maps=[pred.astype(np.uint8) * 255 for pred in predictions],
+        frame_rows=frame_rows,
+        output_dir=tmp_path / "visuals",
+        panel_width=64,
+        sample_count=2,
+        frame_indices=(0, 1),
+    )
+
+    assert Path(summary["timeline_metrics_png"]).is_file()
+    assert len(summary["panel_paths"]) == 2
+    assert all(Path(path).is_file() for path in summary["panel_paths"])
+    assert (tmp_path / "visuals" / "visual_summary.json").is_file()

@@ -24,6 +24,7 @@ from typing import Any, Mapping, Sequence
 import cv2
 import numpy as np
 import torch
+from PIL import Image, ImageDraw, ImageFont
 
 from temporal import BayesianLifespanController, TemporalGeometryChangeModel
 from temporal.bayesian_lifespan_controller import LifespanAction
@@ -55,6 +56,10 @@ OUTPUT_FILES = (
     "lifecycle_events.jsonl",
     "per_frame_bayesian_stats.npz",
     "checkpoint.pt",
+)
+VISUALIZATION_FILES = (
+    "visual_summary.json",
+    "timeline_metrics.png",
 )
 GEOMETRY_NAMES = ("dc", "xyz", "opacity", "scaling", "rotation")
 BASE_FIELDS = (
@@ -164,6 +169,22 @@ def nonnegative_float(value: str) -> float:
     if not math.isfinite(parsed) or parsed < 0:
         raise argparse.ArgumentTypeError("value must be finite and nonnegative")
     return parsed
+
+
+def parse_visualization_frame_indices(value: str | None) -> tuple[int, ...] | None:
+    if value is None or value == "":
+        return None
+    indices = tuple(int(part.strip()) for part in value.split(",") if part.strip())
+    if any(index < 0 for index in indices):
+        raise argparse.ArgumentTypeError("visualization frame indices must be nonnegative")
+    return tuple(dict.fromkeys(indices))
+
+
+def _font(size: int = 14):
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:  # Pillow<10 compatibility.
+        return ImageFont.load_default()
 
 
 def parse_thaw_parameters(value: str | Sequence[str]) -> tuple[str, ...]:
@@ -617,6 +638,321 @@ def binary_metrics(prediction: np.ndarray, target: np.ndarray) -> dict[str, int 
     }
 
 
+def resize_image_to_array(path: Path, shape: tuple[int, int]) -> np.ndarray:
+    height, width = shape
+    with Image.open(path) as image:
+        return np.asarray(image.convert("RGB").resize((width, height), Image.BILINEAR))
+
+
+def load_cue_array(cue_cache_root: Path, frame_name: str, shape: tuple[int, int]) -> np.ndarray:
+    from experiments.train_cue_temporal_rchange import physical_frame_name
+
+    cue_path = cue_cache_root / "cues" / f"{physical_frame_name(Path(frame_name).stem)}.pt"
+    cue = torch.load(cue_path, map_location="cpu", weights_only=False)
+    if not isinstance(cue, torch.Tensor):
+        raise TypeError(f"cue cache entry must be a tensor: {cue_path}")
+    array = cue.detach().float().squeeze().numpy()
+    if array.shape != shape:
+        array = cv2.resize(array, (shape[1], shape[0]), interpolation=cv2.INTER_LINEAR)
+    return np.clip(array, 0.0, 1.0)
+
+
+def mask_rgb(mask: np.ndarray, color: tuple[int, int, int]) -> np.ndarray:
+    out = np.zeros((*mask.shape, 3), dtype=np.uint8)
+    out[mask.astype(bool, copy=False)] = np.asarray(color, dtype=np.uint8)
+    return out
+
+
+def cue_heatmap(cue: np.ndarray) -> np.ndarray:
+    cue = np.clip(cue.astype(np.float32, copy=False), 0.0, 1.0)
+    heat = np.zeros((*cue.shape, 3), dtype=np.uint8)
+    heat[..., 0] = np.round(255.0 * cue).astype(np.uint8)
+    heat[..., 1] = np.round(180.0 * cue).astype(np.uint8)
+    heat[..., 2] = np.round(255.0 * (1.0 - cue)).astype(np.uint8)
+    return heat
+
+
+def prediction_overlay(rgb: np.ndarray, prediction: np.ndarray) -> np.ndarray:
+    overlay = rgb.copy()
+    pred = prediction.astype(bool, copy=False)
+    overlay[pred] = np.round(0.45 * overlay[pred] + 0.55 * np.array([255, 220, 0])).astype(np.uint8)
+    return overlay
+
+
+def confusion_rgb(prediction: np.ndarray, target: np.ndarray) -> np.ndarray:
+    pred = prediction.astype(bool, copy=False)
+    gt = target.astype(bool, copy=False)
+    image = np.zeros((*pred.shape, 3), dtype=np.uint8)
+    image[pred & gt] = (0, 200, 0)
+    image[pred & ~gt] = (255, 105, 180)
+    image[~pred & gt] = (0, 90, 255)
+    return image
+
+
+def labeled_panel(array: np.ndarray, title: str, subtitle: str, width: int) -> Image.Image:
+    image = Image.fromarray(array.astype(np.uint8, copy=False)).convert("RGB")
+    height = max(1, int(round(image.height * width / image.width)))
+    image = image.resize((width, height), Image.BILINEAR)
+    header = 44
+    canvas = Image.new("RGB", (width, height + header), "white")
+    draw = ImageDraw.Draw(canvas)
+    draw.text((6, 5), title, fill="black", font=_font(14))
+    draw.text((6, 24), subtitle[:80], fill=(70, 70, 70), font=_font(11))
+    canvas.paste(image, (0, header))
+    return canvas
+
+
+def hstack(images: Sequence[Image.Image], gap: int = 8) -> Image.Image:
+    width = sum(image.width for image in images) + gap * (len(images) - 1)
+    height = max(image.height for image in images)
+    out = Image.new("RGB", (width, height), "white")
+    x = 0
+    for image in images:
+        out.paste(image, (x, 0))
+        x += image.width + gap
+    return out
+
+
+def choose_visualization_indices(
+    frame_rows: Sequence[Mapping[str, Any]],
+    explicit: Sequence[int] | None,
+    sample_count: int,
+) -> list[int]:
+    if explicit is not None:
+        if any(index >= len(frame_rows) for index in explicit):
+            raise IndexError("visualization frame index outside processed frame range")
+        return list(explicit)
+    if not frame_rows:
+        return []
+    budget = max(1, min(int(sample_count), len(frame_rows)))
+    anchors = [0, len(frame_rows) // 2, len(frame_rows) - 1]
+    scored = [
+        (index, float(row["iou"]) if row.get("iou") is not None else float("nan"))
+        for index, row in enumerate(frame_rows)
+    ]
+    finite = [(index, value) for index, value in scored if math.isfinite(value)]
+    if finite:
+        finite_sorted = sorted(finite, key=lambda item: item[1])
+        anchors.extend(
+            [
+                finite_sorted[0][0],
+                finite_sorted[len(finite_sorted) // 2][0],
+                finite_sorted[-1][0],
+            ]
+        )
+    chosen: list[int] = []
+    for index in anchors:
+        if 0 <= index < len(frame_rows) and index not in chosen:
+            chosen.append(index)
+        if len(chosen) >= budget:
+            break
+    if len(chosen) < budget:
+        for value in np.linspace(0, len(frame_rows) - 1, budget):
+            index = int(round(float(value)))
+            if index not in chosen:
+                chosen.append(index)
+            if len(chosen) >= budget:
+                break
+    return sorted(chosen)
+
+
+def save_timeline_chart(frame_rows: Sequence[Mapping[str, Any]], path: Path) -> None:
+    width, height = 1400, 760
+    margin_left, margin_right = 86, 36
+    margin_top, margin_bottom = 72, 92
+    plot_w = width - margin_left - margin_right
+    plot_h = height - margin_top - margin_bottom
+    canvas = Image.new("RGB", (width, height), "white")
+    draw = ImageDraw.Draw(canvas)
+    font = _font(18)
+    small = _font(13)
+    draw.text((margin_left, 22), "Causal Bayesian lifespan timeline", fill="black", font=font)
+    for tick in range(0, 11):
+        value = tick / 10.0
+        y = margin_top + plot_h - int(value * plot_h)
+        draw.line((margin_left, y, width - margin_right, y), fill=(225, 225, 225))
+        draw.text((34, y - 7), f"{value:.1f}", fill="black", font=small)
+
+    def points(key: str, scale: float = 1.0) -> list[tuple[int, int]]:
+        if len(frame_rows) == 1:
+            xs = [margin_left]
+        else:
+            xs = [
+                margin_left + int(i * plot_w / (len(frame_rows) - 1))
+                for i in range(len(frame_rows))
+            ]
+        ys = []
+        for row in frame_rows:
+            value = row.get(key)
+            value = 0.0 if value is None else max(0.0, min(1.0, float(value) / scale))
+            ys.append(margin_top + plot_h - int(value * plot_h))
+        return list(zip(xs, ys))
+
+    series = [
+        ("IoU", "iou", (0, 120, 210), 1.0),
+        ("F1", "f1", (0, 170, 75), 1.0),
+        ("Predicted + fraction", "predicted_positive_fraction", (255, 140, 0), 1.0),
+    ]
+    for label, key, color, scale in series:
+        pts = points(key, scale)
+        if len(pts) > 1:
+            draw.line(pts, fill=color, width=3)
+        for x, y in pts[:: max(1, len(pts) // 24)]:
+            draw.ellipse((x - 2, y - 2, x + 2, y + 2), fill=color)
+    max_active = max((int(row["active_lifespan_count"]) for row in frame_rows), default=1)
+    active_pts = points("active_lifespan_count", max(1.0, float(max_active)))
+    if len(active_pts) > 1:
+        draw.line(active_pts, fill=(140, 90, 210), width=2)
+    draw.text((margin_left, margin_top + plot_h + 16), "frame index", fill="black", font=small)
+    legend_x = margin_left
+    legend_y = height - 42
+    for label, _key, color, _scale in series + [("Active count (scaled)", "active_lifespan_count", (140, 90, 210), 1.0)]:
+        draw.line((legend_x, legend_y + 8, legend_x + 28, legend_y + 8), fill=color, width=4)
+        draw.text((legend_x + 36, legend_y), label, fill="black", font=small)
+        legend_x += 260
+    path.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(path)
+
+
+def write_visualization_artifacts(
+    *,
+    source_path: Path,
+    cue_cache_root: Path,
+    records: Sequence[Any],
+    predictions: Sequence[np.ndarray],
+    score_maps: Sequence[np.ndarray],
+    frame_rows: Sequence[Mapping[str, Any]],
+    output_dir: Path,
+    panel_width: int,
+    sample_count: int,
+    frame_indices: Sequence[int] | None,
+) -> dict[str, Any]:
+    if len(records) != len(predictions) or len(records) != len(score_maps):
+        raise ValueError("visualization inputs have different lengths")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    panels_dir = output_dir / "panels"
+    binary_dir = output_dir / "pred_binary"
+    score_dir = output_dir / "pred_score"
+    confusion_dir = output_dir / "confusion"
+    for directory in (panels_dir, binary_dir, score_dir, confusion_dir):
+        directory.mkdir(parents=True, exist_ok=True)
+
+    selected = choose_visualization_indices(frame_rows, frame_indices, sample_count)
+    panel_paths: list[str] = []
+    for index in selected:
+        record = records[index]
+        prediction = predictions[index].astype(bool, copy=False)
+        shape = prediction.shape
+        stem = Path(record.name).stem
+        rgb = resize_image_to_array(Path(record.image_path), shape)
+        cue = load_cue_array(cue_cache_root, record.name, shape)
+        gt_path = source_path / "gt_mask" / f"{stem}.png"
+        gt = cv2.imread(str(gt_path), cv2.IMREAD_GRAYSCALE)
+        if gt is None:
+            raise FileNotFoundError(gt_path)
+        if gt.shape != shape:
+            gt = cv2.resize(gt, (shape[1], shape[0]), interpolation=cv2.INTER_NEAREST)
+        gt_mask = gt >= 128
+        score_u8 = np.clip(score_maps[index], 0, 255).astype(np.uint8)
+        confusion = confusion_rgb(prediction, gt_mask)
+        binary = prediction.astype(np.uint8) * 255
+        Image.fromarray(binary).save(binary_dir / f"{stem}.png")
+        Image.fromarray(score_u8).save(score_dir / f"{stem}.png")
+        Image.fromarray(confusion).save(confusion_dir / f"{stem}.png")
+        row = frame_rows[index]
+        subtitle = (
+            f"IoU={float(row['iou']):.3f} F1={float(row['f1']):.3f} "
+            f"open={row['open_count']} active={row['active_lifespan_count']}"
+        )
+        panel = hstack(
+            [
+                labeled_panel(rgb, f"RGB | {stem}", "current frame", panel_width),
+                labeled_panel(cue_heatmap(cue), "Cue C_t", "blue=low, yellow/red=high", panel_width),
+                labeled_panel(prediction_overlay(rgb, prediction), "Prediction overlay", subtitle, panel_width),
+                labeled_panel(mask_rgb(gt_mask, (255, 255, 255)), "GT mask", "post-inference eval only", panel_width),
+                labeled_panel(confusion, "Confusion", "green TP, pink FP, blue FN", panel_width),
+            ]
+        )
+        panel_path = panels_dir / f"{index:06d}_{stem}_panel.png"
+        panel.save(panel_path)
+        panel_paths.append(str(panel_path))
+    timeline_path = output_dir / "timeline_metrics.png"
+    save_timeline_chart(frame_rows, timeline_path)
+    payload = {
+        "schema_version": 1,
+        "contract": "online_bayesian_ref_scene_visualization",
+        "frames": len(frame_rows),
+        "selected_frame_indices": selected,
+        "panel_paths": panel_paths,
+        "timeline_metrics_png": str(timeline_path),
+        "confusion_legend": {"tp": "green", "fp": "pink", "fn": "blue", "tn": "black"},
+        "gt_loaded_after_inference_only": True,
+    }
+    (output_dir / "visual_summary.json").write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    return payload
+
+
+def select_visualization_indices(
+    frame_rows: Sequence[Mapping[str, Any]],
+    *,
+    max_panels: int,
+    explicit_indices: Sequence[int] | None = None,
+) -> list[int]:
+    """Backward-compatible named wrapper used by tests and ad-hoc scripts."""
+    if explicit_indices is not None:
+        valid = [int(index) for index in explicit_indices if 0 <= int(index) < len(frame_rows)]
+        return valid[: int(max_panels)]
+    return choose_visualization_indices(frame_rows, None, int(max_panels))
+
+
+def write_visualizations(
+    visualization_dir: Path,
+    *,
+    source_path: Path,
+    cue_cache_root: Path,
+    records: Sequence[Any],
+    frame_rows: Sequence[Mapping[str, Any]],
+    predictions: Sequence[np.ndarray],
+    max_panels: int,
+    explicit_indices: Sequence[int] | None,
+    run_summary: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Compatibility wrapper that writes panels from binary predictions only."""
+    score_maps = [prediction.astype(np.uint8) * 255 for prediction in predictions]
+    summary = write_visualization_artifacts(
+        source_path=source_path,
+        cue_cache_root=cue_cache_root,
+        records=records,
+        predictions=predictions,
+        score_maps=score_maps,
+        frame_rows=frame_rows,
+        output_dir=visualization_dir,
+        panel_width=260,
+        sample_count=int(max_panels),
+        frame_indices=explicit_indices,
+    )
+    summary.update(
+        {
+            "scene": source_path.name,
+            "metric_summary": run_summary.get("metrics", {}),
+            "algorithm": run_summary.get("algorithm"),
+            "detector_only": run_summary.get("detector_only"),
+            "optimized_parameters": run_summary.get("optimized_parameters", []),
+            "timeline": summary["timeline_metrics_png"],
+            "panels": [
+                {"frame_index": idx, "path": path}
+                for idx, path in zip(summary["selected_frame_indices"], summary["panel_paths"])
+            ],
+        }
+    )
+    (visualization_dir / "visual_summary.json").write_text(
+        json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    return summary
+
+
 def evaluate_after_inference(
     source_path: Path,
     records: Sequence[Any],
@@ -665,6 +1001,8 @@ def evaluate_after_inference(
         "mean_frame_iou": float(np.mean([float(row["iou"]) for row in frame_rows])),
         "mean_frame_f1": float(np.mean([float(row["f1"]) for row in frame_rows])),
     }
+
+
 
 
 def event_diagnostics_after_inference(
@@ -1076,6 +1414,7 @@ def run_online(args: argparse.Namespace) -> dict[str, Any]:
     frame_rows: list[dict[str, Any]] = []
     lifecycle_events: list[LifecycleEvent] = []
     predictions: list[np.ndarray] = []
+    score_maps: list[np.ndarray] = []
     intrinsics: np.ndarray | None = None
     for record in records:
         frame_started = time.time()
@@ -1171,6 +1510,10 @@ def run_online(args: argparse.Namespace) -> dict[str, Any]:
         )
         prediction = (rendered_score.numpy() >= config.evaluation_threshold)
         predictions.append(prediction)
+        if args.visualization_dir is not None:
+            score_maps.append(
+                rendered_score.mul(255.0).round().to(torch.uint8).numpy()
+            )
         frame_rows.append(
             frame_diagnostics(
                 timestamp=timestamp,
@@ -1193,7 +1536,11 @@ def run_online(args: argparse.Namespace) -> dict[str, Any]:
     diagnostic_boundaries = tuple(
         int(value)
         for value in (
-            args.boundaries if args.boundaries is not None else DEFAULT_BOUNDARIES
+            ()
+            if args.disable_boundary_diagnostics
+            else args.boundaries
+            if args.boundaries is not None
+            else DEFAULT_BOUNDARIES
         )
     )
     if args.skip_post_inference_evaluation:
@@ -1216,6 +1563,21 @@ def run_online(args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError(f"immutable base tensor drift detected: {drift}")
     if intrinsics is None:
         raise RuntimeError("no causal frame was processed")
+    visualization_summary = None
+    if args.visualization_dir is not None:
+        visualization_summary = write_visualization_artifacts(
+            source_path=args.source_path,
+            cue_cache_root=args.cue_cache_root,
+            records=records,
+            predictions=predictions,
+            score_maps=score_maps,
+            frame_rows=frame_rows,
+            output_dir=args.visualization_dir,
+            panel_width=int(args.visualization_panel_width),
+            sample_count=int(args.visualization_sample_count),
+            frame_indices=args.visualization_frame_indices,
+        )
+
     summary = {
         "schema_version": 1,
         "script": "experiments/run_online_bayesian_lifespan_thaw.py",
@@ -1261,6 +1623,7 @@ def run_online(args: argparse.Namespace) -> dict[str, Any]:
         "cue_cache_metadata": cue_metadata,
         "camera_intrinsics": intrinsics.tolist(),
         "cuda_peak_memory_bytes": int(torch.cuda.max_memory_allocated()),
+        "visualization": visualization_summary,
     }
     checkpoint = {
         "schema_version": 1,
@@ -1288,8 +1651,39 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--resolution", type=float, default=4.0)
     parser.add_argument("--max-frames", type=positive_int, default=None)
     parser.add_argument("--boundaries", nargs="+", type=int, default=None)
+    parser.add_argument(
+        "--disable-boundary-diagnostics",
+        action="store_true",
+        help="omit post-inference global boundary delay diagnostics, useful for individual ESCD scenes",
+    )
     parser.add_argument("--skip-post-inference-evaluation", action="store_true")
     parser.add_argument("--evaluation-threshold", type=float, default=0.5)
+    parser.add_argument(
+        "--visualization-dir",
+        type=Path,
+        default=None,
+        help="optional post-inference directory for PNG panels/timeline and visual_summary.json",
+    )
+    parser.add_argument(
+        "--visualization-sample-count",
+        "--visualization-max-panels",
+        dest="visualization_sample_count",
+        type=nonnegative_int,
+        default=9,
+        help="number of representative frames to write as visual panels",
+    )
+    parser.add_argument(
+        "--visualization-panel-width",
+        type=positive_int,
+        default=320,
+        help="width in pixels for each panel column",
+    )
+    parser.add_argument(
+        "--visualization-frame-indices",
+        type=parse_visualization_frame_indices,
+        default=None,
+        help="comma-separated zero-based frame indices to render as panels",
+    )
     parser.add_argument("--bayes-cue-mode", choices=("binary", "soft"), default="binary")
     parser.add_argument("--bayes-cue-threshold", type=float, default=0.5)
     parser.add_argument("--bayes-cue-scale", type=float, default=1.0)
