@@ -18,6 +18,9 @@ from experiments.run_online_bayesian_lifespan_thaw import (
     main,
     choose_visualization_indices,
     SyntheticTemporalModel,
+    summarize_binary_metric_rows,
+    transition_diagnostics,
+    visualization_reason,
     write_visualization_artifacts,
 )
 from types import SimpleNamespace
@@ -59,6 +62,26 @@ def test_causal_record_construction_does_not_require_gt_or_boundaries(tmp_path: 
     assert names == ["frame_001.png", "frame_002.png"]
     assert [record.global_index for record in records] == [0, 1]
     assert all(record.mask_path == "" for record in records)
+
+
+def test_causal_record_construction_labels_contiguous_scene_segments(tmp_path: Path):
+    image_dir = tmp_path / "inference_scene" / "images"
+    image_dir.mkdir(parents=True)
+    for name in (
+        "scene_change1_frame_000001.png",
+        "scene_change1_frame_000002.png",
+        "scene_change2_frame_000001.png",
+    ):
+        (image_dir / name).touch()
+
+    records, _ = build_causal_records(tmp_path)
+
+    assert [record.segment_id for record in records] == [0, 0, 1]
+    assert [record.segment_name for record in records] == [
+        "scene_change1",
+        "scene_change1",
+        "scene_change2",
+    ]
 
 
 def test_exact_bocd_memory_guard_requires_explicit_capacity():
@@ -151,6 +174,60 @@ def test_visualization_selection_uses_anchors_and_metric_extremes():
     assert 1 in selected  # worst IoU
 
 
+def test_transition_diagnostics_separates_keep_from_open_close():
+    rows = []
+    for timestamp in range(5):
+        rows.append(
+            {
+                "timestamp": timestamp,
+                "iou": timestamp / 10,
+                "open_count": 10 if timestamp == 2 else 0,
+                "keep_count": 50 + timestamp,
+                "close_count": 3 if timestamp == 2 else 0,
+                "active_lifespan_count": 100 + timestamp,
+            }
+        )
+
+    diagnostics = transition_diagnostics(rows, [2], radius=1)
+
+    assert diagnostics == [
+        {
+            "transition_number": 1,
+            "boundary_timestamp": 2,
+            "window_start": 1,
+            "window_end_exclusive": 4,
+            "window_open_count": 10,
+            "window_keep_count": 156,
+            "window_close_count": 3,
+            "active_before": 101,
+            "active_first": 102,
+            "active_after": 103,
+            "first_frame_open": 10,
+            "first_frame_keep": 52,
+            "first_frame_close": 3,
+            "iou_before": 0.1,
+            "iou_first": 0.2,
+            "iou_after": 0.3,
+        }
+    ]
+    assert "before transition 1" in visualization_reason(1, rows, [2])
+    assert "transition 1 first frame" in visualization_reason(2, rows, [2])
+
+
+def test_summarize_binary_metric_rows_reports_segment_metrics():
+    rows = [
+        {"tp": 3, "tn": 4, "fp": 1, "fn": 2, "iou": 0.5, "f1": 0.6},
+        {"tp": 2, "tn": 5, "fp": 0, "fn": 1, "iou": 0.7, "f1": 0.8},
+    ]
+
+    summary = summarize_binary_metric_rows(rows)
+
+    assert summary["frames"] == 2
+    assert summary["tp"] == 5
+    assert summary["fp"] == 1
+    assert summary["mean_frame_iou"] == pytest.approx(0.6)
+
+
 def test_optional_visualizations_write_separate_pngs_and_summary(tmp_path: Path):
     source = tmp_path / "scene_change_tiny"
     image_dir = source / "inference_scene" / "images"
@@ -171,7 +248,11 @@ def test_optional_visualizations_write_separate_pngs_and_summary(tmp_path: Path)
         mask[2:6, 2:6] = 255
         cv2.imwrite(str(mask_dir / name), mask)
         torch.save(torch.full((1, 8, 8), 0.25 + i * 0.5), cue_dir / f"frame_{i:06d}.pt")
-        records.append(SimpleNamespace(name=name, image_path=str(image_dir / name)))
+        records.append(
+            SimpleNamespace(
+                name=name, image_path=str(image_dir / name), segment_name="tiny"
+            )
+        )
         pred = np.zeros((8, 8), dtype=bool)
         pred[2:6, 2:6] = i == 1
         predictions.append(pred)
@@ -185,6 +266,7 @@ def test_optional_visualizations_write_separate_pngs_and_summary(tmp_path: Path)
                 "active_lifespan_count": 10 + i,
                 "open_count": i,
                 "keep_count": 2 * i,
+                "close_count": 0,
                 "predicted_positive_fraction": float(pred.mean()),
             }
         )
@@ -195,16 +277,30 @@ def test_optional_visualizations_write_separate_pngs_and_summary(tmp_path: Path)
         records=records,
         predictions=predictions,
         score_maps=[pred.astype(np.uint8) * 255 for pred in predictions],
+        raw_render_maps=[
+            np.repeat((pred.astype(np.uint8) * 200)[..., None], 3, axis=2)
+            for pred in predictions
+        ],
         frame_rows=frame_rows,
         output_dir=tmp_path / "visuals",
         panel_width=64,
         sample_count=2,
         frame_indices=(0, 1),
+        boundaries=(1,),
+        all_frames=True,
+        gif_width=320,
+        gif_duration_ms=50,
     )
 
     assert Path(summary["timeline_metrics_png"]).is_file()
+    assert Path(summary["timeline_lifecycle_png"]).is_file()
     assert len(summary["panel_paths"]) == 2
     assert len(summary["selected_frame_reasons"]) == 2
     assert "early" in summary["selected_frame_reasons"][0]
+    assert summary["boundaries"] == [1]
+    assert summary["transition_diagnostics"][0]["boundary_timestamp"] == 1
+    assert summary["all_frames_visualized"] is True
+    assert Path(summary["scene_gifs"]["tiny"]).is_file()
+    assert len(list((tmp_path / "visuals" / "raw_render").glob("*.png"))) == 2
     assert all(Path(path).is_file() for path in summary["panel_paths"])
     assert (tmp_path / "visuals" / "visual_summary.json").is_file()

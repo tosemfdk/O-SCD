@@ -698,6 +698,12 @@ def confusion_rgb(prediction: np.ndarray, target: np.ndarray) -> np.ndarray:
     return image
 
 
+def binary_mask_rgb(mask: np.ndarray, color: tuple[int, int, int]) -> np.ndarray:
+    image = np.zeros((*mask.shape, 3), dtype=np.uint8)
+    image[mask.astype(bool, copy=False)] = color
+    return image
+
+
 def labeled_panel(array: np.ndarray, title: str, subtitle: str, width: int) -> Image.Image:
     image = Image.fromarray(array.astype(np.uint8, copy=False)).convert("RGB")
     height = max(1, int(round(image.height * width / image.width)))
@@ -722,6 +728,29 @@ def hstack(images: Sequence[Image.Image], gap: int = 8) -> Image.Image:
         out.paste(image, (x, 0))
         x += image.width + gap
     return out
+
+
+def save_panel_gif(
+    paths: Sequence[Path], output_path: Path, *, width: int, duration_ms: int
+) -> None:
+    if not paths:
+        return
+    frames: list[Image.Image] = []
+    for path in paths:
+        with Image.open(path) as image:
+            height = max(1, int(round(image.height * width / image.width)))
+            resized = image.convert("RGB").resize((width, height), Image.BILINEAR)
+        frames.append(resized.quantize(colors=128, method=Image.Quantize.MEDIANCUT))
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    frames[0].save(
+        output_path,
+        save_all=True,
+        append_images=frames[1:],
+        duration=duration_ms,
+        loop=0,
+        disposal=2,
+        optimize=False,
+    )
 
 
 def choose_visualization_indices(
@@ -768,7 +797,9 @@ def choose_visualization_indices(
 
 
 def visualization_reason(
-    index: int, frame_rows: Sequence[Mapping[str, Any]]
+    index: int,
+    frame_rows: Sequence[Mapping[str, Any]],
+    boundaries: Sequence[int] = (),
 ) -> str:
     tags: list[str] = []
     if index == 0:
@@ -791,11 +822,44 @@ def visualization_reason(
             tags.append(labels[index])
     if index == len(frame_rows) // 2:
         tags.append("midpoint")
+    for boundary_number, boundary in enumerate(boundaries, start=1):
+        offset = index - int(boundary)
+        if offset == -1:
+            tags.append(f"before transition {boundary_number}")
+        elif offset == 0:
+            tags.append(f"transition {boundary_number} first frame")
+        elif offset == 1:
+            tags.append(f"after transition {boundary_number}")
     return " / ".join(dict.fromkeys(tags)) or "coverage sample"
 
 
+def _draw_boundaries(
+    draw: ImageDraw.ImageDraw,
+    boundaries: Sequence[int],
+    frame_count: int,
+    *,
+    margin_left: int,
+    margin_top: int,
+    plot_w: int,
+    plot_h: int,
+    font: Any,
+) -> None:
+    if frame_count <= 1:
+        return
+    for number, boundary in enumerate(boundaries, start=1):
+        if not 0 < int(boundary) < frame_count:
+            continue
+        x = margin_left + int(int(boundary) * plot_w / (frame_count - 1))
+        for y in range(margin_top, margin_top + plot_h, 12):
+            draw.line((x, y, x, min(y + 7, margin_top + plot_h)), fill=(35, 35, 35), width=2)
+        draw.text((x + 5, margin_top + 4), f"T{number}={int(boundary)}", fill=(35, 35, 35), font=font)
+
+
 def save_timeline_chart(
-    frame_rows: Sequence[Mapping[str, Any]], path: Path, scene_name: str = ""
+    frame_rows: Sequence[Mapping[str, Any]],
+    path: Path,
+    scene_name: str = "",
+    boundaries: Sequence[int] = (),
 ) -> None:
     width, height = 1400, 760
     margin_left, margin_right = 86, 36
@@ -812,7 +876,11 @@ def save_timeline_chart(
     draw.text((margin_left, 18), title, fill="black", font=font)
     draw.text(
         (margin_left, 48),
-        "Independent ref-to-SC stream: no internal CLOSE/REOPEN boundary is expected.",
+        (
+            "One continuous ref->SC1->SC2->SC3 stream; model, BOCD, and optimizer state are not reset."
+            if boundaries
+            else "Independent ref-to-SC stream: no internal CLOSE/REOPEN boundary is expected."
+        ),
         fill=(60, 60, 60),
         font=small,
     )
@@ -857,6 +925,16 @@ def save_timeline_chart(
     active_pts = points("active_lifespan_count", max(1.0, float(max_active)))
     if len(active_pts) > 1:
         draw.line(active_pts, fill=(140, 90, 210), width=2)
+    _draw_boundaries(
+        draw,
+        boundaries,
+        len(frame_rows),
+        margin_left=margin_left,
+        margin_top=margin_top,
+        plot_w=plot_w,
+        plot_h=plot_h,
+        font=small,
+    )
     frame_label = "frame index"
     label_box = draw.textbbox((0, 0), frame_label, font=small)
     draw.text(
@@ -883,6 +961,90 @@ def save_timeline_chart(
     canvas.save(path)
 
 
+def save_lifecycle_chart(
+    frame_rows: Sequence[Mapping[str, Any]],
+    path: Path,
+    scene_name: str = "",
+    boundaries: Sequence[int] = (),
+) -> None:
+    width, height = 1400, 760
+    margin_left, margin_right = 86, 36
+    margin_top, margin_bottom = 96, 92
+    plot_w = width - margin_left - margin_right
+    plot_h = height - margin_top - margin_bottom
+    canvas = Image.new("RGB", (width, height), "white")
+    draw = ImageDraw.Draw(canvas)
+    font = _font(18)
+    small = _font(13)
+    title = "Binary lifespan decisions over the causal stream"
+    if scene_name:
+        title = f"{scene_name}: {title}"
+    draw.text((margin_left, 18), title, fill="black", font=font)
+    draw.text(
+        (margin_left, 48),
+        "Per-frame counts are normalized independently; dashed lines mark scene transitions.",
+        fill=(60, 60, 60),
+        font=small,
+    )
+    for tick in range(0, 11):
+        value = tick / 10.0
+        y = margin_top + plot_h - int(value * plot_h)
+        draw.line((margin_left, y, width - margin_right, y), fill=(225, 225, 225))
+        draw.text((34, y - 7), f"{value:.1f}", fill="black", font=small)
+
+    series = [
+        ("OPEN", "open_count", (0, 140, 70)),
+        ("KEEP", "keep_count", (40, 100, 220)),
+        ("CLOSE", "close_count", (215, 45, 55)),
+        ("Active", "active_lifespan_count", (140, 90, 210)),
+    ]
+    if len(frame_rows) == 1:
+        xs = [margin_left]
+    else:
+        xs = [
+            margin_left + int(i * plot_w / (len(frame_rows) - 1))
+            for i in range(len(frame_rows))
+        ]
+    maxima: dict[str, int] = {}
+    for label, key, color in series:
+        maximum = max((int(row.get(key, 0)) for row in frame_rows), default=0)
+        maxima[label] = maximum
+        scale = max(1, maximum)
+        points = [
+            (
+                x,
+                margin_top
+                + plot_h
+                - int(max(0.0, min(1.0, float(row.get(key, 0)) / scale)) * plot_h),
+            )
+            for x, row in zip(xs, frame_rows)
+        ]
+        if len(points) > 1:
+            draw.line(points, fill=color, width=3 if key != "active_lifespan_count" else 2)
+    _draw_boundaries(
+        draw,
+        boundaries,
+        len(frame_rows),
+        margin_left=margin_left,
+        margin_top=margin_top,
+        plot_w=plot_w,
+        plot_h=plot_h,
+        font=small,
+    )
+    legend_x, legend_y = margin_left, height - 48
+    for label, _key, color in series:
+        draw.line((legend_x, legend_y + 8, legend_x + 28, legend_y + 8), fill=color, width=4)
+        draw.text(
+            (legend_x + 36, legend_y),
+            f"{label} / max ({maxima[label]:,})",
+            fill="black",
+            font=small,
+        )
+        legend_x += 305
+    path.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(path)
+
+
 def write_visualization_artifacts(
     *,
     source_path: Path,
@@ -890,11 +1052,16 @@ def write_visualization_artifacts(
     records: Sequence[Any],
     predictions: Sequence[np.ndarray],
     score_maps: Sequence[np.ndarray],
+    raw_render_maps: Sequence[np.ndarray] | None = None,
     frame_rows: Sequence[Mapping[str, Any]],
     output_dir: Path,
     panel_width: int,
     sample_count: int,
     frame_indices: Sequence[int] | None,
+    boundaries: Sequence[int] = (),
+    all_frames: bool = False,
+    gif_width: int = 960,
+    gif_duration_ms: int = 160,
 ) -> dict[str, Any]:
     if len(records) != len(predictions) or len(records) != len(score_maps):
         raise ValueError("visualization inputs have different lengths")
@@ -902,20 +1069,27 @@ def write_visualization_artifacts(
     panels_dir = output_dir / "panels"
     binary_dir = output_dir / "pred_binary"
     score_dir = output_dir / "pred_score"
+    raw_render_dir = output_dir / "raw_render"
     confusion_dir = output_dir / "confusion"
-    for directory in (panels_dir, binary_dir, score_dir, confusion_dir):
+    for directory in (panels_dir, binary_dir, score_dir, raw_render_dir, confusion_dir):
         directory.mkdir(parents=True, exist_ok=True)
 
-    selected = choose_visualization_indices(frame_rows, frame_indices, sample_count)
+    if raw_render_maps is not None and len(raw_render_maps) != len(records):
+        raise ValueError("raw render maps have different length")
+    selected = (
+        list(range(len(frame_rows)))
+        if all_frames
+        else choose_visualization_indices(frame_rows, frame_indices, sample_count)
+    )
     panel_paths: list[str] = []
     selected_reasons: list[str] = []
+    panels_by_segment: dict[str, list[Path]] = {}
     for index in selected:
         record = records[index]
         prediction = predictions[index].astype(bool, copy=False)
         shape = prediction.shape
         stem = Path(record.name).stem
         rgb = resize_image_to_array(Path(record.image_path), shape)
-        cue = load_cue_array(cue_cache_root, record.name, shape)
         gt_path = source_path / "gt_mask" / f"{stem}.png"
         gt = cv2.imread(str(gt_path), cv2.IMREAD_GRAYSCALE)
         if gt is None:
@@ -924,28 +1098,46 @@ def write_visualization_artifacts(
             gt = cv2.resize(gt, (shape[1], shape[0]), interpolation=cv2.INTER_NEAREST)
         gt_mask = gt >= 128
         score_u8 = np.clip(score_maps[index], 0, 255).astype(np.uint8)
+        raw_render = (
+            np.asarray(raw_render_maps[index], dtype=np.uint8)
+            if raw_render_maps is not None
+            else np.repeat(score_u8[..., None], 3, axis=2)
+        )
         confusion = confusion_rgb(prediction, gt_mask)
         binary = prediction.astype(np.uint8) * 255
         Image.fromarray(binary).save(binary_dir / f"{stem}.png")
         Image.fromarray(score_u8).save(score_dir / f"{stem}.png")
+        Image.fromarray(raw_render).save(raw_render_dir / f"{stem}.png")
         Image.fromarray(confusion).save(confusion_dir / f"{stem}.png")
         row = frame_rows[index]
-        reason = visualization_reason(index, frame_rows)
+        reason = visualization_reason(index, frame_rows, boundaries)
         selected_reasons.append(reason)
         subtitle = (
             "yellow=prediction\n"
             f"IoU={float(row['iou']):.3f} F1={float(row['f1']):.3f} | "
-            f"OPEN={row['open_count']} active={row['active_lifespan_count']}"
+            f"OPEN={row.get('open_count', 0)} KEEP={row.get('keep_count', 0)} "
+            f"CLOSE={row.get('close_count', 0)} | "
+            f"active={row.get('active_lifespan_count', 0)}"
         )
         panel = hstack(
             [
                 labeled_panel(rgb, f"RGB | {reason}", stem, panel_width),
-                labeled_panel(cue_heatmap(cue), "Cue C_t", "blue=low, yellow/red=high", panel_width),
-                labeled_panel(prediction_overlay(rgb, prediction), "Prediction overlay", subtitle, panel_width),
                 labeled_panel(
-                    target_overlay(rgb, gt_mask),
-                    "GT overlay",
-                    "cyan=GT\npost-inference evaluation only",
+                    binary_mask_rgb(gt_mask, (255, 255, 255)),
+                    "GT mask",
+                    "post-inference evaluation only",
+                    panel_width,
+                ),
+                labeled_panel(
+                    raw_render,
+                    "Raw R_change render",
+                    "before channel mean + threshold",
+                    panel_width,
+                ),
+                labeled_panel(
+                    binary_mask_rgb(prediction, (255, 220, 0)),
+                    "Rendered mask (> 0.5)",
+                    subtitle,
                     panel_width,
                 ),
                 labeled_panel(confusion, "Confusion", "green TP, pink FP, blue FN", panel_width),
@@ -954,8 +1146,23 @@ def write_visualization_artifacts(
         panel_path = panels_dir / f"{index:06d}_{stem}_panel.png"
         panel.save(panel_path)
         panel_paths.append(str(panel_path))
+        segment = str(getattr(record, "segment_name", stem.rsplit("_frame_", 1)[0]))
+        panels_by_segment.setdefault(segment, []).append(panel_path)
     timeline_path = output_dir / "timeline_metrics.png"
-    save_timeline_chart(frame_rows, timeline_path, source_path.name)
+    lifecycle_path = output_dir / "timeline_lifecycle.png"
+    save_timeline_chart(frame_rows, timeline_path, source_path.name, boundaries)
+    save_lifecycle_chart(frame_rows, lifecycle_path, source_path.name, boundaries)
+    scene_gifs: dict[str, str] = {}
+    if all_frames:
+        for segment, paths in panels_by_segment.items():
+            gif_path = output_dir / segment / f"{segment}_confusion.gif"
+            save_panel_gif(
+                paths,
+                gif_path,
+                width=int(gif_width),
+                duration_ms=int(gif_duration_ms),
+            )
+            scene_gifs[segment] = str(gif_path)
     payload = {
         "schema_version": 1,
         "contract": "online_bayesian_ref_scene_visualization",
@@ -964,6 +1171,12 @@ def write_visualization_artifacts(
         "selected_frame_reasons": selected_reasons,
         "panel_paths": panel_paths,
         "timeline_metrics_png": str(timeline_path),
+        "timeline_lifecycle_png": str(lifecycle_path),
+        "boundaries": [int(value) for value in boundaries],
+        "transition_diagnostics": transition_diagnostics(frame_rows, boundaries),
+        "all_frames_visualized": bool(all_frames),
+        "scene_gifs": scene_gifs,
+        "raw_render_contract": "three-channel causal R_change output before channel mean and evaluation threshold",
         "confusion_legend": {"tp": "green", "fp": "pink", "fn": "blue", "tn": "black"},
         "gt_loaded_after_inference_only": True,
     }
@@ -1067,6 +1280,10 @@ def evaluate_after_inference(
         else 0.0
     )
     union = aggregate["tp"] + aggregate["fp"] + aggregate["fn"]
+    segment_rows: dict[str, list[Mapping[str, Any]]] = {}
+    for record, row in zip(records, frame_rows):
+        label = getattr(record, "segment_name", Path(record.name).stem)
+        segment_rows.setdefault(str(label), []).append(row)
     return {
         "evaluated": True,
         "frames": len(frame_rows),
@@ -1079,7 +1296,80 @@ def evaluate_after_inference(
         else 0.0,
         "mean_frame_iou": float(np.mean([float(row["iou"]) for row in frame_rows])),
         "mean_frame_f1": float(np.mean([float(row["f1"]) for row in frame_rows])),
+        "segments": [
+            {"segment": label, **summarize_binary_metric_rows(rows)}
+            for label, rows in segment_rows.items()
+        ],
     }
+
+
+def summarize_binary_metric_rows(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    aggregate = {
+        key: sum(int(row[key]) for row in rows) for key in ("tp", "tn", "fp", "fn")
+    }
+    precision = (
+        aggregate["tp"] / (aggregate["tp"] + aggregate["fp"])
+        if aggregate["tp"] + aggregate["fp"]
+        else 0.0
+    )
+    recall = (
+        aggregate["tp"] / (aggregate["tp"] + aggregate["fn"])
+        if aggregate["tp"] + aggregate["fn"]
+        else 0.0
+    )
+    union = aggregate["tp"] + aggregate["fp"] + aggregate["fn"]
+    return {
+        "frames": len(rows),
+        **aggregate,
+        "precision": precision,
+        "recall": recall,
+        "aggregate_iou": aggregate["tp"] / union if union else 0.0,
+        "aggregate_f1": 2.0 * precision * recall / (precision + recall)
+        if precision + recall
+        else 0.0,
+        "mean_frame_iou": float(np.mean([float(row["iou"]) for row in rows])),
+        "mean_frame_f1": float(np.mean([float(row["f1"]) for row in rows])),
+    }
+
+
+def transition_diagnostics(
+    frame_rows: Sequence[Mapping[str, Any]],
+    boundaries: Sequence[int],
+    *,
+    radius: int = 3,
+) -> list[dict[str, Any]]:
+    diagnostics: list[dict[str, Any]] = []
+    for number, boundary_value in enumerate(boundaries, start=1):
+        boundary = int(boundary_value)
+        if not 0 < boundary < len(frame_rows):
+            continue
+        start = max(0, boundary - radius)
+        end = min(len(frame_rows), boundary + radius + 1)
+        window = frame_rows[start:end]
+        before = frame_rows[boundary - 1]
+        first = frame_rows[boundary]
+        after = frame_rows[min(boundary + 1, len(frame_rows) - 1)]
+        diagnostics.append(
+            {
+                "transition_number": number,
+                "boundary_timestamp": boundary,
+                "window_start": start,
+                "window_end_exclusive": end,
+                "window_open_count": sum(int(row.get("open_count", 0)) for row in window),
+                "window_keep_count": sum(int(row.get("keep_count", 0)) for row in window),
+                "window_close_count": sum(int(row.get("close_count", 0)) for row in window),
+                "active_before": int(before.get("active_lifespan_count", 0)),
+                "active_first": int(first.get("active_lifespan_count", 0)),
+                "active_after": int(after.get("active_lifespan_count", 0)),
+                "first_frame_open": int(first.get("open_count", 0)),
+                "first_frame_keep": int(first.get("keep_count", 0)),
+                "first_frame_close": int(first.get("close_count", 0)),
+                "iou_before": float(before["iou"]) if before.get("iou") is not None else None,
+                "iou_first": float(first["iou"]) if first.get("iou") is not None else None,
+                "iou_after": float(after["iou"]) if after.get("iou") is not None else None,
+            }
+        )
+    return diagnostics
 
 
 
@@ -1392,16 +1682,23 @@ def build_causal_records(source_path: Path, *, max_frames: int | None = None) ->
     names = list_images(image_dir)
     if max_frames is not None:
         names = names[:max_frames]
-    records = [
-        SimpleNamespace(
-            global_index=index,
-            segment_id=0,
-            name=name,
-            image_path=str(image_dir / name),
-            mask_path="",
+    records = []
+    segment_ids: dict[str, int] = {}
+    for index, name in enumerate(names):
+        stem = Path(name).stem
+        segment_name = stem.rsplit("_frame_", 1)[0] if "_frame_" in stem else source_path.name
+        if segment_name not in segment_ids:
+            segment_ids[segment_name] = len(segment_ids)
+        records.append(
+            SimpleNamespace(
+                global_index=index,
+                segment_id=segment_ids[segment_name],
+                segment_name=segment_name,
+                name=name,
+                image_path=str(image_dir / name),
+                mask_path="",
+            )
         )
-        for index, name in enumerate(names)
-    ]
     return records, names
 
 
@@ -1494,6 +1791,7 @@ def run_online(args: argparse.Namespace) -> dict[str, Any]:
     lifecycle_events: list[LifecycleEvent] = []
     predictions: list[np.ndarray] = []
     score_maps: list[np.ndarray] = []
+    raw_render_maps: list[np.ndarray] = []
     intrinsics: np.ndarray | None = None
     for record in records:
         frame_started = time.time()
@@ -1593,6 +1891,17 @@ def run_online(args: argparse.Namespace) -> dict[str, Any]:
             score_maps.append(
                 rendered_score.mul(255.0).round().to(torch.uint8).numpy()
             )
+            raw_render_maps.append(
+                package["render"]
+                .detach()
+                .clamp(0.0, 1.0)
+                .mul(255.0)
+                .round()
+                .to(torch.uint8)
+                .permute(1, 2, 0)
+                .cpu()
+                .numpy()
+            )
         frame_rows.append(
             frame_diagnostics(
                 timestamp=timestamp,
@@ -1650,11 +1959,16 @@ def run_online(args: argparse.Namespace) -> dict[str, Any]:
             records=records,
             predictions=predictions,
             score_maps=score_maps,
+            raw_render_maps=raw_render_maps,
             frame_rows=frame_rows,
             output_dir=args.visualization_dir,
             panel_width=int(args.visualization_panel_width),
             sample_count=int(args.visualization_sample_count),
             frame_indices=args.visualization_frame_indices,
+            boundaries=diagnostic_boundaries,
+            all_frames=bool(args.visualization_all_frames),
+            gif_width=int(args.visualization_gif_width),
+            gif_duration_ms=int(args.visualization_gif_duration_ms),
         )
 
     summary = {
@@ -1671,6 +1985,9 @@ def run_online(args: argparse.Namespace) -> dict[str, Any]:
         "manual_boundaries_used_for_inference": False,
         "gt_loaded_after_inference_only": not args.skip_post_inference_evaluation,
         "boundary_diagnostics_after_inference": event_summary,
+        "transition_diagnostics_after_inference": transition_diagnostics(
+            frame_rows, diagnostic_boundaries
+        ),
         "metrics": metric_summary,
         "frames": len(frame_rows),
         "processed_frame_count": len(names),
@@ -1762,6 +2079,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=parse_visualization_frame_indices,
         default=None,
         help="comma-separated zero-based frame indices to render as panels",
+    )
+    parser.add_argument(
+        "--visualization-all-frames",
+        action="store_true",
+        help="write every causal raw render/panel and one GIF per scene segment",
+    )
+    parser.add_argument("--visualization-gif-width", type=positive_int, default=960)
+    parser.add_argument(
+        "--visualization-gif-duration-ms", type=positive_int, default=160
     )
     parser.add_argument("--bayes-cue-mode", choices=("binary", "soft"), default="binary")
     parser.add_argument("--bayes-cue-threshold", type=float, default=0.5)
