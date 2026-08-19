@@ -30,6 +30,9 @@ def test_from_gaussians_initializes_state_and_freezes_base_tensors():
     assert torch.isinf(model.state_end).all()
     assert torch.equal(model.state_valid[:, 0], torch.ones(2, dtype=torch.bool))
     assert not model.state_valid[:, 1:].any()
+    assert torch.equal(model.state_status[:, 0], torch.ones(2, dtype=torch.int8))
+    assert torch.equal(model.num_states, torch.ones(2, dtype=torch.long))
+    assert torch.equal(model.current_state_index, torch.zeros(2, dtype=torch.long))
     assert [name for name, _ in model.named_parameters()] == ["state_change_dc"]
 
     for name in ("_xyz", "_features_dc", "_features_rest", "_opacity", "_scaling", "_rotation"):
@@ -41,8 +44,7 @@ def test_state_dict_contains_temporal_parameter_and_buffers():
 
     state = model.state_dict()
 
-    # Status/count buffers are added with the later transition lifecycle.
-    assert set(state) == {"state_change_dc", "state_start", "state_end", "state_valid"}
+    assert set(state) == {"state_change_dc", "state_start", "state_end", "state_valid", "state_status", "num_states", "current_state_index"}
     assert state["state_change_dc"].shape == (1, 2, 1, 3)
     assert state["state_start"].dtype == model.state_change_dc.dtype
     assert state["state_valid"].dtype == torch.bool

@@ -40,6 +40,16 @@ class TemporalGeometryChangeModel(TemporalChangeModel):
             torch.zeros((n, s, 4), device=device, dtype=dtype)
         )
 
+    @torch.no_grad()
+    def _initialize_state_slot(
+        self, rows: torch.Tensor, slots: torch.Tensor, initialization: str
+    ) -> None:
+        super()._initialize_state_slot(rows, slots, initialization)
+        self.state_xyz_delta[rows, slots].zero_()
+        self.state_opacity_delta[rows, slots].zero_()
+        self.state_scaling_delta[rows, slots].zero_()
+        self.state_rotation_delta[rows, slots].zero_()
+
     @classmethod
     def from_gaussians(
         cls,

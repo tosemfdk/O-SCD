@@ -104,6 +104,9 @@ def test_geometry_state_dict_and_optimizer_contract_are_explicit():
         "state_start",
         "state_end",
         "state_valid",
+        "state_status",
+        "num_states",
+        "current_state_index",
     }
 
 
