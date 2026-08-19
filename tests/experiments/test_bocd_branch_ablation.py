@@ -22,7 +22,7 @@ def test_beam2_memory_estimate_is_linear_and_between_map_and_exact():
         "exact", count, 128, torch.float32
     )
 
-    assert beam == count * (9 * 4 + 8 * 8)
+    assert beam == count * (13 * 4 + 9 * 8)
     assert map_bytes < beam < exact_bytes
 
 
@@ -74,3 +74,5 @@ def test_sanitize_runner_args_rejects_ablation_owned_flags():
     for flag in ("--bocd-mode", "--output-dir", "--detector-only-smoke"):
         with pytest.raises(ValueError, match=flag):
             sanitize_runner_args([flag, "x"])
+        with pytest.raises(ValueError, match=flag):
+            sanitize_runner_args([f"{flag}=x"])
