@@ -2,6 +2,8 @@ import csv
 import json
 from pathlib import Path
 
+import pytest
+
 from experiments.summarize_bayesian_ref_scenes import main, summarize_scene
 
 
@@ -20,6 +22,7 @@ def _write_run(path: Path, scene: str, iou: float, f1: float):
                 "cuda_peak_memory_bytes": 10,
                 "run_arguments": {"source_path": f"data/Instance_1/{scene}"},
                 "metrics": {
+                    "evaluated": True,
                     "aggregate_iou": iou,
                     "aggregate_f1": f1,
                     "precision": 0.7,
@@ -70,3 +73,15 @@ def test_comparison_main_writes_csv_json_png(tmp_path: Path):
     assert (out / "comparison_metrics.png").is_file()
     payload = json.loads((out / "comparison_summary.json").read_text(encoding="utf-8"))
     assert [row["scene"] for row in payload["scenes"]] == ["sc1", "sc2"]
+
+
+def test_summarize_scene_rejects_missing_post_inference_metrics(tmp_path: Path):
+    run = tmp_path / "unevaluated"
+    _write_run(run, "scene_change1", 0.3, 0.4)
+    summary_path = run / "summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["metrics"] = {"evaluated": False, "reason": "skipped"}
+    summary_path.write_text(json.dumps(summary), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="no completed post-inference metrics"):
+        summarize_scene(run)

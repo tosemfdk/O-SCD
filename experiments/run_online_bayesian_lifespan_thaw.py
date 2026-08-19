@@ -648,7 +648,7 @@ def load_cue_array(cue_cache_root: Path, frame_name: str, shape: tuple[int, int]
     from experiments.train_cue_temporal_rchange import physical_frame_name
 
     cue_path = cue_cache_root / "cues" / f"{physical_frame_name(Path(frame_name).stem)}.pt"
-    cue = torch.load(cue_path, map_location="cpu", weights_only=False)
+    cue = torch.load(cue_path, map_location="cpu", weights_only=True)
     if not isinstance(cue, torch.Tensor):
         raise TypeError(f"cue cache entry must be a tensor: {cue_path}")
     array = cue.detach().float().squeeze().numpy()

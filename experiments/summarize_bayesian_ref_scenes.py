@@ -45,6 +45,10 @@ def summarize_scene(run_dir: Path, label: str | None = None) -> dict[str, Any]:
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
     frames = read_frame_csv(frame_path)
     metrics = summary.get("metrics", {}) if isinstance(summary, Mapping) else {}
+    if not isinstance(metrics, Mapping) or metrics.get("evaluated") is not True:
+        raise ValueError(
+            f"run has no completed post-inference metrics: {summary_path}"
+        )
     active_counts = np.asarray([_float(row.get("active_lifespan_count")) for row in frames])
     open_counts = np.asarray([_float(row.get("open_count")) for row in frames])
     keep_counts = np.asarray([_float(row.get("keep_count")) for row in frames])

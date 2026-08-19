@@ -152,7 +152,6 @@ def test_visualization_selection_uses_anchors_and_metric_extremes():
 
 
 def test_optional_visualizations_write_separate_pngs_and_summary(tmp_path: Path):
-    pytest.importorskip("matplotlib")
     source = tmp_path / "scene_change_tiny"
     image_dir = source / "inference_scene" / "images"
     mask_dir = source / "gt_mask"
