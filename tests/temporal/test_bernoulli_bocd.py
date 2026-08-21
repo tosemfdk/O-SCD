@@ -82,6 +82,72 @@ def test_chunked_updates_match_single_batch_updates():
         assert torch.allclose(value, other, atol=1e-12, rtol=1e-12) if value.is_floating_point() else torch.equal(value, other)
 
 
+def test_exact_preserves_low_hazard_changepoint_lineage_until_it_becomes_map():
+    cfg = BernoulliBOCDConfig(prior_a=1.0, prior_b=1.0, hazard=0.01, max_run_length=80)
+    filt = BetaBernoulliBOCD(1, cfg, dtype=torch.float64)
+
+    one = torch.tensor([1.0], dtype=torch.float64)
+    zero = torch.tensor([0.0], dtype=torch.float64)
+    for timestamp in range(40):
+        filt.update(one, zero, timestamp=timestamp)
+
+    first_failure = filt.update(zero, one, timestamp=40)
+    assert 0.0 < first_failure.changepoint_probability.item() < 0.5
+    assert first_failure.map_run_length.item() != 0
+    assert first_failure.run_length_posterior[0, 0].item() > 0.0
+    assert filt.run_start[0, 0].item() == 40
+
+    for timestamp, expected_run_length in ((41, 1), (42, 2), (43, 3)):
+        result = filt.update(zero, one, timestamp=timestamp)
+        posterior = result.run_length_posterior[0]
+        assert result.map_run_length.item() == expected_run_length
+        assert result.estimated_run_start.item() == 40
+        assert posterior[expected_run_length].item() == posterior.max().item()
+        assert posterior[expected_run_length].item() > 0.5
+
+
+def test_exact_unobserved_gap_preserves_low_hazard_lineage_without_advancing():
+    cfg = BernoulliBOCDConfig(
+        prior_a=1.0,
+        prior_b=1.0,
+        hazard=0.01,
+        max_run_length=80,
+        min_evidence_mass=0.5,
+    )
+    filt = BetaBernoulliBOCD(1, cfg, dtype=torch.float64)
+
+    one = torch.tensor([1.0], dtype=torch.float64)
+    zero = torch.tensor([0.0], dtype=torch.float64)
+    for timestamp in range(40):
+        filt.update(one, zero, timestamp=timestamp)
+
+    first_failure = filt.update(zero, one, timestamp=40)
+    assert 0.0 < first_failure.changepoint_probability.item() < 0.5
+    assert filt.run_start[0, 0].item() == 40
+    before_gap = _state_clone(filt)
+
+    gap = filt.update(
+        torch.tensor([99.0], dtype=torch.float64),
+        torch.tensor([99.0], dtype=torch.float64),
+        total_mass=torch.tensor([0.0], dtype=torch.float64),
+        timestamp=41,
+    )
+    for key, value in before_gap.items():
+        assert torch.equal(value, filt.state_dict()[key]), key
+    assert gap.observed.tolist() == [False]
+    assert gap.run_length_posterior[0, 0].item() == first_failure.run_length_posterior[0, 0].item()
+
+    resumed = filt.update(zero, one, timestamp=42)
+    assert resumed.map_run_length.item() == 1
+    assert resumed.estimated_run_start.item() == 40
+    assert resumed.run_length_posterior[0, 1].item() > 0.5
+
+    for timestamp, expected_run_length in ((43, 2), (44, 3)):
+        result = filt.update(zero, one, timestamp=timestamp)
+        assert result.map_run_length.item() == expected_run_length
+        assert result.estimated_run_start.item() == 40
+
+
 def test_map_reset_filter_is_explicit_alternative_and_resets_on_surprise():
     cfg = BernoulliBOCDConfig(hazard=0.2, max_run_length=6)
     filt = MAPResetBernoulliFilter(1, cfg, dtype=torch.float64)
