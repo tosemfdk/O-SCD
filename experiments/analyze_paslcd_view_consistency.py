@@ -205,7 +205,7 @@ class DenseSceneState:
         return out
 
     def q_abs_delta_mean(self) -> np.ndarray:
-        out = np.zeros(self.size, dtype=np.float64)
+        out = np.full(self.size, np.nan, dtype=np.float64)
         m = self.q_delta_count > 0
         out[m] = self.q_abs_delta_sum[m] / self.q_delta_count[m]
         return out
@@ -358,8 +358,8 @@ def discover_scene_infos(root: Path, manifest_name: str = "manifest.json") -> li
     for manifest_path in candidates:
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except Exception:
-            continue
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"Failed to read D1 manifest {manifest_path}: {exc}") from exc
         frame_rows = manifest.get("frames")
         if not isinstance(frame_rows, list) or not frame_rows:
             continue
@@ -566,10 +566,18 @@ def update_scene(scene: SceneInfo, *, eta: float) -> tuple[DenseSceneState, list
             ev_mass = raw_mass[is_event]
             ev_strength = strength[is_event]
             ev_q = q[is_event]
-            odds01, odds10 = transition_odds_arrays(p00[is_event], p01[is_event], p10[is_event], p11[is_event])
+            ev_p_pre = p_pre[is_event]
+            ev_p_post = p_post[is_event]
+            ev_p00 = p00[is_event]
+            ev_p01 = p01[is_event]
+            ev_p10 = p10[is_event]
+            ev_p11 = p11[is_event]
+            ev_pflip = pflip[is_event]
+            ev_visible = visible[is_event]
+            odds01, odds10 = transition_odds_arrays(ev_p00, ev_p01, ev_p10, ev_p11)
             selected_odds = np.where((eactions == "OPEN") | (eactions == "REOPEN"), odds01, odds10)
             ell_active = emission_llr_active(ev_q, ev_strength, eta)
-            crossing = threshold_crossings(p_pre[is_event], p_post[is_event])
+            crossing = threshold_crossings(ev_p_pre, ev_p_post)
             mass_ratio = ev_mass / np.maximum(prior_mass, EPS)
             strength_ratio = ev_strength / np.maximum(prior_strength, EPS)
             view_ratio = np.full(erows.shape, np.nan, dtype=np.float64)
@@ -605,13 +613,13 @@ def update_scene(scene: SceneInfo, *, eta: float) -> tuple[DenseSceneState, list
                         "prior_keep_q_median": csv_float(prior_q[j]),
                         "q_delta_vs_prior_keep": csv_float(q_delta[j]),
                         "q_sign_flip_vs_prior_keep": bool(q_flip[j]),
-                        "p_active_pre": csv_float(p_pre[is_event][j]),
-                        "p_active_post": csv_float(p_post[is_event][j]),
-                        "p00": csv_float(p00[is_event][j]),
-                        "p01": csv_float(p01[is_event][j]),
-                        "p10": csv_float(p10[is_event][j]),
-                        "p11": csv_float(p11[is_event][j]),
-                        "pflip": csv_float(pflip[is_event][j]),
+                        "p_active_pre": csv_float(ev_p_pre[j]),
+                        "p_active_post": csv_float(ev_p_post[j]),
+                        "p00": csv_float(ev_p00[j]),
+                        "p01": csv_float(ev_p01[j]),
+                        "p10": csv_float(ev_p10[j]),
+                        "p11": csv_float(ev_p11[j]),
+                        "pflip": csv_float(ev_pflip[j]),
                         "transition_odds_01": csv_float(odds01[j]),
                         "transition_odds_10": csv_float(odds10[j]),
                         "selected_transition_odds": csv_float(selected_odds[j]),
@@ -619,11 +627,11 @@ def update_scene(scene: SceneInfo, *, eta: float) -> tuple[DenseSceneState, list
                         "emission_llr_close": csv_float(-ell_active[j]),
                         "threshold_crossing": str(crossing[j]),
                         "controller_threshold_margin": csv_float(
-                            p_post[is_event][j] - 0.6
+                            ev_p_post[j] - 0.6
                             if str(eactions[j]) in {"OPEN", "REOPEN"}
-                            else 0.4 - p_post[is_event][j]
+                            else 0.4 - ev_p_post[j]
                         ),
-                        "visible_observation_count": csv_float(visible[is_event][j]),
+                        "visible_observation_count": csv_float(ev_visible[j]),
                         "observation_gap_since_previous": csv_float(event_gap[j]),
                     }
                 )
@@ -741,6 +749,28 @@ def finite_values(rows: Sequence[Mapping[str, Any]], key: str, action: str | Non
         if math.isfinite(value):
             out.append(value)
     return np.asarray(out, dtype=np.float64)
+
+
+def paired_finite_values(
+    rows: Sequence[Mapping[str, Any]],
+    x_key: str,
+    y_key: str,
+    *,
+    action: str | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    pairs: list[tuple[float, float]] = []
+    for row in rows:
+        if action is not None and row.get("action") != action:
+            continue
+        x = finite_float(row.get(x_key), np.nan)
+        y = finite_float(row.get(y_key), np.nan)
+        if math.isfinite(x) and math.isfinite(y):
+            pairs.append((x, y))
+    if not pairs:
+        empty = np.asarray([], dtype=np.float64)
+        return empty, empty.copy()
+    array = np.asarray(pairs, dtype=np.float64)
+    return array[:, 0], array[:, 1]
 
 
 def point_biserial(values: Sequence[float] | np.ndarray, labels: Sequence[bool] | np.ndarray) -> float | None:
@@ -928,7 +958,12 @@ def scatter(path: Path, title: str, x: np.ndarray, y: np.ndarray, xlabel: str, y
 
 def make_plots(output_dir: Path, scenes: Sequence[SceneInfo], states: Sequence[DenseSceneState], events: Sequence[Mapping[str, Any]], eta: float, seed: int) -> None:
     close = [r for r in events if r.get("action") == "CLOSE"]
-    scatter(output_dir / "mass_at_close_vs_keep.png", "CLOSE raw_mass vs preceding KEEP median", finite_values(close, "prior_keep_mass_median"), finite_values(close, "raw_mass"), "median preceding KEEP raw_mass", "CLOSE raw_mass")
+    prior_mass, close_mass = paired_finite_values(
+        close,
+        "prior_keep_mass_median",
+        "raw_mass",
+    )
+    scatter(output_dir / "mass_at_close_vs_keep.png", "CLOSE raw_mass vs preceding KEEP median", prior_mass, close_mass, "median preceding KEEP raw_mass", "CLOSE raw_mass")
     scatter(output_dir / "view_delta_vs_transition.png", "Event view delta vs transition odds", finite_values(events, "view_delta"), finite_values(events, "selected_transition_odds"), "view delta", "selected transition odds", hline=(0.01 / 0.99) * 9.0)
     q_abs: list[float] = []
     repeated: list[float] = []

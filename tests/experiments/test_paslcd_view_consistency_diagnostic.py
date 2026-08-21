@@ -5,7 +5,9 @@ import math
 import importlib.util
 import sys
 import types
+from argparse import Namespace
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -82,6 +84,7 @@ from experiments.run_paslcd_view_consistency_diagnostic import (
     event_structure_key,
     event_structure_sha256,
     lifecycle_event_structure_sha256,
+    load_resumable_scene_summary,
     max_transition_llr_without_prior,
     merge_sparse_observed_rows,
     read_sparse_observed_rows_jsonl,
@@ -507,3 +510,42 @@ def test_stable_inactive_cohort_requires_at_least_five_observations(tmp_path: Pa
     assert cohorts["stable-inactive"]["gaussian_count"] == 2
     assert cohorts["stable-inactive"]["observed_row_count"] == 10
     assert cohorts["insufficient-observation"]["gaussian_count"] == 0
+
+
+def test_full_resume_rejects_cached_partial_scene(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    image_dir = source / "inference_scene" / "images"
+    image_dir.mkdir(parents=True)
+    (image_dir / "frame_000.png").write_bytes(b"first")
+    (image_dir / "frame_001.png").write_bytes(b"second")
+    output_root = tmp_path / "diagnostic"
+    scene_dir = output_root / "Instance_1" / "Scene"
+    frames_dir = scene_dir / "frames"
+    frames_dir.mkdir(parents=True)
+    (frames_dir / "000000.npz").write_bytes(b"cached")
+    for name in ("frame_metrics.csv", "lifecycle_events.jsonl"):
+        (scene_dir / name).write_text("", encoding="utf-8")
+    (scene_dir / "summary.json").write_text(
+        json.dumps({"frames": 1, "processed_frame_count": 1, "run_config": {}}),
+        encoding="utf-8",
+    )
+    (scene_dir / "manifest.json").write_text(
+        json.dumps({"frames": [{"npz": "frames/000000.npz"}]}),
+        encoding="utf-8",
+    )
+    spec = SimpleNamespace(
+        instance="Instance_1",
+        scene="Scene",
+        source_path=source,
+        cameras_json=tmp_path / "cameras.json",
+        output_dir=tmp_path / "cue",
+    )
+    args = Namespace(
+        output_root=output_root,
+        max_frames=None,
+        baseline_lifecycle_events=None,
+        baseline_lifecycle_root=None,
+        allow_baseline_mismatch=True,
+    )
+
+    assert load_resumable_scene_summary(args, spec, object()) is None

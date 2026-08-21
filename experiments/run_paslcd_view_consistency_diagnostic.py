@@ -149,14 +149,44 @@ def write_sparse_observed_rows_jsonl(path: Path, rows: Sequence[SparseObservedRo
 def read_sparse_observed_rows_jsonl(path: Path) -> list[SparseObservedRows]:
     out: list[SparseObservedRows] = []
     with path.open(encoding="utf-8") as f:
-        for line in f:
+        for line_number, line in enumerate(f, start=1):
             payload = json.loads(line)
-            payload.pop("schema", None)
-            out.append(SparseObservedRows(**payload))
+            schema = payload.pop("schema", None)
+            if schema != "paslcd_view_consistency_sparse_observed_rows_v1":
+                raise ValueError(f"{path}:{line_number} has unsupported schema {schema!r}")
+            row = SparseObservedRows(**payload)
+            lengths = {
+                len(row.observed_gaussian_indices),
+                len(row.transition_llr),
+                len(row.p_transition),
+            }
+            if len(lengths) != 1:
+                raise ValueError(f"{path}:{line_number} has mismatched sparse-row lengths")
+            if len(set(row.observed_gaussian_indices)) != len(row.observed_gaussian_indices):
+                raise ValueError(f"{path}:{line_number} contains duplicate Gaussian indices")
+            if any(not math.isfinite(float(value)) for value in row.transition_llr):
+                raise ValueError(f"{path}:{line_number} contains non-finite transition LLR")
+            if any(not 0.0 <= float(value) <= 1.0 for value in row.p_transition):
+                raise ValueError(f"{path}:{line_number} contains invalid transition probability")
+            out.append(row)
     return out
 
 
 def merge_sparse_observed_rows(*, num_gaussians: int, sparse: SparseObservedRows) -> list[dict[str, Any]]:
+    if int(num_gaussians) < 0:
+        raise ValueError("num_gaussians must be nonnegative")
+    lengths = {
+        len(sparse.observed_gaussian_indices),
+        len(sparse.transition_llr),
+        len(sparse.p_transition),
+    }
+    if len(lengths) != 1:
+        raise ValueError("sparse observed-row fields must have equal lengths")
+    indices = [int(value) for value in sparse.observed_gaussian_indices]
+    if len(set(indices)) != len(indices):
+        raise ValueError("sparse observed-row indices must be unique")
+    if any(value < 0 or value >= int(num_gaussians) for value in indices):
+        raise IndexError("sparse observed-row index is out of bounds")
     dense = [
         {"gaussian_index": i, "observed": False, "transition_llr": None, "p_transition": None}
         for i in range(int(num_gaussians))
@@ -774,7 +804,11 @@ def scene_outputs_complete(scene_dir: Path, summary: Mapping[str, Any], manifest
     return True
 
 
-def load_resumable_scene_summary(args: argparse.Namespace, spec: SceneSpec) -> dict[str, Any] | None:
+def load_resumable_scene_summary(
+    args: argparse.Namespace,
+    spec: SceneSpec,
+    config: RunConfig,
+) -> dict[str, Any] | None:
     scene_dir = args.output_root / spec.instance / spec.scene
     summary_path = scene_dir / "summary.json"
     manifest_path = scene_dir / "manifest.json"
@@ -787,7 +821,33 @@ def load_resumable_scene_summary(args: argparse.Namespace, spec: SceneSpec) -> d
         return None
     if not scene_outputs_complete(scene_dir, summary, manifest):
         return None
-    if args.max_frames is not None and int(summary.get("frames", -1)) != int(args.max_frames):
+    expected_frames = len(
+        list_images_no_gt(spec.source_path / "inference_scene" / "images")
+    )
+    if args.max_frames is not None:
+        expected_frames = min(expected_frames, int(args.max_frames))
+    if int(summary.get("processed_frame_count", -1)) != expected_frames:
+        return None
+    if json.dumps(summary.get("run_config"), sort_keys=True) != json.dumps(
+        asdict(config), sort_keys=True
+    ):
+        return None
+    expected_paths = {
+        "source_path": spec.source_path,
+        "fixed_cameras_json": spec.cameras_json,
+        "cue_cache_root": spec.output_dir,
+    }
+    for key, expected in expected_paths.items():
+        try:
+            cached = Path(str(summary.get(key, ""))).resolve()
+        except (OSError, RuntimeError, ValueError):
+            return None
+        if cached != expected.resolve():
+            return None
+    base_ply = (spec.source_path / BASE_PLY_REL).resolve()
+    if summary.get("base_ply_sha256") != sha256_file(base_ply):
+        return None
+    if summary.get("fixed_cameras_sha256") != sha256_file(spec.cameras_json):
         return None
     baseline = summary.get("baseline_lifecycle_event_structure")
     if baseline is not None and not bool(baseline.get("matches")) and not args.allow_baseline_mismatch:
@@ -943,7 +1003,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     summaries: list[dict[str, Any]] = []
     for spec in specs:
         if args.resume:
-            cached = load_resumable_scene_summary(args, spec)
+            cached = load_resumable_scene_summary(args, spec, config)
             if cached is not None:
                 print(f"RESUME D1 {spec.instance}/{spec.scene}", flush=True)
                 summaries.append(cached)
