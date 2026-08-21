@@ -214,3 +214,69 @@ event row의 `11.89%`가 이전 KEEP 중앙값과 반대 `q` sign을 보였다. 
 - `outputs/paslcd_d1_view_consistency_diagnostic/view_consistency_analysis/*.png`
 
 `outputs/`의 NPZ/CSV/PNG는 Git에 커밋하지 않는다.
+
+---
+
+## 8. D2/D3 offline confirmation replay
+
+D1 산출물의 sparse NPZ만 다시 읽어서 detector policy를 offline으로 replay했다. 이 replay는
+GT mask, temporal DC/geometry, rendered mask를 읽지 않는다. 각 Gaussian의 committed
+representation state만 내부적으로 다시 추적하며, 관측되지 않은 row는 `HOLD`한다.
+
+### Replay rule
+
+현재 committed state가 inactive이면 OPEN support를:
+
+```text
+BF_open = (P01 / P00) / (p01 / (1 - p01))
+```
+
+현재 committed state가 active이면 CLOSE support를:
+
+```text
+BF_close = (P10 / P11) / (p10 / (1 - p10))
+```
+
+로 정의했다. 즉 Markov transition prior odds를 제거하고, 현재 observation이 stay보다
+flip likelihood를 얼마나 더 지지하는지만 본다. `evidence_strength < 1e-6`이면 HOLD,
+관측됐지만 support가 아니면 consecutive counter를 reset한다. Counter가 `K`번 연속
+support에 도달할 때만 OPEN/CLOSE를 commit한다.
+
+### PASLCD 20-scene replay 결과
+
+기존 D1 posterior-hysteresis baseline은 OPEN/CLOSE/REOPEN `922,714/446,622/109,847`,
+repeated transition extras `556,469`였다.
+
+| condition | OPEN | CLOSE | REOPEN | repeated extras | final active | unique opened |
+|---|---:|---:|---:|---:|---:|---:|
+| K=1, BF>=1 | 3,906,023 | 3,347,980 | 1,827,332 | 5,175,312 | 558,043 | 2,078,691 |
+| K=1, BF>=3 | 1,813,888 | 1,290,570 | 533,161 | 1,823,731 | 523,318 | 1,280,727 |
+| K=2, BF>=1 | 1,131,043 | 726,616 | 216,745 | 943,361 | 404,427 | 914,298 |
+| K=2, BF>=3 | 493,138 | 176,997 | 44,311 | 221,308 | 316,141 | 448,827 |
+| K=3, BF>=1 | 511,019 | 210,728 | 40,849 | 251,577 | 300,291 | 470,170 |
+| K=3, BF>=3 | 234,891 | 34,898 | 8,255 | 43,153 | 199,993 | 226,636 |
+
+가장 안정적인 설정은 `K=3, BF>=3`이다. repeated extras가 `556,469 -> 43,153`으로
+약 `92.2%` 감소했고, REOPEN도 `109,847 -> 8,255`로 줄었다. 다만 final active와
+unique opened도 크게 줄었으므로, 이 설정은 PASLCD false transition 억제에는 강하지만
+ESCD 실제 transition delay/recall 검증 없이는 최종 detector로 확정하면 안 된다.
+
+### 구현 반영
+
+- `temporal.view_consistent_binary_lifespan_controller`를 추가해 production runner에서도
+  `--lifecycle-controller view_consistent`를 선택할 수 있게 했다.
+- `p_active`는 diagnostic으로만 저장하고, lifecycle mutation은 committed state별
+  `BF_open`/`BF_close` consecutive support로만 결정한다.
+- 기본값은 conservative하게 `--transition-confirmation-views 2`,
+  `--min-transition-bayes-factor 3.0`, `--min-transition-evidence-strength 1e-6`이다.
+
+다음 실험은 이 controller로 ESCD `ref -> sc1 -> sc2 -> sc3`와 PASLCD mask mIoU를
+같은 cue/cache/pose 조건에서 실제 렌더링까지 돌려, `K=2/BF=3`과 `K=3/BF=3`의
+false transition 감소와 true transition delay를 비교하는 것이다.
+
+### D2 산출물
+
+- `outputs/paslcd_d2_transition_confirmation_replay/summary.json`
+- `outputs/paslcd_d2_transition_confirmation_replay/condition_metrics.csv`
+
+이 산출물도 Git에 커밋하지 않는다.

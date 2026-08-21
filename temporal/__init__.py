@@ -9,6 +9,11 @@ from .binary_state_lifespan_controller import (
     BinaryStateLifespanControllerConfig,
     BinaryStateLifespanUpdate,
 )
+from .view_consistent_binary_lifespan_controller import (
+    ViewConsistentBinaryLifespanController,
+    ViewConsistentBinaryLifespanControllerConfig,
+    ViewConsistentBinaryLifespanUpdate,
+)
 from .bayesian_lifespan_controller import (
     BayesianLifespanController,
     BayesianLifespanControllerConfig,
@@ -100,6 +105,9 @@ __all__ = [
     "BinaryStateLifespanController",
     "BinaryStateLifespanControllerConfig",
     "BinaryStateLifespanUpdate",
+    "ViewConsistentBinaryLifespanController",
+    "ViewConsistentBinaryLifespanControllerConfig",
+    "ViewConsistentBinaryLifespanUpdate",
     "evidence_counts",
     "cue_to_change_probability",
     "alpha_t_evidence_vjp",

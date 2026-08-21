@@ -310,3 +310,52 @@ def test_training_optimizer_factory_uses_real_masked_row_slot_adam():
     )
     optimizer = make_optimizer(model, RunConfig(thaw_parameters=("dc",)), args)
     assert isinstance(optimizer, MaskedRowSlotAdam)
+
+
+def test_view_consistent_lifecycle_controller_config_is_wired_into_runner():
+    from experiments.run_online_binary_state_lifespan_thaw import make_controller
+    from temporal.view_consistent_binary_lifespan_controller import ViewConsistentBinaryLifespanController
+
+    model = SyntheticTemporalModel(_synthetic_base(), n=1, max_states=4)
+    cfg = RunConfig(
+        lifecycle_controller="view_consistent",
+        transition_confirmation_views=3,
+        min_transition_bayes_factor=2.0,
+        min_transition_evidence_strength=0.25,
+        inactive_to_active_prior=0.03,
+        active_to_inactive_prior=0.04,
+        detector_only=True,
+    )
+
+    controller = make_controller(model, cfg)
+
+    assert isinstance(controller, ViewConsistentBinaryLifespanController)
+    assert controller.config.confirmation_views == 3
+    assert controller.config.min_transition_bayes_factor == pytest.approx(2.0)
+    assert controller.config.min_evidence_strength == pytest.approx(0.25)
+    assert controller.config.inactive_to_active_prior == pytest.approx(0.03)
+    assert controller.config.active_to_inactive_prior == pytest.approx(0.04)
+
+
+def test_view_consistent_detector_sequence_waits_for_confirmed_transition():
+    model = SyntheticTemporalModel(_synthetic_base(), n=1, max_states=4)
+    cfg = _cfg(
+        evidence_count_mode="capped",
+        min_evidence_mass=1e-6,
+        inactive_to_active_prior=0.01,
+        active_to_inactive_prior=0.01,
+        initial_active_probability=0.5,
+        lifecycle_controller="view_consistent",
+        transition_confirmation_views=2,
+        min_transition_bayes_factor=3.0,
+    )
+
+    result = run_detector_sequence(
+        q_sequence_to_evidence([0.9, 0.2, 0.9, 0.9], strength=1.0),
+        model,
+        cfg,
+    )
+
+    assert _actions(result) == ["OPEN"]
+    assert result["events"][0].decision_timestamp == 3
+    assert model.current_state_index.tolist() == [0]

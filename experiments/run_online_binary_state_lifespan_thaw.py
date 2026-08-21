@@ -33,6 +33,10 @@ try:
         BinaryStateLifespanController,
         BinaryStateLifespanControllerConfig,
     )
+    from temporal.view_consistent_binary_lifespan_controller import (
+        ViewConsistentBinaryLifespanController,
+        ViewConsistentBinaryLifespanControllerConfig,
+    )
 except ModuleNotFoundError as exc:  # pragma: no cover - package __init__ imports renderer-only deps in unit env.
     import importlib.util
     import sys
@@ -66,6 +70,14 @@ except ModuleNotFoundError as exc:  # pragma: no cover - package __init__ import
     BinaryLifespanAction = module2.BinaryLifespanAction
     BinaryStateLifespanController = module2.BinaryStateLifespanController
     BinaryStateLifespanControllerConfig = module2.BinaryStateLifespanControllerConfig
+    spec3 = importlib.util.spec_from_file_location("temporal.view_consistent_binary_lifespan_controller", root / "view_consistent_binary_lifespan_controller.py")
+    if spec3 is None or spec3.loader is None:
+        raise
+    module3 = importlib.util.module_from_spec(spec3)
+    sys.modules["temporal.view_consistent_binary_lifespan_controller"] = module3
+    spec3.loader.exec_module(module3)
+    ViewConsistentBinaryLifespanController = module3.ViewConsistentBinaryLifespanController
+    ViewConsistentBinaryLifespanControllerConfig = module3.ViewConsistentBinaryLifespanControllerConfig
 
 try:
     from temporal.change_evidence import evidence_counts
@@ -201,8 +213,12 @@ class RunConfig:
     active_to_inactive_prior: float = 0.01
     initial_active_probability: float = 0.5
     filter_chunk_size: int = 65536
+    lifecycle_controller: str = "posterior_hysteresis"
     open_probability: float = 0.6
     close_probability: float = 0.4
+    transition_confirmation_views: int = 2
+    min_transition_bayes_factor: float = 3.0
+    min_transition_evidence_strength: float = 1e-6
     max_states: int = 8
     thaw_parameters: tuple[str, ...] = ("dc",)
     updates_per_frame: int = 120
@@ -338,8 +354,16 @@ def validate_run_config(config: RunConfig) -> None:
         raise ValueError("inactive_to_active_prior must be in (0, 1)")
     if not (0.0 < float(config.active_to_inactive_prior) < 1.0):
         raise ValueError("active_to_inactive_prior must be in (0, 1)")
+    if config.lifecycle_controller not in {"posterior_hysteresis", "view_consistent"}:
+        raise ValueError("lifecycle_controller must be posterior_hysteresis or view_consistent")
     if not (0.0 < float(config.close_probability) < float(config.open_probability) < 1.0):
         raise ValueError("close_probability/open_probability must satisfy 0 < close < open < 1")
+    if isinstance(config.transition_confirmation_views, bool) or int(config.transition_confirmation_views) < 1:
+        raise ValueError("transition_confirmation_views must be positive")
+    if not math.isfinite(float(config.min_transition_bayes_factor)) or float(config.min_transition_bayes_factor) <= 0:
+        raise ValueError("min_transition_bayes_factor must be finite and positive")
+    if not math.isfinite(float(config.min_transition_evidence_strength)) or float(config.min_transition_evidence_strength) < 0:
+        raise ValueError("min_transition_evidence_strength must be finite and nonnegative")
     if not 0.0 < float(config.evaluation_threshold) < 1.0:
         raise ValueError("evaluation_threshold must be in (0, 1)")
     if min(config.filter_chunk_size, config.max_states, config.updates_per_frame) < 1:
@@ -360,8 +384,12 @@ def run_config_from_args(args: argparse.Namespace) -> RunConfig:
         active_to_inactive_prior=float(args.active_to_inactive_prior),
         initial_active_probability=float(args.initial_active_probability),
         filter_chunk_size=int(args.filter_chunk_size),
+        lifecycle_controller=str(args.lifecycle_controller),
         open_probability=float(args.open_probability),
         close_probability=float(args.close_probability),
+        transition_confirmation_views=int(args.transition_confirmation_views),
+        min_transition_bayes_factor=float(args.min_transition_bayes_factor),
+        min_transition_evidence_strength=float(args.min_transition_evidence_strength),
         max_states=int(args.max_states),
         thaw_parameters=parse_thaw_parameters(args.thaw_parameters),
         updates_per_frame=int(args.updates_per_frame),
@@ -393,6 +421,19 @@ def make_filter(gaussian_count: int, config: RunConfig, *, device, dtype):
 
 
 def make_controller(model: Any, config: RunConfig):
+    if config.lifecycle_controller == "view_consistent":
+        lifecycle_cfg = ViewConsistentBinaryLifespanControllerConfig(
+            inactive_to_active_prior=config.inactive_to_active_prior,
+            active_to_inactive_prior=config.active_to_inactive_prior,
+            min_transition_bayes_factor=config.min_transition_bayes_factor,
+            confirmation_views=config.transition_confirmation_views,
+            min_evidence_strength=config.min_transition_evidence_strength,
+        )
+        return ViewConsistentBinaryLifespanController(
+            model,
+            lifecycle_cfg,
+            initialization="zero",
+        )
     lifecycle_cfg = BinaryStateLifespanControllerConfig(
         active_threshold=config.open_probability,
         inactive_threshold=config.close_probability,
@@ -454,6 +495,8 @@ def update_binary_lifecycle_chunks(tracker: Any, controller: Any, model: Any, op
     p01_values: list[torch.Tensor] = []
     p10_values: list[torch.Tensor] = []
     q_values: list[torch.Tensor] = []
+    open_bf_values: list[torch.Tensor] = []
+    close_bf_values: list[torch.Tensor] = []
     events: list[LifecycleEvent] = []
     for start in range(0, int(rows_all.numel()), int(chunk_size)):
         rows = rows_all[start:start + int(chunk_size)]
@@ -467,6 +510,10 @@ def update_binary_lifecycle_chunks(tracker: Any, controller: Any, model: Any, op
         p01_values.append(update.p_01)
         p10_values.append(update.p_10)
         q_values.append(update.q)
+        if hasattr(decision, "open_bayes_factor"):
+            open_bf_values.append(decision.open_bayes_factor)
+        if hasattr(decision, "close_bayes_factor"):
+            close_bf_values.append(decision.close_bayes_factor)
         events.extend(controller_events(decision))
         close_pos = torch.nonzero(decision.action == int(BinaryLifespanAction.CLOSE), as_tuple=False).flatten()
         if close_pos.numel():
@@ -485,6 +532,8 @@ def update_binary_lifecycle_chunks(tracker: Any, controller: Any, model: Any, op
         "p_01_stats": quantile_summary(_concat(p01_values)),
         "p_10_stats": quantile_summary(_concat(p10_values)),
         "q_stats": quantile_summary(_concat(q_values)),
+        "open_bayes_factor_stats": quantile_summary(_concat(open_bf_values)),
+        "close_bayes_factor_stats": quantile_summary(_concat(close_bf_values)),
         "events": events,
     }
 
@@ -508,6 +557,8 @@ def frame_diagnostics(*, timestamp: int, frame_name: str, evidence: Any, binary:
         "p_01_stats": dict(binary["p_01_stats"]),
         "p_10_stats": dict(binary["p_10_stats"]),
         "q_stats": dict(binary["q_stats"]),
+        "open_bayes_factor_stats": dict(binary["open_bayes_factor_stats"]),
+        "close_bayes_factor_stats": dict(binary["close_bayes_factor_stats"]),
         "open_count": int(counts["OPEN"]),
         "keep_count": int(counts["KEEP"]),
         "close_count": int(counts["CLOSE"]),
@@ -540,6 +591,8 @@ def compact_npz_stats(rows: Sequence[Mapping[str, Any]]) -> dict[str, np.ndarray
         "p_01": stat_matrix("p_01_stats"),
         "p_10": stat_matrix("p_10_stats"),
         "q": stat_matrix("q_stats"),
+        "open_bayes_factor": stat_matrix("open_bayes_factor_stats"),
+        "close_bayes_factor": stat_matrix("close_bayes_factor_stats"),
         "open_count": np.asarray([r["open_count"] for r in rows], dtype=np.int64),
         "close_count": np.asarray([r["close_count"] for r in rows], dtype=np.int64),
         "keep_count": np.asarray([r["keep_count"] for r in rows], dtype=np.int64),
@@ -1033,6 +1086,12 @@ def run_online(args: argparse.Namespace) -> dict[str, Any]:
         "run_arguments": serializable_arguments(args),
         "algorithm": getattr(tracker, "algorithm", "direct_binary_state_filter"),
         "transition_equation": "normalize [(1-b)(1-p01)L0, (1-b)p01L1, bp10L0, b(1-p10)L1]; p_active=P01+P11; p_flip=P01+P10",
+        "lifecycle_controller": config.lifecycle_controller,
+        "lifecycle_controller_equation": (
+            "posterior hysteresis on p_active"
+            if config.lifecycle_controller == "posterior_hysteresis"
+            else "committed-state branch BF confirmation: inactive uses (P01/P00)/(p01/(1-p01)); active uses (P10/P11)/(p10/(1-p10)); p_active is diagnostic only"
+        ),
         "gt_used_for_training": False,
         "manual_boundaries_used_for_inference": False,
         "gt_loaded_after_inference_only": not args.skip_post_inference_evaluation,
@@ -1122,8 +1181,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--active-to-inactive-prior", type=float, default=0.01)
     parser.add_argument("--initial-active-probability", type=float, default=0.5)
     parser.add_argument("--filter-chunk-size", type=positive_int, default=65536)
+    parser.add_argument("--lifecycle-controller", choices=("posterior_hysteresis", "view_consistent"), default="posterior_hysteresis")
     parser.add_argument("--open-probability", type=float, default=0.6)
     parser.add_argument("--close-probability", type=float, default=0.4)
+    parser.add_argument("--transition-confirmation-views", type=positive_int, default=2)
+    parser.add_argument("--min-transition-bayes-factor", type=nonnegative_float, default=3.0)
+    parser.add_argument("--min-transition-evidence-strength", type=nonnegative_float, default=1e-6)
     parser.add_argument("--max-states", type=positive_int, default=8)
     parser.add_argument("--thaw-parameters", type=parse_thaw_parameters, default=("dc",))
     parser.add_argument("--updates-per-frame", type=positive_int, default=120)
