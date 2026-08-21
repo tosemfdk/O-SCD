@@ -116,19 +116,38 @@ def test_close_then_reopen_allocates_reopen_metric() -> None:
 
 
 def test_low_strength_does_not_count_as_support() -> None:
-    cfg = _config(k=1, bf=3.0, min_strength=0.5)
+    cfg = _config(k=2, bf=3.0, min_strength=0.5)
     state = ReplayState.make(1)
+    update_state_for_frame(
+        state,
+        np.asarray([0], dtype=np.int64),
+        np.asarray([1.0]),
+        np.asarray([99.0]),
+        np.asarray([1.0]),
+        frame_index=0,
+        config=cfg,
+    )
     update_state_for_frame(
         state,
         np.asarray([0], dtype=np.int64),
         np.asarray([0.1]),
         np.asarray([99.0]),
         np.asarray([1.0]),
-        frame_index=0,
+        frame_index=1,
         config=cfg,
     )
     assert int(state.open_count[0]) == 0
-    assert int(state.support_count[0]) == 0
+    assert int(state.support_count[0]) == 1
+    update_state_for_frame(
+        state,
+        np.asarray([0], dtype=np.int64),
+        np.asarray([1.0]),
+        np.asarray([99.0]),
+        np.asarray([1.0]),
+        frame_index=2,
+        config=cfg,
+    )
+    assert int(state.open_count[0]) == 1
 
 
 def test_multiscene_namespace_is_not_shared(tmp_path: Path) -> None:

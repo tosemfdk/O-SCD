@@ -255,6 +255,12 @@ class LifecycleEvent:
     p_10: float
     p_flip: float
     visible_observation_count: int
+    open_branch_odds: float | None = None
+    close_branch_odds: float | None = None
+    open_bayes_factor: float | None = None
+    close_bayes_factor: float | None = None
+    open_support_count: int | None = None
+    close_support_count: int | None = None
 
 
 class ExactClosedPairArchive:
@@ -456,6 +462,10 @@ def _call_filter_update(tracker: Any, delta_a: torch.Tensor, delta_b: torch.Tens
 
 
 def controller_events(decision) -> list[LifecycleEvent]:
+    def optional_value(name: str, pos: int, cast):
+        values = getattr(decision, name, None)
+        return None if values is None else cast(values[pos].item())
+
     positions = torch.nonzero(decision.event_mask, as_tuple=False).flatten().tolist()
     records: list[LifecycleEvent] = []
     for pos in positions:
@@ -472,6 +482,12 @@ def controller_events(decision) -> list[LifecycleEvent]:
             p_10=float(decision.p_10[pos].item()),
             p_flip=float(decision.p_flip[pos].item()),
             visible_observation_count=int(decision.visible_observations[pos].item()),
+            open_branch_odds=optional_value("open_branch_odds", pos, float),
+            close_branch_odds=optional_value("close_branch_odds", pos, float),
+            open_bayes_factor=optional_value("open_bayes_factor", pos, float),
+            close_bayes_factor=optional_value("close_bayes_factor", pos, float),
+            open_support_count=optional_value("open_support_count", pos, int),
+            close_support_count=optional_value("close_support_count", pos, int),
         ))
     return records
 

@@ -183,15 +183,21 @@ def update_state_for_frame(
     state.ensure(int(np.max(idx)))
     active = state.active[idx]
     branch_bf = np.where(active, bf_close, bf_open)
-    support = np.isfinite(branch_bf) & np.isfinite(strength) & (strength >= config.min_strength) & (branch_bf >= config.bf_threshold)
+    quality = (
+        np.isfinite(branch_bf)
+        & np.isfinite(strength)
+        & (strength >= config.min_strength)
+    )
+    support = quality & (branch_bf >= config.bf_threshold)
 
     state.observed_row_count += int(idx.size)
     state.supported_observation_count += int(np.count_nonzero(support))
 
     # Observed non-support is contradictory/insufficient evidence for the current
     # committed transition candidate, so it resets the consecutive confirmation.
-    if np.any(~support):
-        reset_idx = idx[~support]
+    non_support = quality & ~support
+    if np.any(non_support):
+        reset_idx = idx[non_support]
         state.support_count[reset_idx] = 0
         state.support_start_frame[reset_idx] = -1
 

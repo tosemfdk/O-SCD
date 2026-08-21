@@ -358,4 +358,6 @@ def test_view_consistent_detector_sequence_waits_for_confirmed_transition():
 
     assert _actions(result) == ["OPEN"]
     assert result["events"][0].decision_timestamp == 3
+    assert result["events"][0].open_bayes_factor is not None
+    assert result["events"][0].open_support_count == 2
     assert model.current_state_index.tolist() == [0]

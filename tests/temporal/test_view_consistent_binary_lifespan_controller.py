@@ -119,15 +119,19 @@ def test_observed_contradiction_resets_support_counter():
 
 
 def test_low_mass_gate_does_not_confirm_transition():
-    model, controller = make_controller(confirmation_views=1)
+    model, controller = make_controller(confirmation_views=2)
     filt = BinaryStateFilter(1, dtype=torch.float64)
 
-    decision = controller.update(filter_update(filt, 0.9, timestamp=0, total_mass=1e-8), timestamp=0)
+    first = controller.update(filter_update(filt, 0.9, timestamp=0), timestamp=0)
+    decision = controller.update(filter_update(filt, 0.9, timestamp=1, total_mass=1e-8), timestamp=1)
 
+    assert first.open_support_count.tolist() == [1]
     assert decision.action_names == ("NONE",)
     assert decision.open_support.tolist() == [False]
-    assert decision.open_support_count.tolist() == [0]
+    assert decision.open_support_count.tolist() == [1]
     assert model.current_state_index.tolist() == [-1]
+    confirmed = controller.update(filter_update(filt, 0.9, timestamp=2), timestamp=2)
+    assert confirmed.action_names == ("OPEN",)
 
 
 def test_p_active_crossing_alone_cannot_flip_lifecycle():

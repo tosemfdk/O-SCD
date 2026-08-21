@@ -119,9 +119,9 @@ matplotlib을 요구한다.
 | base tensor bitwise equal | true |
 | base max drift | 0.0 |
 | baseline lifecycle structure mismatch | 0 |
-| detector replay runtime | 341.59 s |
-| aggregate analysis runtime | 101.84 s |
-| aggregate analysis peak RSS | 3.82 GiB |
+| detector replay runtime | 350.14 s |
+| aggregate analysis runtime (실행 로그 기준) | 101.84 s |
+| aggregate analysis peak RSS (실행 로그 기준) | 3.82 GiB |
 
 ### 원인 분해 요약
 
@@ -270,9 +270,12 @@ ESCD 실제 transition delay/recall 검증 없이는 최종 detector로 확정�
 - 기본값은 conservative하게 `--transition-confirmation-views 2`,
   `--min-transition-bayes-factor 3.0`, `--min-transition-evidence-strength 1e-6`이다.
 
-다음 실험은 이 controller로 ESCD `ref -> sc1 -> sc2 -> sc3`와 PASLCD mask mIoU를
-같은 cue/cache/pose 조건에서 실제 렌더링까지 돌려, `K=2/BF=3`과 `K=3/BF=3`의
-false transition 감소와 true transition delay를 비교하는 것이다.
+후속 full rendering에서는 `K=3/BF=3`을 선택했다. PASLCD all-geometry는 O-SCD
+online보다 mean-frame mIoU가 `+0.0086` 높으면서 repeated extras를 `12.9x`
+줄였다. ESCD `ref -> sc1 -> sc2 -> sc3`에서도 CLOSE/REOPEN과 boundary 인접 반응이
+유지됐다. 자세한 수치와 detector/representation 분해는
+[`view-consistent-binary-lifespan-confirmation-ko.md`](view-consistent-binary-lifespan-confirmation-ko.md)에
+기록한다.
 
 ### D2 산출물
 

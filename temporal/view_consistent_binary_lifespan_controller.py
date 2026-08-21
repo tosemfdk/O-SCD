@@ -156,6 +156,10 @@ class ViewConsistentBinaryLifespanController(BinaryStateLifespanController):
         p11 = update.p_11.to(device=device).flatten()
         pflip = update.p_flip.to(device=device).flatten()
         strength = update.evidence_strength.to(device=device).flatten()
+        if strength.numel() != indices.numel():
+            raise ValueError("Binary state update field evidence_strength has the wrong length")
+        if not bool(torch.isfinite(strength).all()) or bool((strength < 0).any()):
+            raise ValueError("evidence_strength must be finite and nonnegative")
 
         eps = float(self.config.eps)
         prior_open_odds = float(self.config.inactive_to_active_prior) / (
@@ -184,10 +188,12 @@ class ViewConsistentBinaryLifespanController(BinaryStateLifespanController):
         # lifecycle state stay bitwise identical.
         inactive = observed & (old_label == 0)
         active = observed & (old_label == 1)
+        inactive_quality = inactive & quality
+        active_quality = active & quality
         inactive_open_support = inactive & open_support
-        inactive_non_support = inactive & ~open_support
+        inactive_non_support = inactive_quality & ~open_support
         active_close_support = active & close_support
-        active_non_support = active & ~close_support
+        active_non_support = active_quality & ~close_support
 
         if bool(inactive_open_support.any()):
             rows = indices[inactive_open_support]
