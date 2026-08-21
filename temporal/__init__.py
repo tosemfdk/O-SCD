@@ -1,3 +1,14 @@
+from .binary_state_filter import (
+    BinaryStateFilter,
+    BinaryStateFilterConfig,
+    BinaryStateFilterUpdate,
+)
+from .binary_state_lifespan_controller import (
+    BinaryLifespanAction,
+    BinaryStateLifespanController,
+    BinaryStateLifespanControllerConfig,
+    BinaryStateLifespanUpdate,
+)
 from .bayesian_lifespan_controller import (
     BayesianLifespanController,
     BayesianLifespanControllerConfig,
@@ -82,6 +93,13 @@ from .signed_influence import (
 )
 
 __all__ = [
+    "BinaryStateFilter",
+    "BinaryStateFilterConfig",
+    "BinaryStateFilterUpdate",
+    "BinaryLifespanAction",
+    "BinaryStateLifespanController",
+    "BinaryStateLifespanControllerConfig",
+    "BinaryStateLifespanUpdate",
     "evidence_counts",
     "cue_to_change_probability",
     "alpha_t_evidence_vjp",
