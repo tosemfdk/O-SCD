@@ -2,6 +2,7 @@ import importlib.util
 import sys
 from pathlib import Path
 
+import pytest
 import torch
 
 MODULE_PATH = Path(__file__).resolve().parents[2] / "temporal" / "bernoulli_bocd.py"
@@ -12,12 +13,86 @@ spec.loader.exec_module(bocd)
 
 BernoulliBOCDConfig = bocd.BernoulliBOCDConfig
 BetaBernoulliBOCD = bocd.BetaBernoulliBOCD
+AdamsMacKayBetaBernoulliBOCD = bocd.AdamsMacKayBetaBernoulliBOCD
 MAPResetBernoulliFilter = bocd.MAPResetBernoulliFilter
 make_bocd_filter = bocd.make_bocd_filter
 
 
 def _state_clone(filter_):
     return {k: v.clone() for k, v in filter_.state_dict().items()}
+
+
+def _scalar_beta_log_predictive(s, f, a, b):
+    import math
+
+    return (
+        math.lgamma(a + s)
+        + math.lgamma(b + f)
+        - math.lgamma(a + b + s + f)
+        - (math.lgamma(a) + math.lgamma(b) - math.lgamma(a + b))
+    )
+
+
+def _scalar_logsumexp(values):
+    import math
+
+    finite = [v for v in values if math.isfinite(v)]
+    if not finite:
+        return -math.inf
+    m = max(finite)
+    return m + math.log(sum(math.exp(v - m) for v in finite))
+
+
+def _scalar_adams_mackay_steps(observations, *, prior_a, prior_b, hazard, max_run_length):
+    import math
+
+    size = max_run_length + 1
+    logp = [-math.inf] * size
+    logp[0] = 0.0
+    a = [prior_a] * size
+    b = [prior_b] * size
+    evidence = [0.0] * size
+    visible = [0] * size
+    run_start = [0] * size
+    total_visible = 0
+    states = []
+    for timestamp, s_count, f_count in observations:
+        old_logp = logp[:]
+        old_a = a[:]
+        old_b = b[:]
+        old_evidence = evidence[:]
+        old_visible = visible[:]
+        old_start = run_start[:]
+        if total_visible == 0:
+            old_start = [timestamp] * size
+
+        pred = [
+            _scalar_beta_log_predictive(s_count, f_count, old_a[r], old_b[r])
+            for r in range(size)
+        ]
+        new_logp = [-math.inf] * size
+        new_logp[0] = _scalar_logsumexp(
+            old_logp[r] + pred[r] + math.log(hazard) for r in range(size)
+        )
+        for r in range(size - 1):
+            new_logp[r + 1] = old_logp[r] + pred[r] + math.log1p(-hazard)
+        norm = _scalar_logsumexp(new_logp)
+        logp = [v - norm for v in new_logp]
+
+        a = [prior_a] * size
+        b = [prior_b] * size
+        evidence = [0.0] * size
+        visible = [0] * size
+        run_start = [timestamp + 1] + [0] * max_run_length
+        for r in range(size - 1):
+            a[r + 1] = old_a[r] + s_count
+            b[r + 1] = old_b[r] + f_count
+            evidence[r + 1] = old_evidence[r] + s_count + f_count
+            visible[r + 1] = old_visible[r] + 1
+            run_start[r + 1] = old_start[r]
+        total_visible += 1
+        states.append((logp[:], a[:], b[:], evidence[:], visible[:], run_start[:]))
+    return states
 
 
 def test_fractional_counts_use_integrated_predictive_and_stay_normalized():
@@ -148,6 +223,149 @@ def test_exact_unobserved_gap_preserves_low_hazard_lineage_without_advancing():
         assert result.estimated_run_start.item() == 40
 
 
+
+def test_adams_mackay_matches_scalar_algorithm_one_recurrence_over_fractional_sequence():
+    cfg = BernoulliBOCDConfig(prior_a=1.3, prior_b=2.1, hazard=0.07, max_run_length=5)
+    filt = AdamsMacKayBetaBernoulliBOCD(1, cfg, dtype=torch.float64)
+    observations = [
+        (3, 0.25, 0.75),
+        (4, 1.20, 0.10),
+        (5, 0.00, 0.80),
+        (6, 0.55, 0.45),
+    ]
+
+    expected_states = _scalar_adams_mackay_steps(
+        observations,
+        prior_a=1.3,
+        prior_b=2.1,
+        hazard=0.07,
+        max_run_length=5,
+    )
+
+    for (timestamp, e_plus, e_minus), expected in zip(observations, expected_states):
+        filt.update(
+            torch.tensor([e_plus], dtype=torch.float64),
+            torch.tensor([e_minus], dtype=torch.float64),
+            timestamp=timestamp,
+        )
+        logp, a, b, evidence, visible, run_start = expected
+        assert torch.allclose(
+            filt.log_run_probs[0], torch.tensor(logp, dtype=torch.float64), atol=1e-12, rtol=1e-12
+        )
+        assert torch.allclose(filt.a[0], torch.tensor(a, dtype=torch.float64), atol=1e-12, rtol=1e-12)
+        assert torch.allclose(filt.b[0], torch.tensor(b, dtype=torch.float64), atol=1e-12, rtol=1e-12)
+        assert torch.allclose(
+            filt.total_run_evidence[0], torch.tensor(evidence, dtype=torch.float64), atol=1e-12, rtol=1e-12
+        )
+        assert filt.run_visible_observations[0].tolist() == visible
+        assert filt.run_start[0].tolist() == run_start
+
+
+def test_adams_mackay_constant_hazard_keeps_p_run_zero_at_h_without_truncation():
+    cfg = BernoulliBOCDConfig(prior_a=1.0, prior_b=1.0, hazard=0.17, max_run_length=12)
+    filt = AdamsMacKayBetaBernoulliBOCD(1, cfg, dtype=torch.float64)
+    observations = [
+        (1.0, 0.0),
+        (0.5, 0.5),
+        (0.0, 1.0),
+        (2.0, 0.0),
+        (0.0, 2.0),
+    ]
+
+    for timestamp, (plus, minus) in enumerate(observations):
+        result = filt.update(
+            torch.tensor([plus], dtype=torch.float64),
+            torch.tensor([minus], dtype=torch.float64),
+            timestamp=timestamp,
+        )
+        assert torch.allclose(
+            result.changepoint_probability[0],
+            torch.tensor(0.17, dtype=torch.float64),
+            atol=1e-12,
+            rtol=1e-12,
+        )
+        assert torch.allclose(result.run_length_posterior[0].sum(), torch.tensor(1.0, dtype=torch.float64))
+
+
+def test_adams_mackay_cp_branch_uses_previous_predictive_but_resets_stats_and_start():
+    cfg = BernoulliBOCDConfig(prior_a=1.0, prior_b=1.0, hazard=0.3, max_run_length=6)
+    filt = AdamsMacKayBetaBernoulliBOCD(1, cfg, dtype=torch.float64)
+    filt.update(torch.tensor([3.0], dtype=torch.float64), torch.tensor([0.0], dtype=torch.float64), timestamp=10)
+    old_log = filt.log_run_probs.clone()
+    old_a = filt.a.clone()
+    old_b = filt.b.clone()
+
+    filt.update(torch.tensor([0.0], dtype=torch.float64), torch.tensor([3.0], dtype=torch.float64), timestamp=11)
+
+    pred = bocd.beta_binomial_log_predictive(
+        torch.tensor([[0.0]], dtype=torch.float64),
+        torch.tensor([[3.0]], dtype=torch.float64),
+        old_a,
+        old_b,
+    )[0]
+    unnorm = torch.full_like(old_log[0], -torch.inf)
+    unnorm[0] = torch.logsumexp(old_log[0] + pred + torch.log(torch.tensor(0.3, dtype=torch.float64)), dim=0)
+    unnorm[1:] = old_log[0, :-1] + pred[:-1] + torch.log(torch.tensor(0.7, dtype=torch.float64))
+    expected_cp = (unnorm - torch.logsumexp(unnorm, dim=0)).exp()[0]
+
+    assert torch.allclose(filt.p_run_zero[0], expected_cp, atol=1e-12, rtol=1e-12)
+    assert torch.allclose(filt.a[0, 0], torch.tensor(1.0, dtype=torch.float64))
+    assert torch.allclose(filt.b[0, 0], torch.tensor(1.0, dtype=torch.float64))
+    assert torch.allclose(filt.total_run_evidence[0, 0], torch.tensor(0.0, dtype=torch.float64))
+    assert filt.run_visible_observations[0, 0].item() == 0
+    assert filt.run_start[0, 0].item() == 12
+    assert filt.run_start[0, 1].item() == 11
+    assert filt.run_start[0, 2].item() == 10
+
+
+def test_adams_mackay_low_hazard_reset_branch_can_grow_after_contradiction():
+    cfg = BernoulliBOCDConfig(prior_a=1.0, prior_b=1.0, hazard=0.01, max_run_length=100)
+    filt = AdamsMacKayBetaBernoulliBOCD(1, cfg, dtype=torch.float64)
+
+    one = torch.tensor([1.0], dtype=torch.float64)
+    zero = torch.tensor([0.0], dtype=torch.float64)
+    stable = None
+    for timestamp in range(40):
+        stable = filt.update(one, zero, timestamp=timestamp)
+
+    assert stable is not None
+    assert filt.run_start[0, 0].item() == 40
+    assert stable.run_length_posterior[0, 0].item() == pytest.approx(0.01)
+
+    first_failure = filt.update(zero, one, timestamp=40)
+    assert first_failure.changepoint_probability[0].item() == pytest.approx(0.01)
+    assert filt.run_start[0, 1].item() == 40
+    assert first_failure.run_length_posterior[0, 1].item() == pytest.approx(
+        0.14974600001749427
+    )
+    assert first_failure.map_run_length.item() != 1
+
+    for timestamp, expected_run_length in ((41, 2), (42, 3), (43, 4)):
+        result = filt.update(zero, one, timestamp=timestamp)
+        assert filt.run_start[0, expected_run_length].item() == 40
+        assert result.map_run_length.item() == expected_run_length
+        assert result.estimated_run_start.item() == 40
+        assert result.run_length_posterior[0, expected_run_length].item() > 0.5
+
+
+def test_adams_mackay_no_observation_preserves_every_state_tensor_exactly():
+    cfg = BernoulliBOCDConfig(hazard=0.2, max_run_length=3, min_evidence_mass=0.5)
+    filt = AdamsMacKayBetaBernoulliBOCD(3, cfg)
+    filt.update(torch.tensor([1.0, 0.0, 0.5]), torch.tensor([0.0, 1.0, 0.5]))
+    before = _state_clone(filt)
+    result = filt.update(
+        torch.tensor([100.0, 100.0]),
+        torch.tensor([100.0, 100.0]),
+        total_mass=torch.tensor([0.0, 0.49]),
+        row_indices=torch.tensor([0, 2]),
+        timestamp=7,
+    )
+    for key, value in before.items():
+        assert torch.equal(value, filt.state_dict()[key]), key
+    assert result.indices.tolist() == [0, 2]
+    assert result.observed.tolist() == [False, False]
+
+
 def test_map_reset_filter_is_explicit_alternative_and_resets_on_surprise():
     cfg = BernoulliBOCDConfig(hazard=0.2, max_run_length=6)
     filt = MAPResetBernoulliFilter(1, cfg, dtype=torch.float64)
@@ -208,6 +426,9 @@ def test_legacy_chunk_signature_and_factory_modes():
     filt = make_bocd_filter("exact", 2, cfg)
     out = filt.update([0], torch.tensor([1.0]), torch.tensor([0.0]), timestamp=3)
     assert out.visible_observations.tolist() == [1]
+    adams_mackay = make_bocd_filter("adams_mackay", 2, cfg)
+    assert isinstance(adams_mackay, AdamsMacKayBetaBernoulliBOCD)
+    assert adams_mackay.algorithm == "adams_mackay"
     assert isinstance(make_bocd_filter("map_reset", 2, cfg), MAPResetBernoulliFilter)
 
 

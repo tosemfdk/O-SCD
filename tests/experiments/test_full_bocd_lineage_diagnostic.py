@@ -9,11 +9,13 @@ from experiments.run_full_bocd_lineage_diagnostic import (
     DiagnosticConfig,
     bocd_config,
     build_cohort_mapping,
+    centered_start_cluster_mass,
     detector_local_rows,
     parse_action_list,
     parse_cohort_events,
     posterior_mass_by_start,
     recent_start_mass,
+    record_initial_lineage_mass,
     snapshot_filter_start_masses,
     start_mass_stats,
     summarize_boundary_lineages,
@@ -78,7 +80,12 @@ def test_all_cohort_mapping_is_identity_without_dense_lookup():
 def test_filter_snapshot_includes_persistent_unobserved_rows_without_advancing():
     cfg = DiagnosticConfig(hazard=0.01, expected_run_length=None, max_run_length=4)
     bocd_cfg = bocd_config(cfg)
-    _Config, BetaBernoulliBOCD, BeamTwoBernoulliFilter = load_bocd_classes()
+    (
+        _Config,
+        BetaBernoulliBOCD,
+        _AdamsMacKayBetaBernoulliBOCD,
+        BeamTwoBernoulliFilter,
+    ) = load_bocd_classes()
     exact = BetaBernoulliBOCD(2, bocd_cfg, dtype=torch.float64)
     beam = BeamTwoBernoulliFilter(2, bocd_cfg, dtype=torch.float64)
     one = torch.tensor([1.0], dtype=torch.float64)
@@ -126,6 +133,60 @@ def test_recent_start_mass_and_start_stats_are_causal():
     mean, q95 = start_mass_stats(mass, current_t=2, frame_count=4)
     assert np.allclose(mean, np.array([0.05, 0.3, 0.65, 0.0], dtype=np.float32))
     assert q95[3] == 0.0
+
+
+def test_centered_start_cluster_mass_merges_neighbors_without_wrapping_edges():
+    mass = torch.tensor(
+        [
+            [0.1, 0.3, 0.4, 0.2],
+            [0.7, 0.2, 0.1, 0.0],
+            [0.0, 0.2, 0.3, 0.5],
+        ]
+    )
+
+    clustered = centered_start_cluster_mass(
+        mass, torch.tensor([2, 0, 3]), radius=1
+    )
+
+    assert torch.allclose(clustered, torch.tensor([0.9, 0.9, 0.8]))
+    assert torch.allclose(
+        centered_start_cluster_mass(mass, torch.tensor([-1, 4, 2]), radius=0),
+        torch.tensor([0.0, 0.0, 0.3]),
+    )
+
+
+def test_initial_lineage_mass_respects_recurrence_birth_timestamp():
+    mass = torch.tensor(
+        [
+            [0.8, 0.1, 0.1, 0.0],
+            [0.7, 0.2, 0.1, 0.0],
+        ]
+    )
+    rows = torch.tensor([1, 3])
+
+    prior_reset = torch.full((4, 4), float("nan"))
+    record_initial_lineage_mass(
+        prior_reset,
+        rows,
+        mass,
+        timestamp=1,
+        exact_recurrence="prior_reset",
+    )
+    assert torch.allclose(prior_reset[rows, 1], torch.tensor([0.1, 0.2]))
+    assert torch.isnan(prior_reset[rows, 2]).all()
+
+    adams_mackay = torch.full((4, 4), float("nan"))
+    record_initial_lineage_mass(
+        adams_mackay,
+        rows,
+        mass,
+        timestamp=1,
+        exact_recurrence="adams_mackay",
+        first_observation=torch.tensor([True, False]),
+    )
+    assert adams_mackay[1, 1].item() == pytest.approx(0.1)
+    assert torch.isnan(adams_mackay[3, 1])
+    assert torch.allclose(adams_mackay[rows, 2], torch.tensor([0.1, 0.1]))
 
 
 def test_validate_full_run_max_r_rejects_truncation():
@@ -176,6 +237,15 @@ def test_lineage_recovery_counts_low_initial_hypotheses_that_later_cross():
     assert summary["per_start"][1]["mean_recovery_delay"] == 3.0
     assert summary["per_start"][2]["mean_recovery_delay"] == 3.0
 
+    shifted = summarize_lineage_recoveries(
+        torch.tensor([[float("nan"), 0.1]]),
+        torch.tensor([[-1, 1]]),
+        threshold=0.5,
+        birth_timestamp_offset=-1,
+    )
+    assert shifted["recovered_lineage_count"] == 1
+    assert shifted["per_start"][1]["mean_recovery_delay"] == 0.0
+
 
 def test_config_validation_rejects_bad_cue_and_accepts_defaults():
     validate_config(DiagnosticConfig())
@@ -192,7 +262,12 @@ def test_exact_lineage_can_become_dominant_after_initial_small_r0_and_beam_candi
         min_evidence_mass=1e-9,
     )
     bocd_cfg = bocd_config(cfg)
-    _Config, BetaBernoulliBOCD, BeamTwoBernoulliFilter = load_bocd_classes()
+    (
+        _Config,
+        BetaBernoulliBOCD,
+        _AdamsMacKayBetaBernoulliBOCD,
+        BeamTwoBernoulliFilter,
+    ) = load_bocd_classes()
     exact = BetaBernoulliBOCD(1, bocd_cfg, dtype=torch.float64)
     beam = BeamTwoBernoulliFilter(1, bocd_cfg, dtype=torch.float64)
 

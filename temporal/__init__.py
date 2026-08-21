@@ -6,10 +6,13 @@ from .bayesian_lifespan_controller import (
 )
 from .bernoulli_bocd import (
     BOCDUpdate,
+    BocdMode,
     BernoulliBOCDConfig,
+    AdamsMacKayBetaBernoulliBOCD,
     BetaBernoulliBOCD,
     MAPResetBernoulliFilter,
     beta_binomial_log_predictive,
+    make_bocd_filter,
 )
 from .change_evidence import (
     ChangeEvidence,
@@ -87,14 +90,17 @@ __all__ = [
     "LifespanDecision",
     "beta_binomial_log_predictive",
     "BOCDUpdate",
+    "BocdMode",
     "MaskedRowSlotAdam",
     "cue_to_probability",
     "counts_from_evidence",
     "accumulate_alpha_t_evidence",
     "ChangeEvidence",
     "MAPResetBernoulliFilter",
+    "AdamsMacKayBetaBernoulliBOCD",
     "BetaBernoulliBOCD",
     "BernoulliBOCDConfig",
+    "make_bocd_filter",
     "LifespanAction",
     "BayesianLifespanControllerConfig",
     "BayesianLifespanController",

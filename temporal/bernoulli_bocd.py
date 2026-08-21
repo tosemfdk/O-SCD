@@ -9,7 +9,7 @@ from typing import Literal, Optional
 
 import torch
 
-BocdMode = Literal["exact", "map_reset"]
+BocdMode = Literal["exact", "adams_mackay", "map_reset"]
 
 
 @dataclass(frozen=True)
@@ -115,7 +115,11 @@ class BetaBernoulliBOCD:
 
     Updates are chunkable via ``row_indices``. Rows whose mass is below
     ``min_evidence_mass`` are unobserved and every stored tensor for those rows is
-    preserved exactly.
+    preserved exactly. The reset branch uses the prior predictive for the current
+    observation and then stores that observation in run length 0; this is a
+    valid CP-at-current-observation convention, but it is not the literal
+    Adams--MacKay Algorithm 1 recurrence. Use
+    :class:`AdamsMacKayBetaBernoulliBOCD` for the paper-faithful convention.
     """
 
     algorithm = "exact"
@@ -346,6 +350,82 @@ class BetaBernoulliBOCD:
         )
 
 
+class AdamsMacKayBetaBernoulliBOCD(BetaBernoulliBOCD):
+    """Paper-faithful Adams--MacKay Algorithm 1 Beta-Bernoulli BOCD.
+
+    This variant uses each previous run's current-observation predictive in
+    both the growth and changepoint sums. The changepoint branch is interpreted
+    as a CP after the current observation: its post-update run length 0 state is
+    reset to the prior with zero observations, and its global ``run_start`` is
+    ``timestamp + 1``. Growth branches absorb the current counts and carry their
+    previous global run start.
+
+    With a constant hazard and no truncation, ``P(r_t=0)`` equals the hazard;
+    it is not an evidence-driven lifecycle commit probability. This variant is
+    diagnostic-only until a recent/old start-region posterior policy is wired
+    explicitly into the lifecycle controller.
+    """
+
+    algorithm = "adams_mackay"
+
+    @torch.no_grad()
+    def update(self, *args, **kwargs) -> BOCDUpdate:
+        indices, s, f, total_mass, timestamp = self._coerce_update(*args, **kwargs)
+        observed = total_mass >= float(self.config.min_evidence_mass)
+        if not bool(observed.any()):
+            return self._snapshot(indices, observed, timestamp)
+        obs_idx = indices[observed]
+        ss = s[observed]
+        ff = f[observed]
+        h = torch.as_tensor(self.config.resolved_hazard, device=self.device, dtype=self.dtype)
+        log_h = torch.log(h)
+        log_1mh = torch.log1p(-h)
+        old_log = self.log_run_probs[obs_idx]
+        old_a = self.a[obs_idx]
+        old_b = self.b[obs_idx]
+        old_e = self.total_run_evidence[obs_idx]
+        old_visible = self.run_visible_observations[obs_idx]
+        old_start = self.run_start[obs_idx].clone()
+        never_observed = self.visible_observations[obs_idx] == 0
+        if bool(never_observed.any()):
+            old_start[never_observed] = int(timestamp)
+
+        pred = beta_binomial_log_predictive(ss[:, None], ff[:, None], old_a, old_b)
+        new_log = torch.full_like(old_log, -torch.inf)
+        new_log[:, 0] = torch.logsumexp(old_log + pred + log_h, dim=1)
+        new_log[:, 1:] = old_log[:, :-1] + pred[:, :-1] + log_1mh
+        new_log = new_log - torch.logsumexp(new_log, dim=1, keepdim=True)
+
+        new_a = torch.full_like(old_a, float(self.config.prior_a))
+        new_b = torch.full_like(old_b, float(self.config.prior_b))
+        new_a[:, 1:] = old_a[:, :-1] + ss[:, None]
+        new_b[:, 1:] = old_b[:, :-1] + ff[:, None]
+
+        new_e = torch.zeros_like(old_e)
+        new_e[:, 1:] = old_e[:, :-1] + (ss + ff)[:, None]
+
+        new_start = torch.zeros_like(old_start)
+        new_start[:, 0] = int(timestamp) + 1
+        new_start[:, 1:] = old_start[:, :-1]
+
+        new_visible = torch.zeros_like(old_visible)
+        new_visible[:, 1:] = old_visible[:, :-1] + 1
+
+        self.log_run_probs[obs_idx] = new_log
+        self.a[obs_idx] = new_a
+        self.b[obs_idx] = new_b
+        self.total_run_evidence[obs_idx] = new_e
+        self.run_start[obs_idx] = new_start
+        self.run_visible_observations[obs_idx] = new_visible
+        self.visible_observations[obs_idx] += 1
+        self.last_changepoint_probability[obs_idx] = new_log[:, 0].exp()
+        self.last_timestamp[obs_idx] = timestamp
+        map_r = new_log.argmax(dim=1).to(torch.long)
+        rows = torch.arange(obs_idx.numel(), device=self.device)
+        self.map_run_start[obs_idx] = self.run_start[obs_idx][rows, map_r]
+        return self._snapshot(indices, observed, timestamp)
+
+
 class MAPResetBernoulliFilter:
     """Explicit O(N) MAP alternative: one Beta run per Gaussian row.
 
@@ -511,8 +591,15 @@ class MAPResetBernoulliFilter:
 
 
 def make_bocd_filter(mode: BocdMode, num_gaussians: int, config: BernoulliBOCDConfig | None = None, *, device=None, dtype=torch.float32) -> BetaBernoulliBOCD:
+    """Construct a BOCD implementation without implying lifecycle compatibility.
+
+    In particular, ``adams_mackay`` exposes literal ``P(r_t=0)``; callers must
+    not use that scalar as the existing lifecycle changepoint score.
+    """
     if mode == "exact":
         return BetaBernoulliBOCD(num_gaussians, config, device=device, dtype=dtype)
+    if mode == "adams_mackay":
+        return AdamsMacKayBetaBernoulliBOCD(num_gaussians, config, device=device, dtype=dtype)
     if mode == "map_reset":
         return MAPResetBernoulliFilter(num_gaussians, config, device=device, dtype=dtype)
-    raise ValueError("bocd mode must be 'exact' or 'map_reset'")
+    raise ValueError("bocd mode must be 'exact', 'adams_mackay', or 'map_reset'")

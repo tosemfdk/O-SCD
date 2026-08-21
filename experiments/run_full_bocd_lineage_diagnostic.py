@@ -45,6 +45,7 @@ OUTPUT_FILES = (
 
 @dataclass(frozen=True)
 class DiagnosticConfig:
+    exact_recurrence: str = "prior_reset"
     cue_mode: str = "binary"
     cue_threshold: float = 0.5
     cue_scale: float = 1.0
@@ -61,6 +62,7 @@ class DiagnosticConfig:
     min_run_evidence: float = 0.0
     min_visible_observations: int = 1
     recent_window: int = 5
+    start_cluster_radii: tuple[int, ...] = (0, 1, 2, 3, 5)
 
 
 def positive_int(value: str) -> int:
@@ -77,8 +79,16 @@ def nonnegative_float(value: str) -> float:
     return parsed
 
 
+def nonnegative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("value must be nonnegative")
+    return parsed
+
+
 def config_from_args(args: argparse.Namespace) -> DiagnosticConfig:
     cfg = DiagnosticConfig(
+        exact_recurrence=args.exact_recurrence,
         cue_mode=args.cue_mode,
         cue_threshold=float(args.cue_threshold),
         cue_scale=float(args.cue_scale),
@@ -95,12 +105,15 @@ def config_from_args(args: argparse.Namespace) -> DiagnosticConfig:
         min_run_evidence=float(args.min_run_evidence),
         min_visible_observations=int(args.min_visible_observations),
         recent_window=int(args.recent_window),
+        start_cluster_radii=tuple(sorted(set(args.start_cluster_radii))),
     )
     validate_config(cfg)
     return cfg
 
 
 def validate_config(config: DiagnosticConfig) -> None:
+    if config.exact_recurrence not in {"prior_reset", "adams_mackay"}:
+        raise ValueError("exact_recurrence must be prior_reset|adams_mackay")
     if config.cue_mode not in {"binary", "soft"}:
         raise ValueError("cue_mode must be binary|soft")
     if config.cue_scale <= 0:
@@ -113,6 +126,8 @@ def validate_config(config: DiagnosticConfig) -> None:
         raise ValueError("min_evidence_mass must be nonnegative")
     if min(config.max_run_length, config.chunk_size, config.recent_window) < 1:
         raise ValueError("max_run_length, chunk_size and recent_window must be positive")
+    if not config.start_cluster_radii or min(config.start_cluster_radii) < 0:
+        raise ValueError("start_cluster_radii must be nonempty and nonnegative")
     if not 0.0 <= config.changepoint_probability <= 1.0:
         raise ValueError("changepoint_probability must be in [0,1]")
     _ = bocd_config(config)
@@ -121,9 +136,18 @@ def validate_config(config: DiagnosticConfig) -> None:
 def load_bocd_classes():
     """Load BOCD classes without importing renderer-heavy temporal.__init__ in tests."""
     try:
-        from temporal.bernoulli_bocd import BernoulliBOCDConfig, BetaBernoulliBOCD
+        from temporal.bernoulli_bocd import (
+            AdamsMacKayBetaBernoulliBOCD,
+            BernoulliBOCDConfig,
+            BetaBernoulliBOCD,
+        )
         from temporal.beam2_bocd import BeamTwoBernoulliFilter
-        return BernoulliBOCDConfig, BetaBernoulliBOCD, BeamTwoBernoulliFilter
+        return (
+            BernoulliBOCDConfig,
+            BetaBernoulliBOCD,
+            AdamsMacKayBetaBernoulliBOCD,
+            BeamTwoBernoulliFilter,
+        )
     except ModuleNotFoundError:
         import importlib.util
         import sys
@@ -151,11 +175,21 @@ def load_bocd_classes():
 
         bernoulli = load("bernoulli_bocd")
         beam2 = load("beam2_bocd")
-        return bernoulli.BernoulliBOCDConfig, bernoulli.BetaBernoulliBOCD, beam2.BeamTwoBernoulliFilter
+        return (
+            bernoulli.BernoulliBOCDConfig,
+            bernoulli.BetaBernoulliBOCD,
+            bernoulli.AdamsMacKayBetaBernoulliBOCD,
+            beam2.BeamTwoBernoulliFilter,
+        )
 
 
 def bocd_config(config: DiagnosticConfig):
-    BernoulliBOCDConfig, _BetaBernoulliBOCD, _BeamTwoBernoulliFilter = load_bocd_classes()
+    (
+        BernoulliBOCDConfig,
+        _BetaBernoulliBOCD,
+        _AdamsMacKayBetaBernoulliBOCD,
+        _BeamTwoBernoulliFilter,
+    ) = load_bocd_classes()
     return BernoulliBOCDConfig(
         prior_a=config.prior_a,
         prior_b=config.prior_b,
@@ -324,6 +358,80 @@ def recent_start_mass(mass_by_start: torch.Tensor, *, current_t: int, recent_win
     return mass_by_start[:, lo:hi].sum(dim=1)
 
 
+def centered_start_cluster_mass(
+    mass_by_start: torch.Tensor,
+    centers: torch.Tensor,
+    *,
+    radius: int,
+) -> torch.Tensor:
+    """Sum posterior mass within ``center +/- radius`` on the start axis."""
+    if mass_by_start.ndim != 2:
+        raise ValueError("mass_by_start must be rank-2")
+    centers = torch.as_tensor(
+        centers, device=mass_by_start.device, dtype=torch.long
+    ).flatten()
+    if centers.numel() != mass_by_start.shape[0]:
+        raise ValueError("centers must contain one start timestamp per row")
+    if radius < 0:
+        raise ValueError("radius must be nonnegative")
+    offsets = torch.arange(
+        -int(radius), int(radius) + 1, device=mass_by_start.device
+    )
+    indices = centers[:, None] + offsets[None, :]
+    valid = (indices >= 0) & (indices < mass_by_start.shape[1])
+    gathered = mass_by_start.gather(
+        1, indices.clamp(0, mass_by_start.shape[1] - 1)
+    )
+    return torch.where(valid, gathered, torch.zeros_like(gathered)).sum(dim=1)
+
+
+def record_initial_lineage_mass(
+    target: torch.Tensor,
+    row_indices: torch.Tensor,
+    mass_by_start: torch.Tensor,
+    *,
+    timestamp: int,
+    exact_recurrence: str,
+    first_observation: torch.Tensor | None = None,
+) -> None:
+    """Record each start hypothesis at the update that creates it.
+
+    The existing prior-reset recurrence creates ``start=t`` after consuming
+    observation ``t``. Literal Adams--MacKay Algorithm 1 instead creates an
+    empty ``r_t=0`` branch for ``start=t+1``; its first evidence arrives on a
+    later observation. Rows observed for the first time also create their
+    initial established run at ``start=t``.
+    """
+    if target.ndim != 2 or mass_by_start.ndim != 2:
+        raise ValueError("target and mass_by_start must be rank-2")
+    rows = torch.as_tensor(
+        row_indices, device=target.device, dtype=torch.long
+    ).flatten()
+    if rows.numel() != mass_by_start.shape[0]:
+        raise ValueError("row_indices and mass_by_start must have equal rows")
+    if target.shape[1] != mass_by_start.shape[1]:
+        raise ValueError("target and mass_by_start must share the start axis")
+    t = int(timestamp)
+    if not 0 <= t < target.shape[1]:
+        raise ValueError("timestamp is outside the start axis")
+    if exact_recurrence == "prior_reset":
+        target[rows, t] = mass_by_start[:, t]
+        return
+    if exact_recurrence != "adams_mackay":
+        raise ValueError("exact_recurrence must be prior_reset|adams_mackay")
+    if first_observation is None:
+        raise ValueError("first_observation is required for adams_mackay")
+    first = torch.as_tensor(
+        first_observation, device=target.device, dtype=torch.bool
+    ).flatten()
+    if first.numel() != rows.numel():
+        raise ValueError("first_observation must contain one flag per row")
+    if bool(first.any()):
+        target[rows[first], t] = mass_by_start[first, t]
+    if t + 1 < target.shape[1]:
+        target[rows, t + 1] = mass_by_start[:, t + 1]
+
+
 def map_start_summary(mass_by_start: torch.Tensor) -> tuple[float | None, float | None]:
     if mass_by_start.numel() == 0 or mass_by_start.shape[0] == 0:
         return None, None
@@ -379,6 +487,7 @@ def summarize_lineage_recoveries(
     first_cross_timestamp: torch.Tensor,
     *,
     threshold: float,
+    birth_timestamp_offset: int = 0,
 ) -> dict[str, Any]:
     """Summarize low-initial-probability start hypotheses that later dominate."""
     if initial_mass.shape != first_cross_timestamp.shape or initial_mass.ndim != 2:
@@ -394,7 +503,8 @@ def summarize_lineage_recoveries(
         positive = finite & (values > 0)
         low = positive & (values < float(threshold))
         first_cross = first_cross_timestamp[:, start].long()
-        recovered = low & (first_cross > int(start))
+        birth_timestamp = int(start) + int(birth_timestamp_offset)
+        recovered = low & (first_cross > birth_timestamp)
         low_count = int(low.sum().item())
         recovered_count = int(recovered.sum().item())
         delays = first_cross[recovered] - int(start)
@@ -415,6 +525,7 @@ def summarize_lineage_recoveries(
         )
     return {
         "threshold": float(threshold),
+        "birth_timestamp_offset_from_start": int(birth_timestamp_offset),
         "low_initial_lineage_count": total_low,
         "recovered_lineage_count": total_recovered,
         "recovery_rate": total_recovered / total_low if total_low else None,
@@ -593,7 +704,12 @@ def run_diagnostic(args: argparse.Namespace) -> dict[str, Any]:
     cohort_contract["detector_row_count"] = detector_row_count
 
     cfg = bocd_config(config)
-    _BernoulliBOCDConfig, BetaBernoulliBOCD, BeamTwoBernoulliFilter = load_bocd_classes()
+    (
+        _BernoulliBOCDConfig,
+        BetaBernoulliBOCD,
+        AdamsMacKayBetaBernoulliBOCD,
+        BeamTwoBernoulliFilter,
+    ) = load_bocd_classes()
     exact_state_bytes = estimated_exact_state_bytes(
         detector_row_count, config.max_run_length, dtype
     )
@@ -606,7 +722,12 @@ def run_diagnostic(args: argparse.Namespace) -> dict[str, Any]:
             f"{float(args.exact_state_memory_limit_gb):.3f} GiB; "
             "lineage tracking, Beam-2 state, renderer state, and temporaries are extra"
         )
-    exact = BetaBernoulliBOCD(detector_row_count, cfg, device=device, dtype=dtype)
+    exact_class = (
+        BetaBernoulliBOCD
+        if config.exact_recurrence == "prior_reset"
+        else AdamsMacKayBetaBernoulliBOCD
+    )
+    exact = exact_class(detector_row_count, cfg, device=device, dtype=dtype)
     beam = BeamTwoBernoulliFilter(detector_row_count, cfg, device=device, dtype=dtype)
     pipe = SimpleNamespace(compute_cov3D_python=False, convert_SHs_python=False, debug=False)
     background = torch.zeros(3, dtype=dtype, device=device)
@@ -639,6 +760,14 @@ def run_diagnostic(args: argparse.Namespace) -> dict[str, Any]:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     if commit_path.exists():
         commit_path.unlink()
+    cluster_commit_counts = {
+        radius: {
+            "beam_commit_count": 0,
+            "exact_beam_start_cluster_ge_threshold_count": 0,
+            "exact_map_start_cluster_ge_threshold_count": 0,
+        }
+        for radius in config.start_cluster_radii
+    }
 
     intrinsics = None
     with commit_path.open("a", encoding="utf-8") as commit_file:
@@ -676,10 +805,14 @@ def run_diagnostic(args: argparse.Namespace) -> dict[str, Any]:
             beam_recent_values: list[torch.Tensor] = []
             exact_mass_chunks: list[torch.Tensor] = []
             beam_mass_chunks: list[torch.Tensor] = []
+            exact_first_observation_chunks: list[torch.Tensor] = []
 
             for start in range(0, int(rows_for_frame.numel()), config.chunk_size):
                 rows = rows_for_frame[start : start + config.chunk_size]
                 local_rows = local_rows_for_frame[start : start + config.chunk_size]
+                exact_first_observation_chunks.append(
+                    (exact.visible_observations[local_rows] == 0).detach()
+                )
                 exact_result = exact.update(
                     evidence.delta_a[rows],
                     evidence.delta_b[rows],
@@ -719,7 +852,49 @@ def run_diagnostic(args: argparse.Namespace) -> dict[str, Any]:
                     valid = (cand_starts >= 0) & (cand_starts < frame_count)
                     if bool(valid.any()):
                         exact_same[valid] = exact_mass[pos[valid], cand_starts[valid]]
-                    exact_map_prob = exact_result.run_length_posterior[exact_rows, exact_result.map_run_length]
+                    exact_map_run_prob = exact_result.run_length_posterior[
+                        exact_rows, exact_result.map_run_length
+                    ]
+                    exact_binned_map_prob, exact_binned_map_start = exact_mass.max(
+                        dim=1
+                    )
+                    beam_start_clusters = {
+                        radius: centered_start_cluster_mass(
+                            exact_mass[pos], cand_starts, radius=radius
+                        )
+                        for radius in config.start_cluster_radii
+                    }
+                    exact_map_clusters = {
+                        radius: centered_start_cluster_mass(
+                            exact_mass[pos],
+                            exact_binned_map_start[pos],
+                            radius=radius,
+                        )
+                        for radius in config.start_cluster_radii
+                    }
+                    for radius in config.start_cluster_radii:
+                        counts = cluster_commit_counts[radius]
+                        counts["beam_commit_count"] += int(pos.numel())
+                        counts[
+                            "exact_beam_start_cluster_ge_threshold_count"
+                        ] += int(
+                            (
+                                beam_start_clusters[radius]
+                                >= config.changepoint_probability
+                            )
+                            .sum()
+                            .item()
+                        )
+                        counts[
+                            "exact_map_start_cluster_ge_threshold_count"
+                        ] += int(
+                            (
+                                exact_map_clusters[radius]
+                                >= config.changepoint_probability
+                            )
+                            .sum()
+                            .item()
+                        )
                     for j, p in enumerate(pos.tolist()):
                         record_out = {
                             "gaussian_index": int(rows[p].item()),
@@ -727,20 +902,53 @@ def run_diagnostic(args: argparse.Namespace) -> dict[str, Any]:
                             "beam_estimated_start": int(beam_result.candidate_run_start[p].item()),
                             "beam_candidate_probability": float(beam_result.candidate_probability[p].item()),
                             "exact_posterior_mass_on_same_start": float(exact_same[j].item()),
-                            "exact_map_start": int(exact_result.estimated_run_start[p].item()),
-                            "exact_map_probability": float(exact_map_prob[p].item()),
+                            "exact_map_run_start": int(
+                                exact_result.estimated_run_start[p].item()
+                            ),
+                            "exact_map_run_probability": float(
+                                exact_map_run_prob[p].item()
+                            ),
+                            "exact_map_start": int(
+                                exact_result.estimated_run_start[p].item()
+                            ),
+                            "exact_map_probability": float(
+                                exact_map_run_prob[p].item()
+                            ),
+                            "exact_binned_map_start": int(
+                                exact_binned_map_start[p].item()
+                            ),
+                            "exact_binned_map_start_probability": float(
+                                exact_binned_map_prob[p].item()
+                            ),
                             "exact_p_run_zero": float(exact_result.changepoint_probability[p].item()),
                         }
+                        for radius in config.start_cluster_radii:
+                            record_out[
+                                f"exact_beam_start_cluster_mass_r{radius}"
+                            ] = float(beam_start_clusters[radius][j].item())
+                            record_out[
+                                f"exact_map_start_cluster_mass_r{radius}"
+                            ] = float(exact_map_clusters[radius][j].item())
                         commit_file.write(json.dumps(record_out, sort_keys=True) + "\n")
 
             if exact_mass_chunks:
-                exact_frame_mass = torch.cat(exact_mass_chunks, dim=0)
-                beam_frame_mass = torch.cat(beam_mass_chunks, dim=0)
+                observed_exact_frame_mass = torch.cat(exact_mass_chunks, dim=0)
+                observed_beam_frame_mass = torch.cat(beam_mass_chunks, dim=0)
+                exact_first_observation = torch.cat(
+                    exact_first_observation_chunks, dim=0
+                )
             else:
-                exact_frame_mass = torch.zeros(
+                observed_exact_frame_mass = torch.zeros(
                     (0, frame_count), device=device, dtype=torch.float32
                 )
-                beam_frame_mass = torch.zeros_like(exact_frame_mass)
+                observed_beam_frame_mass = torch.zeros_like(
+                    observed_exact_frame_mass
+                )
+                exact_first_observation = torch.zeros(
+                    (0,), device=device, dtype=torch.bool
+                )
+            exact_frame_mass = observed_exact_frame_mass
+            beam_frame_mass = observed_beam_frame_mass
             if use_event_cohort:
                 lineage_rows = torch.nonzero(
                     exact.visible_observations > 0, as_tuple=False
@@ -756,21 +964,48 @@ def run_diagnostic(args: argparse.Namespace) -> dict[str, Any]:
                 lineage_rows = local_rows_for_frame
             exact_mean[t], exact_q95[t] = start_mass_stats(exact_frame_mass, current_t=t, frame_count=frame_count)
             beam_mean[t], beam_q95[t] = start_mass_stats(beam_frame_mass, current_t=t, frame_count=frame_count)
-            if lineage_rows.numel():
-                exact_initial_mass[lineage_rows, t] = exact_frame_mass[:, t]
-                beam_initial_mass[lineage_rows, t] = beam_frame_mass[:, t]
-                exact_cross_view = exact_first_cross[lineage_rows, : t + 1]
-                beam_cross_view = beam_first_cross[lineage_rows, : t + 1]
+            if local_rows_for_frame.numel():
+                record_initial_lineage_mass(
+                    exact_initial_mass,
+                    local_rows_for_frame,
+                    observed_exact_frame_mass,
+                    timestamp=t,
+                    exact_recurrence=config.exact_recurrence,
+                    first_observation=exact_first_observation,
+                )
+                record_initial_lineage_mass(
+                    beam_initial_mass,
+                    local_rows_for_frame,
+                    observed_beam_frame_mass,
+                    timestamp=t,
+                    exact_recurrence="prior_reset",
+                )
+                exact_upto = min(
+                    t + (1 if config.exact_recurrence == "adams_mackay" else 0),
+                    frame_count - 1,
+                )
+                exact_cross_view = exact_first_cross[
+                    local_rows_for_frame, : exact_upto + 1
+                ]
+                beam_cross_view = beam_first_cross[
+                    local_rows_for_frame, : t + 1
+                ]
                 exact_new_cross = (exact_cross_view < 0) & (
-                    exact_frame_mass[:, : t + 1] >= config.changepoint_probability
+                    observed_exact_frame_mass[:, : exact_upto + 1]
+                    >= config.changepoint_probability
                 )
                 beam_new_cross = (beam_cross_view < 0) & (
-                    beam_frame_mass[:, : t + 1] >= config.changepoint_probability
+                    observed_beam_frame_mass[:, : t + 1]
+                    >= config.changepoint_probability
                 )
                 exact_cross_view[exact_new_cross] = int(t)
                 beam_cross_view[beam_new_cross] = int(t)
-                exact_first_cross[lineage_rows, : t + 1] = exact_cross_view
-                beam_first_cross[lineage_rows, : t + 1] = beam_cross_view
+                exact_first_cross[
+                    local_rows_for_frame, : exact_upto + 1
+                ] = exact_cross_view
+                beam_first_cross[
+                    local_rows_for_frame, : t + 1
+                ] = beam_cross_view
 
             exact_map_start_mean, exact_map_prob_mean = map_start_summary(exact_frame_mass)
             beam_map_start_mean, beam_map_prob_mean = map_start_summary(beam_frame_mass)
@@ -809,13 +1044,21 @@ def run_diagnostic(args: argparse.Namespace) -> dict[str, Any]:
     }
     lineage_recovery = {
         "definition": (
-            "a start hypothesis has 0 < initial posterior mass < threshold and "
-            "crosses threshold on a later timestamp"
+            "a start hypothesis has 0 < posterior mass at branch birth < "
+            "threshold and crosses threshold after its recurrence-specific "
+            "birth update"
+        ),
+        "birth_contract": (
+            "prior_reset creates start=t after observation t; adams_mackay "
+            "creates empty r_t=0 start=t+1 after observation t"
         ),
         "exact": summarize_lineage_recoveries(
             exact_initial_mass,
             exact_first_cross,
             threshold=config.changepoint_probability,
+            birth_timestamp_offset=(
+                -1 if config.exact_recurrence == "adams_mackay" else 0
+            ),
         ),
         "beam2": summarize_lineage_recoveries(
             beam_initial_mass,
@@ -828,10 +1071,37 @@ def run_diagnostic(args: argparse.Namespace) -> dict[str, Any]:
         encoding="utf-8",
     )
     peak_cuda = torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0
+    cluster_commit_summary = {}
+    for radius, counts in cluster_commit_counts.items():
+        total = counts["beam_commit_count"]
+        cluster_commit_summary[str(radius)] = {
+            **counts,
+            "exact_beam_start_cluster_ge_threshold_rate": (
+                counts["exact_beam_start_cluster_ge_threshold_count"] / total
+                if total
+                else None
+            ),
+            "exact_map_start_cluster_ge_threshold_rate": (
+                counts["exact_map_start_cluster_ge_threshold_count"] / total
+                if total
+                else None
+            ),
+        }
     summary = {
-        "schema_version": 1,
+        "schema_version": 2,
         "algorithm_names": {"exact": exact.algorithm, "beam2": beam.algorithm},
-        "contract": "detector_only_full_bocd_vs_protected_beam2_same_causal_evidence",
+        "contract": "detector_only_full_bocd_start_posterior_diagnostic",
+        "recurrence_contract": {
+            "exact": config.exact_recurrence,
+            "exact_and_beam_share_recurrence": config.exact_recurrence
+            == "prior_reset",
+            "beam2": "protected_prior_reset_candidate",
+            "adams_mackay_note": (
+                "Algorithm 1 scores current evidence under each previous-run "
+                "predictive for both growth and CP; r=0 resets to the prior for "
+                "the next observation"
+            ),
+        },
         "frames": frame_count,
         "gaussian_count": num_gaussians,
         "cohort": cohort_contract,
@@ -859,7 +1129,9 @@ def run_diagnostic(args: argparse.Namespace) -> dict[str, Any]:
             "full_run_validation": "max_run_length >= processed frame count",
             "changepoint_probability": config.changepoint_probability,
             "recent_window": config.recent_window,
+            "start_cluster_radii": list(config.start_cluster_radii),
         },
+        "beam_commit_cluster_scan": cluster_commit_summary,
         "memory_estimates": {
             "detector_row_count": detector_row_count,
             "exact_resident_bytes": exact_state_bytes,
@@ -920,6 +1192,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--cue-cache-root", type=Path, default=DEFAULT_CUE_CACHE)
     parser.add_argument("--resolution", type=float, default=4.0)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument(
+        "--exact-recurrence",
+        choices=("prior_reset", "adams_mackay"),
+        default="prior_reset",
+    )
     parser.add_argument("--cue-mode", choices=("binary", "soft"), default="binary")
     parser.add_argument("--cue-threshold", type=float, default=0.5)
     parser.add_argument("--cue-scale", type=float, default=1.0)
@@ -948,6 +1225,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--min-run-evidence", type=nonnegative_float, default=0.0)
     parser.add_argument("--min-visible-observations", type=int, default=1)
     parser.add_argument("--recent-window", type=positive_int, default=5)
+    parser.add_argument(
+        "--start-cluster-radii",
+        nargs="+",
+        type=nonnegative_int,
+        default=[0, 1, 2, 3, 5],
+        help="global-timestamp radii scanned around Beam and exact MAP starts",
+    )
     parser.add_argument("--cohort", choices=("all", "events"), default="all", help="use all observed rows; --cohort-events selects a posthoc event cohort")
     parser.add_argument("--cohort-events", type=Path, default=None)
     parser.add_argument("--cohort-actions", type=str, default="CLOSE")
