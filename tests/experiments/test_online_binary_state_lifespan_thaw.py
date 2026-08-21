@@ -20,6 +20,7 @@ from experiments.run_online_binary_state_lifespan_thaw import (
     run_detector_only_synthetic_smoke,
     run_detector_sequence,
     same_scene_repeated_transition_diagnostics,
+    validate_cue_camera_checksum,
 )
 
 
@@ -149,6 +150,32 @@ def test_detector_only_smoke_writes_binary_state_outputs(tmp_path: Path):
     stats = np.load(tmp_path / "per_frame_binary_state_stats.npz")
     assert {"p_active", "p_flip", "p_01", "p_10", "open_count", "reopen_count"} <= set(stats.files)
     assert stats["p_active"].shape[1] == 5
+
+
+def test_detector_only_smoke_can_omit_large_checkpoint(tmp_path: Path):
+    (tmp_path / "checkpoint.pt").write_bytes(b"stale checkpoint")
+    rc = main([
+        "--detector-only-smoke",
+        "--skip-checkpoint",
+        "--output-dir",
+        str(tmp_path),
+    ])
+
+    assert rc == 0
+    assert not (tmp_path / "checkpoint.pt").exists()
+    summary = json.loads((tmp_path / "summary.json").read_text())
+    assert summary["checkpoint_saved"] is False
+    assert "checkpoint.pt" not in summary["output_files"]
+
+
+def test_cue_camera_checksum_is_enforced_when_metadata_provides_it():
+    validate_cue_camera_checksum({}, "actual")
+    validate_cue_camera_checksum({"fixed_cameras_sha256": "actual"}, "actual")
+    with pytest.raises(ValueError, match="camera checksum mismatch"):
+        validate_cue_camera_checksum(
+            {"fixed_cameras_sha256": "cached"},
+            "actual",
+        )
 
 
 def test_smoke_helper_reports_expected_final_state():

@@ -211,6 +211,20 @@ class RunConfig:
     seed: int = 0
 
 
+def validate_cue_camera_checksum(
+    cue_metadata: Mapping[str, Any], actual_camera_checksum: str
+) -> None:
+    cached_camera_checksum = cue_metadata.get("fixed_cameras_sha256")
+    if (
+        cached_camera_checksum is not None
+        and cached_camera_checksum != actual_camera_checksum
+    ):
+        raise ValueError(
+            "cue cache/fixed camera checksum mismatch: "
+            f"{cached_camera_checksum} != {actual_camera_checksum}"
+        )
+
+
 @dataclass(frozen=True)
 class LifecycleEvent:
     gaussian_index: int
@@ -559,9 +573,18 @@ def _cpu_tree(value: Any) -> Any:
     return value
 
 
-def write_outputs(output_dir: Path, summary: Mapping[str, Any], frame_metrics: list[dict[str, Any]], events: Sequence[LifecycleEvent], checkpoint: Mapping[str, Any]) -> None:
+def write_outputs(
+    output_dir: Path,
+    summary: Mapping[str, Any],
+    frame_metrics: list[dict[str, Any]],
+    events: Sequence[LifecycleEvent],
+    checkpoint: Mapping[str, Any] | None,
+) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    summary_path = output_dir / "summary.json"
+    summary_tmp = output_dir / ".summary.json.tmp"
+    summary_path.unlink(missing_ok=True)
+    summary_tmp.unlink(missing_ok=True)
     with (output_dir / "lifecycle_events.jsonl").open("w", encoding="utf-8") as f:
         for event in events:
             f.write(json.dumps(asdict(event), sort_keys=True) + "\n")
@@ -570,7 +593,16 @@ def write_outputs(output_dir: Path, summary: Mapping[str, Any], frame_metrics: l
         writer = csv.DictWriter(f, fieldnames=list(rows[0]) if rows else ["timestamp"])
         writer.writeheader(); writer.writerows(rows)
     np.savez_compressed(output_dir / "per_frame_binary_state_stats.npz", **compact_npz_stats(frame_metrics))
-    torch.save(_cpu_tree(dict(checkpoint)), output_dir / "checkpoint.pt")
+    checkpoint_path = output_dir / "checkpoint.pt"
+    if checkpoint is None:
+        checkpoint_path.unlink(missing_ok=True)
+    else:
+        torch.save(_cpu_tree(dict(checkpoint)), checkpoint_path)
+    summary_tmp.write_text(
+        json.dumps(summary, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    summary_tmp.replace(summary_path)
 
 
 def evaluate_after_inference(source_path: Path, records: Sequence[Any], pre_predictions: Sequence[np.ndarray], post_predictions: Sequence[np.ndarray], frame_rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -884,11 +916,16 @@ def run_online(args: argparse.Namespace) -> dict[str, Any]:
     from temporal import TemporalGeometryChangeModel
     from temporal.change_evidence import accumulate_change_evidence
     from experiments.train_cue_temporal_rchange import build_fixed_cue_views, load_fixed_camera_index, validate_cue_cache
-    from experiments.train_real_temporal_rchange import oscd_positive_sparsity_loss, seed_everything
+    from experiments.train_real_temporal_rchange import (
+        file_checksum,
+        oscd_positive_sparsity_loss,
+        seed_everything,
+    )
     from gaussian_renderer import render_change_temporal
     from scene import GaussianModel
 
     config = run_config_from_args(args)
+    skip_checkpoint = bool(getattr(args, "skip_checkpoint", False))
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required by the Gaussian renderer")
     seed_everything(config.seed); torch.cuda.reset_peak_memory_stats(); started = time.time()
@@ -898,6 +935,10 @@ def run_online(args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError("views are not in strict global timestamp order")
     base_ply = (args.source_path / BASE_PLY_REL).resolve()
     cue_metadata = validate_cue_cache(args.cue_cache_root, base_ply, args.resolution)
+    validate_cue_camera_checksum(
+        cue_metadata,
+        file_checksum(args.fixed_cameras_json),
+    )
     cameras = load_fixed_camera_index(args.fixed_cameras_json)
     base = GaussianModel(sh_degree=3, active_sh_degree=0); base.load_ply_change(str(base_ply))
     base_before = base_snapshots(base); checksums = base_checksums(base); checksum = combined_checksum(checksums)
@@ -1035,10 +1076,13 @@ def run_online(args: argparse.Namespace) -> dict[str, Any]:
             + tracker.visible_observations.numel() * tracker.visible_observations.element_size()
             + tracker.last_timestamp.numel() * tracker.last_timestamp.element_size()
         ),
-        "output_files": list(OUTPUT_FILES),
+        "output_files": list(OUTPUT_FILES[:-1] if skip_checkpoint else OUTPUT_FILES),
+        "checkpoint_saved": not skip_checkpoint,
         "visualization": visualization_summary,
     }
-    checkpoint = {"schema_version": 1, "contract": summary["contract"], "base_ply": str(base_ply), "state_dict": model.state_dict(), "binary_filter_state": tracker.state_dict() if hasattr(tracker, "state_dict") else {}, "controller_state": controller.state_dict() if hasattr(controller, "state_dict") else {}, "optimizer_state": None if optimizer is None else optimizer.state_dict(), "metadata": summary}
+    checkpoint = None
+    if not skip_checkpoint:
+        checkpoint = {"schema_version": 1, "contract": summary["contract"], "base_ply": str(base_ply), "state_dict": model.state_dict(), "binary_filter_state": tracker.state_dict() if hasattr(tracker, "state_dict") else {}, "controller_state": controller.state_dict() if hasattr(controller, "state_dict") else {}, "optimizer_state": None if optimizer is None else optimizer.state_dict(), "metadata": summary}
     write_outputs(args.output_dir, summary, rows, events, checkpoint)
     return summary
 
@@ -1092,6 +1136,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--rotation-lr", type=nonnegative_float, default=0.001)
     parser.add_argument("--adam-eps", type=float, default=1e-15)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--skip-checkpoint",
+        action="store_true",
+        help="Keep textual diagnostics but omit the large training checkpoint.",
+    )
     return parser.parse_args(argv)
 
 
@@ -1099,8 +1148,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     if args.detector_only_smoke:
         result = run_detector_only_synthetic_smoke()
-        summary = {"algorithm": result["algorithm"], "frames": len(result["frame_metrics"]), "event_count": len(result["events"]), "active_to_active_false_split_count": event_diagnostics(result["events"])["active_to_active_false_split_count"], "reused_slot_violations": event_diagnostics(result["events"])["reused_slot_violations"], "base_tensor_drift": result["base_drift"], "output_files": list(OUTPUT_FILES), "detector_only_smoke": True}
-        write_outputs(args.output_dir, summary, result["frame_metrics"], result["events"], {"summary": summary, "filter_state": result["filter_state"]})
+        summary = {"algorithm": result["algorithm"], "frames": len(result["frame_metrics"]), "event_count": len(result["events"]), "active_to_active_false_split_count": event_diagnostics(result["events"])["active_to_active_false_split_count"], "reused_slot_violations": event_diagnostics(result["events"])["reused_slot_violations"], "base_tensor_drift": result["base_drift"], "output_files": list(OUTPUT_FILES[:-1] if args.skip_checkpoint else OUTPUT_FILES), "checkpoint_saved": not bool(args.skip_checkpoint), "detector_only_smoke": True}
+        checkpoint = None if args.skip_checkpoint else {"summary": summary, "filter_state": result["filter_state"]}
+        write_outputs(args.output_dir, summary, result["frame_metrics"], result["events"], checkpoint)
         print(json.dumps(summary, indent=2)); return 0
     summary = run_online(args)
     print(json.dumps({"summary": str(args.output_dir / "summary.json"), "frames": summary["frames"], "algorithm": summary["algorithm"]}, indent=2))
