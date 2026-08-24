@@ -1,4 +1,4 @@
-"""Run causal FastGS-style soft change-cue density control on ref -> SC1.
+"""Run causal FastGS-style soft change-cue density control on ESCD scopes.
 
 This is deliberately a mutable ``R_change`` ablation rather than a temporal
 sidecar integration.  The immutable reference PLY and cached ref--inf cue are
@@ -43,6 +43,18 @@ DEFAULT_CUE_CACHE = Path(
 )
 BASE_PLY_REL = Path("reference_reconstruction/point_cloud/iteration_30000/point_cloud.ply")
 FASTGS_SOURCE_COMMIT = "44e02a5c1d5e9ed64d2ecd4af1cbba14ac92150f"
+SCOPE_MAX_FRAMES = {
+    "scene_change1": 95,
+    "scene_change2": 104,
+    "scene_change3": 105,
+    "continuous": 304,
+}
+SCOPE_LABELS = {
+    "scene_change1": "ref -> scene_change1 only",
+    "scene_change2": "ref -> scene_change2 only",
+    "scene_change3": "ref -> scene_change3 only",
+    "continuous": "ref -> scene_change1 -> scene_change2 -> scene_change3",
+}
 
 
 def positive_int(value: str) -> int:
@@ -80,6 +92,59 @@ def deterministic_training_view_index(
     if float(local.random()) <= 0.33:
         return int(timestamp)
     return int(local.integers(0, timestamp + 1))
+
+
+def select_scope_records(
+    records: Sequence[Any],
+    *,
+    scope: str,
+    max_frames: int,
+) -> list[Any]:
+    """Select an independent segment or the full stream and reindex causally."""
+    if scope not in SCOPE_MAX_FRAMES:
+        raise ValueError(f"unknown scope: {scope}")
+    if max_frames < 1 or max_frames > SCOPE_MAX_FRAMES[scope]:
+        raise ValueError(f"max_frames exceeds the {scope} scope")
+    selected = (
+        list(records[:max_frames])
+        if scope == "continuous"
+        else [record for record in records if record.segment_name == scope][:max_frames]
+    )
+    if len(selected) != max_frames:
+        raise RuntimeError(
+            f"requested {max_frames} frames for {scope}, found {len(selected)}"
+        )
+    normalized: list[Any] = []
+    for index, record in enumerate(selected):
+        values = vars(record).copy()
+        values["global_index"] = index
+        normalized.append(SimpleNamespace(**values))
+    return normalized
+
+
+def oracle_state_local_view_indices(
+    processed_records: Sequence[Any],
+    current_index: int,
+    k: int,
+    *,
+    seed: int,
+) -> tuple[int, ...]:
+    """Sample current plus past views only from the current oracle state."""
+    if current_index != len(processed_records) - 1:
+        raise ValueError("processed_records must end at current_index")
+    segment = processed_records[current_index].segment_name
+    start = current_index
+    while start > 0 and processed_records[start - 1].segment_name == segment:
+        start -= 1
+    local_indices = causal_random_view_indices(
+        current_index - start,
+        k,
+        seed=int(seed) + 10_007 * int(processed_records[current_index].segment_id),
+    )
+    selected = tuple(start + index for index in local_indices)
+    if any(processed_records[index].segment_name != segment for index in selected):
+        raise RuntimeError("oracle state-local density sampling crossed a boundary")
+    return selected
 
 
 def reference_scene_extent(cameras_json: Path) -> float:
@@ -408,8 +473,12 @@ def write_plots(
 def validate_args(args: argparse.Namespace) -> None:
     if args.condition not in {"baseline", "fastgs_gradient_only", "cue_vcd"}:
         raise ValueError("condition must be baseline, fastgs_gradient_only, or cue_vcd")
-    if args.max_frames > 95:
-        raise ValueError("this ablation is locked to ref -> SC1 (at most 95 frames)")
+    if args.scope not in SCOPE_MAX_FRAMES:
+        raise ValueError("unknown ESCD scope")
+    if args.max_frames > SCOPE_MAX_FRAMES[args.scope]:
+        raise ValueError(f"max_frames exceeds the {args.scope} scope")
+    if args.oracle_state_local_density_views and args.scope != "continuous":
+        raise ValueError("oracle state-local density views require continuous scope")
     if not 0 <= args.densify_update_index < args.updates_per_frame:
         raise ValueError("densify_update_index must be within the per-frame update schedule")
 
@@ -438,9 +507,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     started = time.time()
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    records, _names = build_causal_records(args.source_path, max_frames=args.max_frames)
-    if not records or any(record.segment_name != "scene_change1" for record in records):
-        raise RuntimeError("ref -> SC1 ablation received a non-SC1 frame")
+    all_records, _names = build_causal_records(args.source_path)
+    records = select_scope_records(
+        all_records,
+        scope=args.scope,
+        max_frames=int(args.max_frames),
+    )
     base_ply = (args.source_path / BASE_PLY_REL).resolve()
     immutable_hash_before = file_sha256(base_ply)
     validate_cue_cache(args.cue_cache_root, base_ply, args.resolution)
@@ -469,6 +541,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     global_update = 0
     total_clones = 0
     total_splits = 0
+    cross_state_density_view_access_count = 0
 
     for record in records:
         frame_started = time.time()
@@ -545,13 +618,28 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         dense_fraction=float(args.fastgs_dense_fraction),
                     )
                 else:
-                    selected_indices = causal_random_view_indices(
-                        timestamp,
-                        int(args.k_views),
-                        seed=int(args.seed),
-                    )
+                    if args.oracle_state_local_density_views:
+                        selected_indices = oracle_state_local_view_indices(
+                            records[: timestamp + 1],
+                            timestamp,
+                            int(args.k_views),
+                            seed=int(args.seed),
+                        )
+                    else:
+                        selected_indices = causal_random_view_indices(
+                            timestamp,
+                            int(args.k_views),
+                            seed=int(args.seed),
+                        )
                     if max(selected_indices) > timestamp:
                         raise RuntimeError("future density-score view accessed")
+                    cross_state_count = sum(
+                        records[index].segment_name != record.segment_name
+                        for index in selected_indices
+                    )
+                    cross_state_density_view_access_count += cross_state_count
+                    if args.oracle_state_local_density_views and cross_state_count:
+                        raise RuntimeError("oracle density sample crossed a state boundary")
                     score = compute_soft_multiview_change_score(
                         processed_views,
                         selected_indices,
@@ -581,6 +669,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 event = {
                     "timestamp": timestamp,
                     "selected_view_indices": list(selected_indices),
+                    "selected_view_segments": [
+                        records[index].segment_name for index in selected_indices
+                    ],
                     "selected_view_count": len(selected_indices),
                     "initial_count": density.initial_count,
                     "final_count": density.final_count,
@@ -596,6 +687,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     "importance": importance_stats,
                     "change_ratio": ratio_stats,
                     "future_view_access_count": 0,
+                    "cross_state_density_view_access_count": (
+                        cross_state_count if args.condition == "cue_vcd" else 0
+                    ),
                 }
                 density_events.append(event)
             global_update += 1
@@ -617,6 +711,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             {
                 "timestamp": timestamp,
                 "frame": record.name,
+                "segment": record.segment_name,
                 "condition": args.condition,
                 "k_views": int(args.k_views) if args.condition == "cue_vcd" else 0,
                 "gaussian_count": int(change_bank.get_xyz.shape[0]),
@@ -635,6 +730,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "frame_runtime_seconds": time.time() - frame_started,
                 "cuda_peak_memory_bytes": int(torch.cuda.max_memory_allocated()),
                 "future_view_access_count": 0,
+                "cross_state_density_view_access_count": event.get(
+                    "cross_state_density_view_access_count", 0
+                ),
             }
         )
 
@@ -665,7 +763,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     summary = {
         "schema_version": 1,
         "script": "experiments/run_ref_sc1_change_cue_density.py",
-        "scope": "ref -> scene_change1 only",
+        "scope": SCOPE_LABELS[args.scope],
+        "scope_key": args.scope,
         "condition": args.condition,
         "k_views": int(args.k_views) if args.condition == "cue_vcd" else None,
         "cue_contract": (
@@ -679,7 +778,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             else None
         ),
         "view_sampling": (
-            "current view plus K-1 random already-processed SC1 views; no future views"
+            (
+                "current view plus K-1 random already-processed views from the same oracle state; no future views"
+                if args.oracle_state_local_density_views
+                else "current view plus K-1 random already-processed views; no future views"
+            )
             if args.condition == "cue_vcd"
             else "not applicable"
         ),
@@ -692,14 +795,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         ],
         "fastgs_changed": [
             "normalized RGB L1 threshold map -> soft alpha-T ref-inf change cue",
-            "offline random train views -> causal processed SC1 views",
+            "offline random train views -> causal already-processed ESCD views",
             "cue-based pruning disabled",
         ],
         "temporal_topology_integration": False,
         "temporal_topology_blocker": "TemporalGeometryChangeModel is fixed [N,S]; mutable density requires a separate residual bank",
         "gt_used_in_causal_loop": False,
         "gt_loaded_after_inference_only": True,
-        "manual_boundaries_used": False,
+        "manual_boundaries_used": bool(args.oracle_state_local_density_views),
+        "oracle_state_labels_used_for_density_sampling_only": bool(
+            args.oracle_state_local_density_views
+        ),
+        "oracle_state_labels_used_for_training_replay": False,
         "initial_gaussian_count": initial_count,
         "final_gaussian_count": int(change_bank.get_xyz.shape[0]),
         "total_clones": int(total_clones),
@@ -711,6 +818,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "immutable_reference_ply_sha256": immutable_hash_before,
         "immutable_reference_unchanged": True,
         "future_view_access_count": 0,
+        "cross_state_density_view_access_count": int(
+            cross_state_density_view_access_count
+        ),
         "runtime_seconds": time.time() - started,
         "peak_cuda_memory_bytes": int(torch.cuda.max_memory_allocated()),
         "plots": plots,
@@ -744,6 +854,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         choices=("baseline", "fastgs_gradient_only", "cue_vcd"),
         required=True,
     )
+    parser.add_argument(
+        "--scope",
+        choices=tuple(SCOPE_MAX_FRAMES),
+        default="scene_change1",
+    )
+    parser.add_argument("--oracle-state-local-density-views", action="store_true")
     parser.add_argument("--k-views", type=positive_int, default=10)
     parser.add_argument("--max-frames", type=positive_int, default=95)
     parser.add_argument("--resolution", type=float, default=4.0)

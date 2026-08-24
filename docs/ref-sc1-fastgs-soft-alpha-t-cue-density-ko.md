@@ -305,3 +305,7 @@ multi-view consistency probability도 아니다. 다음 연구 순서는
 SC1 안의 semantic new-object identity annotation을 density decision이나
 평가에 사용하지 않았으므로, 이번 결과만으로 new-object region recall이
 개별적으로 개선됐다고 주장하지 않는다.
+
+SC2/SC3 독립 실행과 oracle state-local K=10 연속 실행 결과는
+[`escd-k10-oracle-state-local-density-ko.md`](escd-k10-oracle-state-local-density-ko.md)에
+기록한다.
