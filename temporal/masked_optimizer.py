@@ -13,6 +13,27 @@ from torch.optim import Optimizer
 ALLOWED_NAMES = ("dc", "xyz", "opacity", "scaling", "rotation")
 
 
+def active_visible_pair_mask(
+    active_pair_mask: torch.Tensor,
+    radii: torch.Tensor,
+) -> torch.Tensor:
+    """Restrict current lifespan pairs to rows visible in one render.
+
+    ``render_change_temporal`` follows the Gaussian renderer convention that a
+    row is visible when its rasterized radius is positive.  The returned mask
+    can be passed directly to :class:`MaskedRowSlotAdam`, ensuring that an OPEN
+    pair outside the current camera view preserves both its parameter value and
+    its optimizer-owned moments exactly.
+    """
+    if active_pair_mask.ndim != 2 or active_pair_mask.dtype != torch.bool:
+        raise ValueError("active_pair_mask must be a boolean [N, S] tensor")
+    if radii.ndim != 1 or radii.shape[0] != active_pair_mask.shape[0]:
+        raise ValueError("radii must have shape [N] matching active_pair_mask")
+    if radii.device != active_pair_mask.device:
+        radii = radii.to(device=active_pair_mask.device)
+    return active_pair_mask & (radii.detach() > 0).unsqueeze(1)
+
+
 class MaskedRowSlotAdam(Optimizer):
     """Adam optimizer that updates only selected Gaussian row-slot pairs.
 

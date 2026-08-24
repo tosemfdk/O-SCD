@@ -13,6 +13,7 @@ assert spec is not None and spec.loader is not None
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 MaskedRowSlotAdam = module.MaskedRowSlotAdam
+active_visible_pair_mask = module.active_visible_pair_mask
 
 
 class _DummyTemporalModel(nn.Module):
@@ -120,6 +121,69 @@ def test_row_slot_masked_adam_updates_only_selected_pairs_and_preserves_inactive
             torch.zeros_like(opt.state[param]["exp_avg_sq"][2, 0]),
         )
         assert opt.state[param]["step"][2, 0].item() == 0
+
+
+def test_active_but_invisible_pair_preserves_parameters_and_adam_state_exactly():
+    model = _DummyTemporalModel(n=3, s=2)
+    opt = MaskedRowSlotAdam(
+        dict(model.state_parameter_items()),
+        thaw_names=("dc", "xyz", "opacity", "scaling", "rotation"),
+        lrs={name: 0.02 for name in ("dc", "xyz", "opacity", "scaling", "rotation")},
+    )
+    active = torch.zeros(3, 2, dtype=torch.bool)
+    active[0, 0] = True
+    active[1, 1] = True
+
+    # Row 0 is initially visible and accumulates non-zero Adam momentum.
+    row0_visible = active_visible_pair_mask(active, torch.tensor([2.0, 0.0, 0.0]))
+    assert torch.equal(
+        row0_visible,
+        torch.tensor([[True, False], [False, False], [False, False]]),
+    )
+    _set_masked_gradients(model, row0_visible, 1.0)
+    opt.step(row0_visible)
+    opt.step(row0_visible)
+
+    parameter_before = {
+        name: parameter[0, 0].detach().clone()
+        for name, parameter in model.state_parameter_items()
+    }
+    state_before = {
+        name: {
+            key: opt.state[parameter][key][0, 0].detach().clone()
+            for key in ("exp_avg", "exp_avg_sq", "step")
+        }
+        for name, parameter in model.state_parameter_items()
+    }
+
+    # Row 0 remains OPEN but leaves the current view.  Only visible row 1 may
+    # advance; row 0 must retain parameters and optimizer moments bitwise.
+    row1_visible = active_visible_pair_mask(active, torch.tensor([0.0, 3.0, 0.0]))
+    _set_masked_gradients(model, row1_visible, 0.5)
+    for _ in range(4):
+        opt.step(row1_visible)
+
+    for name, parameter in model.state_parameter_items():
+        assert torch.equal(parameter[0, 0], parameter_before[name])
+        for key in ("exp_avg", "exp_avg_sq", "step"):
+            assert torch.equal(opt.state[parameter][key][0, 0], state_before[name][key])
+        assert opt.state[parameter]["step"][1, 1].item() == 4
+
+    # The same active pair becomes intentionally optimizable again when it
+    # re-enters a later selected view.
+    _set_masked_gradients(model, row0_visible, 0.25)
+    opt.step(row0_visible)
+    for name, parameter in model.state_parameter_items():
+        assert not torch.equal(parameter[0, 0], parameter_before[name])
+        assert opt.state[parameter]["step"][0, 0].item() == 3
+
+
+def test_active_visible_pair_mask_rejects_mismatched_renderer_shapes():
+    active = torch.zeros(3, 2, dtype=torch.bool)
+    with pytest.raises(ValueError, match="shape \\[N\\]"):
+        active_visible_pair_mask(active, torch.ones(2))
+    with pytest.raises(ValueError, match="boolean \\[N, S\\]"):
+        active_visible_pair_mask(active.float(), torch.ones(3))
 
 
 def test_optimizer_respects_disabled_thaw_names_and_keeps_them_exact():

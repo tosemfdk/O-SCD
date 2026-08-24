@@ -34,7 +34,7 @@ from temporal.bernoulli_bocd import (
     make_bocd_filter,
 )
 from temporal.change_evidence import accumulate_change_evidence, evidence_counts
-from temporal.masked_optimizer import MaskedRowSlotAdam
+from temporal.masked_optimizer import MaskedRowSlotAdam, active_visible_pair_mask
 
 DEFAULT_SOURCE = "data/Instance_1/scene_change1_2_3"
 DEFAULT_BOUNDARIES = (95, 199)
@@ -575,6 +575,8 @@ def frame_diagnostics(
     cuda_peak_memory_bytes: int,
     predicted_positive_fraction: float,
     algorithm: str,
+    optimizer_selected_rows: int = 0,
+    active_but_not_visible_rows: int = 0,
 ) -> dict[str, Any]:
     counts = bayesian["action_counts"]
     return {
@@ -596,6 +598,8 @@ def frame_diagnostics(
         "uncertain_count": int(counts["UNCERTAIN"]),
         "active_lifespan_count": int((model.current_state_index >= 0).sum().item()),
         "number_of_geometry_thawed_rows": int(geometry_thawed_rows),
+        "optimizer_selected_active_visible_rows": int(optimizer_selected_rows),
+        "active_but_not_visible_rows": int(active_but_not_visible_rows),
         "base_checksum": base_checksum,
         "inactive_parameter_drift_audit": dict(inactive_audit),
         "predicted_positive_fraction": float(predicted_positive_fraction),
@@ -1446,6 +1450,14 @@ def compact_npz_stats(frame_rows: Sequence[Mapping[str, Any]]) -> dict[str, np.n
             [row["number_of_geometry_thawed_rows"] for row in frame_rows],
             dtype=np.int64,
         ),
+        "optimizer_selected_active_visible_rows": np.asarray(
+            [row["optimizer_selected_active_visible_rows"] for row in frame_rows],
+            dtype=np.int64,
+        ),
+        "active_but_not_visible_rows": np.asarray(
+            [row["active_but_not_visible_rows"] for row in frame_rows],
+            dtype=np.int64,
+        ),
         "inactive_drift_max_abs": np.asarray(
             [row["inactive_parameter_drift_audit"]["max_abs"] for row in frame_rows],
             dtype=np.float64,
@@ -1840,12 +1852,7 @@ def run_online(args: argparse.Namespace) -> dict[str, Any]:
         )
         active_pairs = current_pair_mask(model)
         active_row_count = int((model.current_state_index >= 0).sum().item())
-        geometry_enabled = optimizer is not None and any(
-            name != "dc" for name in config.thaw_parameters
-        )
-        geometry_thawed_rows = (
-            active_row_count if geometry_enabled else 0
-        )
+        geometry_enabled = optimizer is not None and any(name != "dc" for name in config.thaw_parameters)
         if optimizer is not None:
             # Clear stale gradients even on a frame where every lifespan has
             # just closed and no optimizer step will run.
@@ -1853,8 +1860,13 @@ def run_online(args: argparse.Namespace) -> dict[str, Any]:
         package = render_change_temporal(
             view, model, pipe, background, timestamp=float(timestamp)
         )
+        optimizer_selected_pairs = torch.zeros_like(active_pairs)
         if optimizer is not None and active_row_count:
             for _update_index in range(config.updates_per_frame):
+                update_pairs = active_visible_pair_mask(active_pairs, package["radii"])
+                if not bool(update_pairs.any()):
+                    break
+                optimizer_selected_pairs |= update_pairs
                 optimizer.zero_grad(set_to_none=True)
                 loss, _parts = oscd_positive_sparsity_loss(
                     view.training_target, package["render"]
@@ -1864,10 +1876,13 @@ def run_online(args: argparse.Namespace) -> dict[str, Any]:
                         f"non-finite online loss at timestamp {timestamp}"
                     )
                 loss.backward()
-                optimizer.step(active_pairs)
+                optimizer.step(update_pairs)
                 package = render_change_temporal(
                     view, model, pipe, background, timestamp=float(timestamp)
                 )
+        optimizer_selected_rows = int(optimizer_selected_pairs.any(dim=1).sum().item())
+        active_but_not_visible_rows = active_row_count - optimizer_selected_rows
+        geometry_thawed_rows = optimizer_selected_rows if geometry_enabled else 0
         inactive_audit = compare_pair_audit(
             inactive_before,
             model,
@@ -1916,6 +1931,8 @@ def run_online(args: argparse.Namespace) -> dict[str, Any]:
                 cuda_peak_memory_bytes=torch.cuda.max_memory_allocated(),
                 predicted_positive_fraction=float(prediction.mean()),
                 algorithm=tracker.algorithm,
+                optimizer_selected_rows=optimizer_selected_rows,
+                active_but_not_visible_rows=active_but_not_visible_rows,
             )
         )
 
@@ -2009,6 +2026,13 @@ def run_online(args: argparse.Namespace) -> dict[str, Any]:
         "optimized_parameters": list(config.thaw_parameters)
         if not config.detector_only
         else [],
+        "optimizer_visibility_contract": "current OPEN row-slot AND current temporal render radius > 0; mask recomputed before every optimizer update",
+        "optimizer_selected_row_observations": int(
+            sum(int(row["optimizer_selected_active_visible_rows"]) for row in frame_rows)
+        ),
+        "active_but_not_visible_row_observations": int(
+            sum(int(row["active_but_not_visible_rows"]) for row in frame_rows)
+        ),
         "detector_only": config.detector_only,
         "cue_mode_contract": (
             "source-faithful Beta-Bernoulli binary observations"

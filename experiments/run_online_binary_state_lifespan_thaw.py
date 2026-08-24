@@ -558,7 +558,7 @@ def _evidence_namespace(delta_a, delta_b, total_mass):
     return SimpleNamespace(delta_a=delta_a, delta_b=delta_b, e_plus=delta_a, e_minus=delta_b, total_mass=total_mass)
 
 
-def frame_diagnostics(*, timestamp: int, frame_name: str, evidence: Any, binary: Mapping[str, Any], model: Any, geometry_thawed_rows: int, base_checksum: str, inactive_audit: Mapping[str, Any], frame_runtime_seconds: float, cuda_peak_memory_bytes: int, pre_predicted_positive_fraction: float, post_predicted_positive_fraction: float) -> dict[str, Any]:
+def frame_diagnostics(*, timestamp: int, frame_name: str, evidence: Any, binary: Mapping[str, Any], model: Any, geometry_thawed_rows: int, base_checksum: str, inactive_audit: Mapping[str, Any], frame_runtime_seconds: float, cuda_peak_memory_bytes: int, pre_predicted_positive_fraction: float, post_predicted_positive_fraction: float, optimizer_selected_rows: int = 0, active_but_not_visible_rows: int = 0) -> dict[str, Any]:
     counts = binary["action_counts"]
     return {
         "timestamp": int(timestamp),
@@ -584,6 +584,8 @@ def frame_diagnostics(*, timestamp: int, frame_name: str, evidence: Any, binary:
         "active_lifespan_count": int((model.current_state_index >= 0).sum().item()),
         "final_active_gs": int((model.current_state_index >= 0).sum().item()),
         "number_of_geometry_thawed_rows": int(geometry_thawed_rows),
+        "optimizer_selected_active_visible_rows": int(optimizer_selected_rows),
+        "active_but_not_visible_rows": int(active_but_not_visible_rows),
         "base_checksum": base_checksum,
         "inactive_parameter_drift_audit": dict(inactive_audit),
         "pre_predicted_positive_fraction": float(pre_predicted_positive_fraction),
@@ -615,6 +617,8 @@ def compact_npz_stats(rows: Sequence[Mapping[str, Any]]) -> dict[str, np.ndarray
         "uncertain_count": np.asarray([r["uncertain_count"] for r in rows], dtype=np.int64),
         "reopen_count": np.asarray([r["reopen_count"] for r in rows], dtype=np.int64),
         "active_lifespan_count": np.asarray([r["active_lifespan_count"] for r in rows], dtype=np.int64),
+        "optimizer_selected_active_visible_rows": np.asarray([r["optimizer_selected_active_visible_rows"] for r in rows], dtype=np.int64),
+        "active_but_not_visible_rows": np.asarray([r["active_but_not_visible_rows"] for r in rows], dtype=np.int64),
         "pre_predicted_positive_fraction": np.asarray([r["pre_predicted_positive_fraction"] for r in rows], dtype=np.float64),
         "post_predicted_positive_fraction": np.asarray([r["post_predicted_positive_fraction"] for r in rows], dtype=np.float64),
         "frame_runtime_seconds": np.asarray([r["frame_runtime_seconds"] for r in rows], dtype=np.float64),
@@ -992,6 +996,7 @@ def run_online(args: argparse.Namespace) -> dict[str, Any]:
     )
     from gaussian_renderer import render_change_temporal
     from scene import GaussianModel
+    from temporal.masked_optimizer import active_visible_pair_mask
 
     config = run_config_from_args(args)
     skip_checkpoint = bool(getattr(args, "skip_checkpoint", False))
@@ -1048,29 +1053,36 @@ def run_online(args: argparse.Namespace) -> dict[str, Any]:
         pre_package = render_change_temporal(view, model, pipe, background, timestamp=float(timestamp))
         pre_pred, pre_score = _prediction_from_package(pre_package, config.evaluation_threshold)
         package = pre_package
+        optimizer_selected_pairs = torch.zeros_like(active_pairs)
         if optimizer is not None and active_count:
             for update_index in range(config.updates_per_frame):
+                update_pairs = active_visible_pair_mask(active_pairs, package["radii"])
+                if not bool(update_pairs.any()):
+                    break
+                optimizer_selected_pairs |= update_pairs
                 optimizer.zero_grad(set_to_none=True)
                 loss, _parts = oscd_positive_sparsity_loss(view.training_target, package["render"])
                 if not bool(torch.isfinite(loss)):
                     raise FloatingPointError(f"non-finite online loss at timestamp {timestamp}")
                 loss.backward()
                 if update_index == 0:
-                    gradient_audit = _inactive_gradient_audit(model, active_pairs)
+                    gradient_audit = _inactive_gradient_audit(model, update_pairs)
                     inactive_gradient_violation_count += int(gradient_audit["count"])
                     inactive_gradient_max_abs = max(
                         inactive_gradient_max_abs,
                         float(gradient_audit["max_abs"]),
                     )
-                optimizer.step(active_pairs)
+                optimizer.step(update_pairs)
                 package = render_change_temporal(view, model, pipe, background, timestamp=float(timestamp))
+        optimizer_selected_rows = int(optimizer_selected_pairs.any(dim=1).sum().item())
+        active_but_not_visible_rows = active_count - optimizer_selected_rows
         inactive_audit = closed_audit.status()
         post_pred, post_score = _prediction_from_package(package, config.evaluation_threshold)
         pre_predictions.append(pre_pred); post_predictions.append(post_pred)
         if args.visualization_dir is not None:
             score_maps.append(post_score.mul(255).round().to(torch.uint8).numpy())
             raw_render_maps.append(package["render"].detach().clamp(0, 1).mul(255).round().to(torch.uint8).permute(1, 2, 0).cpu().numpy())
-        rows.append(frame_diagnostics(timestamp=timestamp, frame_name=record.name, evidence=evidence, binary=binary, model=model, geometry_thawed_rows=active_count if any(n != "dc" for n in config.thaw_parameters) else 0, base_checksum=checksum, inactive_audit=inactive_audit, frame_runtime_seconds=time.time() - frame_started, cuda_peak_memory_bytes=torch.cuda.max_memory_allocated(), pre_predicted_positive_fraction=float(pre_pred.mean()), post_predicted_positive_fraction=float(post_pred.mean())))
+        rows.append(frame_diagnostics(timestamp=timestamp, frame_name=record.name, evidence=evidence, binary=binary, model=model, geometry_thawed_rows=optimizer_selected_rows if any(n != "dc" for n in config.thaw_parameters) else 0, optimizer_selected_rows=optimizer_selected_rows, active_but_not_visible_rows=active_but_not_visible_rows, base_checksum=checksum, inactive_audit=inactive_audit, frame_runtime_seconds=time.time() - frame_started, cuda_peak_memory_bytes=torch.cuda.max_memory_allocated(), pre_predicted_positive_fraction=float(pre_pred.mean()), post_predicted_positive_fraction=float(post_pred.mean())))
     closed_slot_audit = closed_audit.verify(model, optimizer)
     if not closed_slot_audit["passed"]:
         raise RuntimeError(f"closed slot drift after future updates: {closed_slot_audit}")
@@ -1128,7 +1140,7 @@ def run_online(args: argparse.Namespace) -> dict[str, Any]:
         "inactive_gradient_first_step_violations": int(
             inactive_gradient_violation_count
         ),
-        "inactive_gradient_audit_scope": "first_optimizer_step_per_frame",
+        "inactive_gradient_audit_scope": "first_optimizer_step_per_frame_inactive_or_current_view_invisible",
         "inactive_gradient_max_abs": float(inactive_gradient_max_abs),
         "open_zero_initialization_audit": open_audit_totals,
         "zero_init_violations": int(
@@ -1142,6 +1154,9 @@ def run_online(args: argparse.Namespace) -> dict[str, Any]:
         "final_active_gs": int((model.current_state_index >= 0).sum().item()),
         "fixed_topology": True,
         "optimized_parameters": list(config.thaw_parameters) if not config.detector_only else [],
+        "optimizer_visibility_contract": "current OPEN row-slot AND current temporal render radius > 0; mask recomputed before every optimizer update",
+        "optimizer_selected_row_observations": int(sum(int(row["optimizer_selected_active_visible_rows"]) for row in rows)),
+        "active_but_not_visible_row_observations": int(sum(int(row["active_but_not_visible_rows"]) for row in rows)),
         "detector_only": config.detector_only,
         "cue_cache_metadata": cue_metadata,
         "camera_intrinsics": None if intrinsics is None else intrinsics.tolist(),
