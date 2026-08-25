@@ -40,6 +40,7 @@ NEVER_OPEN row는 초기에는 reference geometry/opacity와 zero change DC를
 | OPEN only | 0.5330 | 0.6176 | 0.5792 | 0.5779 | 0.7044 | 0.7202 | 0.8619 |
 | 고정 NEVER_OPEN occluder | 0.4710 | 0.4440 | 0.4535 | 0.4557 | 0.5872 | 0.7065 | 0.6893 |
 | NEVER_OPEN DC+opacity | **0.6157** | **0.6615** | **0.6266** | **0.6351** | **0.7539** | **0.7695** | **0.8654** |
+| NEVER_OPEN DC+opacity + O-SCD densify | **0.6232** | **0.6713** | **0.6383** | **0.6449** | **0.7618** | **0.7680** | **0.8823** |
 | 원본 O-SCD online | 0.5915 | 0.6783 | 0.6666 | 0.6471 | 0.7619 | - | - |
 
 DC+opacity plasticity는 OPEN-only 대비 weighted mIoU를 `+0.0572`, F1을
@@ -50,6 +51,21 @@ DC+opacity plasticity는 OPEN-only 대비 weighted mIoU를 `+0.0572`, F1을
 원본 O-SCD 수치는 동일한 independent 16-update protocol이지만 online
 gradient densification을 포함한다. 따라서 마지막 `0.0120` 차이를 오직
 lifespan으로 귀속할 수는 없다.
+
+동일하게 local update 4에서 원본 O-SCD gradient clone/split을 켜고 추가
+opacity/size pruning은 끈 matched run에서는 weighted mIoU/F1이
+`0.6449/0.7618`로 상승했다. Density-off 대비 `+0.0098/+0.0078`이며,
+원본 O-SCD와는 `-0.0023/-0.0002` 차이다. SC1은 원본보다 `+0.0316`
+높았고 SC2/SC3은 `-0.0070/-0.0283` 낮았다.
+
+| Scope | 초기 GS | 최종 GS | 순증가 | Clone | Split source | Split child |
+|---|---:|---:|---:|---:|---:|---:|
+| SC1 | 1,283,501 | 1,283,570 | 69 | 0 | 69 | 138 |
+| SC2 | 1,283,501 | 1,283,816 | 315 | 38 | 277 | 554 |
+| SC3 | 1,283,501 | 1,283,655 | 154 | 2 | 152 | 304 |
+
+세 run의 순증가는 538 GS이며 원본 O-SCD의 832 GS보다 작다. 표의 removed는
+추가 pruning이 아니라 split source를 두 child로 교체하면서 발생한 제거다.
 
 ## Lifecycle 변화
 
@@ -85,6 +101,8 @@ responsibility와 posterior에도 feedback되어 lifecycle event 자체가 달�
 - active-to-active false split: `0`
 - DC+opacity 세 run 총 runtime: `219.76 s`
 - peak CUDA memory: `4.385 GiB`
+- DC+opacity + densify 총 runtime: `226.53 s`
+- DC+opacity + densify peak CUDA memory: `5.109 GiB`
 - 전체 테스트: `415 passed`
 
 출력은 다음 위치에 생성했으며 repository에 commit하지 않는다.
@@ -92,6 +110,7 @@ responsibility와 posterior에도 feedback되어 lifecycle event 자체가 달�
 ```text
 outputs/escd_dynamic_open_or_never_open_u16_seed0_20260825/
 outputs/escd_dynamic_open_or_never_open_dc_opacity_u16_seed0_20260825/
+outputs/escd_open_never_dc_opacity_oscd_densify_u16_seed0_20260825/
 ```
 
 실행 예:
