@@ -11,7 +11,7 @@
 
 import torch
 import numpy as np
-from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
+from utils.general_utils import inverse_sigmoid, get_expon_lr_func
 from torch import nn
 import os
 from utils.system_utils import mkdir_p
@@ -20,6 +20,7 @@ from utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
+from utils.fastgs_topology import fastgs_split_children
 
 class GaussianModel:
 
@@ -503,12 +504,13 @@ class GaussianModel:
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
 
-        stds = self.get_scaling[selected_pts_mask].repeat(N,1)
-        means =torch.zeros((stds.size(0), 3),device="cuda")
-        samples = torch.normal(mean=means, std=stds)
-        rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N,1,1)
-        new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask].repeat(N, 1)
-        new_scaling = self.scaling_inverse_activation(self.get_scaling[selected_pts_mask].repeat(N,1) / (0.8*N))
+        new_xyz, new_scaling = fastgs_split_children(
+            self.get_xyz[selected_pts_mask],
+            self.get_scaling[selected_pts_mask],
+            self._rotation[selected_pts_mask],
+            self.scaling_inverse_activation,
+            children_per_source=N,
+        )
         new_rotation = self._rotation[selected_pts_mask].repeat(N,1)
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N,1,1)
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
@@ -636,12 +638,13 @@ class GaussianModel:
         mask = torch.logical_and(metric_mask, filter)
         selected_pts_mask[:mask.shape[0]] = mask
 
-        stds = self.get_scaling[selected_pts_mask].repeat(N,1)
-        means =torch.zeros((stds.size(0), 3),device="cuda")
-        samples = torch.normal(mean=means, std=stds)
-        rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N,1,1)
-        new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask].repeat(N, 1)
-        new_scaling = self.scaling_inverse_activation(self.get_scaling[selected_pts_mask].repeat(N,1) / (0.8*N))
+        new_xyz, new_scaling = fastgs_split_children(
+            self.get_xyz[selected_pts_mask],
+            self.get_scaling[selected_pts_mask],
+            self._rotation[selected_pts_mask],
+            self.scaling_inverse_activation,
+            children_per_source=N,
+        )
         new_rotation = self._rotation[selected_pts_mask].repeat(N,1)
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N,1,1)
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
@@ -750,4 +753,3 @@ class GaussianModel:
         scores_mask = pruning_score > 0.9
         final_prune = torch.logical_or(prune_mask, scores_mask)
         self.prune_points_fastgs(final_prune)
-

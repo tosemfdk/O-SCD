@@ -42,6 +42,13 @@ from .change_evidence import (
     evidence_counts,
 )
 from .change_model import CLOSED, EMPTY, OPEN, TemporalChangeModel
+from .active_density_topology import (
+    TemporalDensityResult,
+    TemporalDensityScore,
+    TemporalTopologyManager,
+    aggregate_temporal_view_evidence,
+    compute_temporal_multiview_score,
+)
 from .checkpoint import load_temporal_model
 from .fusion import compute_growth_replay_regularization, compute_ssf_loss
 from .geometry_change_model import TemporalGeometryChangeModel
@@ -167,6 +174,11 @@ __all__ = [
     "masked_xfeat_subset",
     "signed_mask_selection",
     "TemporalChangeModel",
+    "TemporalDensityResult",
+    "TemporalDensityScore",
+    "TemporalTopologyManager",
+    "aggregate_temporal_view_evidence",
+    "compute_temporal_multiview_score",
     "TemporalGeometryChangeModel",
     "TemporalSharedGeometryChangeModel",
     "compute_growth_replay_regularization",
