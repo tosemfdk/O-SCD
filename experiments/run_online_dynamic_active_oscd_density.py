@@ -59,7 +59,7 @@ from experiments.run_ref_sc1_change_cue_density import (
 )
 
 
-SCOPES = ("scene_change1", "scene_change2", "scene_change3")
+SCOPES = ("scene_change1", "scene_change2", "scene_change3", "continuous")
 DENSITY_POLICIES = ("none", "active_oscd")
 RENDER_SUPPORT_MODES = (
     "open_only",
@@ -315,7 +315,7 @@ def _sample_training_view(
 
 def _validate_args(args: argparse.Namespace) -> None:
     if args.scope not in SCOPES:
-        raise ValueError("only independent SC1/SC2/SC3 scopes are supported")
+        raise ValueError("unknown independent/continuous ESCD scope")
     if args.density_policy not in DENSITY_POLICIES:
         raise ValueError("unknown density policy")
     if args.render_support_mode not in RENDER_SUPPORT_MODES:
@@ -714,6 +714,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if event_diag["active_to_active_false_split_count"] or event_diag["reused_slot_violations"]:
         raise RuntimeError(f"lifespan invariant failed: {event_diag}")
 
+    diagnostic_boundaries = (95, 199) if args.scope == "continuous" else ()
     summary = {
         "schema_version": 1,
         "script": "experiments/run_online_dynamic_active_oscd_density.py",
@@ -788,7 +789,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         },
         "metrics": metrics,
         **event_diag,
-        **same_scene_repeated_transition_diagnostics(lifecycle_events, ()),
+        **same_scene_repeated_transition_diagnostics(
+            lifecycle_events, diagnostic_boundaries
+        ),
         "posterior_diagnostics": posterior_run_diagnostics(frame_rows),
         "final_active_gs": int(topology.active_mask().sum().item()),
         "closed_row_persistence_audit": closed_result,
@@ -799,6 +802,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "gt_used_in_causal_loop": False,
         "gt_loaded_after_inference_only": True,
         "manual_boundaries_used": False,
+        "manual_boundaries_used_for_posthoc_diagnostics_only": list(
+            diagnostic_boundaries
+        ),
         "runtime_seconds": time.time() - started,
         "peak_cuda_memory_bytes": int(torch.cuda.max_memory_allocated()),
         "cue_cache_metadata": cue_metadata,

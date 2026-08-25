@@ -47,6 +47,19 @@ def test_runner_exposes_open_or_never_open_render_ablation():
     assert args.render_support_mode == "open_or_never_open"
 
 
+def test_runner_accepts_full_continuous_escd_scope():
+    args = parse_args(
+        [
+            "--scope",
+            "continuous",
+            "--output-dir",
+            str(Path("outputs/test-dynamic-active-density-continuous")),
+        ]
+    )
+    assert args.scope == "continuous"
+    assert args.max_frames is None
+
+
 def test_never_open_appearance_mode_uses_parameter_specific_masks():
     active = np.array([True, False, False])
     never_open = np.array([False, True, False])

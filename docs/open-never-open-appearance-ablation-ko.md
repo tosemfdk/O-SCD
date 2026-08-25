@@ -67,6 +67,36 @@ opacity/size pruning은 끈 matched run에서는 weighted mIoU/F1이
 세 run의 순증가는 538 GS이며 원본 O-SCD의 832 GS보다 작다. 표의 removed는
 추가 pruning이 아니라 split source를 두 child로 교체하면서 발생한 제거다.
 
+## 연속 `ref -> SC1 -> SC2 -> SC3`
+
+독립 실행과 동일한 설정을 하나의 304-frame stream에서 state를 유지한 채
+실행했다. Training replay는 원본 O-SCD처럼 현재 frame 또는 임의의 이미
+처리된 causal view를 사용하며, manual boundary는 inference에 사용하지
+않았다.
+
+| 조건 | SC1 mIoU | SC2 mIoU | SC3 mIoU | 전체 mIoU | 전체 F1 |
+|---|---:|---:|---:|---:|---:|
+| NEVER_OPEN DC+opacity + densify, 연속 | **0.6228** | 0.5232 | 0.3175 | 0.4833 | 0.6028 |
+| 원본 O-SCD online, 연속 | 0.5961 | **0.5468** | **0.4183** | **0.5178** | **0.6401** |
+
+SC1은 원본보다 `+0.0268` 높지만 SC2/SC3은 `-0.0236/-0.1008`
+낮아지고, 전체 mIoU/F1은 원본보다 `-0.0345/-0.0373` 낮다. 따라서 독립
+single-state 성능은 거의 복구했지만 evolving stream의 누적 오염은 해결하지
+못했다.
+
+연속 run lifecycle은 OPEN/CLOSE/REOPEN `55,886/13,954/3,295`, post-hoc
+same-state repeated transition `9,007`, final ACTIVE `42,701`이었다. Density는
+clone 210, split source 559, split child 1,118로 GS가 `1,283,501 ->
+1,284,270` 증가했다. CLOSED drift, 허용 마스크 밖 gradient, active-to-active
+false split, reused-slot violation은 모두 0이었다.
+
+이 ablation에서 NEVER_OPEN DC/opacity는 lifecycle OPEN 이전에도 학습되고
+렌더링된다. 따라서 아직 OPEN되지 않은 appearance에는 닫을 lifespan 자체가
+없어 state가 바뀌어도 stale cue가 남을 수 있다. 또한 causal이지만 모든 과거
+state를 섞는 O-SCD replay가 하나의 persistent parameter bank를 이전 cue로
+계속 학습시킨다. 이 두 coupling이 연속 SC2/SC3 하락의 유력 원인이며, 현재
+결과만으로 각각의 기여도를 분리할 수는 없다.
+
 ## Lifecycle 변화
 
 | 조건 | OPEN | CLOSE | REOPEN |
@@ -103,7 +133,9 @@ responsibility와 posterior에도 feedback되어 lifecycle event 자체가 달�
 - peak CUDA memory: `4.385 GiB`
 - DC+opacity + densify 총 runtime: `226.53 s`
 - DC+opacity + densify peak CUDA memory: `5.109 GiB`
-- 전체 테스트: `415 passed`
+- 연속 DC+opacity + densify runtime: `196.11 s`
+- 연속 DC+opacity + densify peak CUDA memory: `6.605 GiB`
+- 전체 테스트: `416 passed`
 
 출력은 다음 위치에 생성했으며 repository에 commit하지 않는다.
 
@@ -111,6 +143,7 @@ responsibility와 posterior에도 feedback되어 lifecycle event 자체가 달�
 outputs/escd_dynamic_open_or_never_open_u16_seed0_20260825/
 outputs/escd_dynamic_open_or_never_open_dc_opacity_u16_seed0_20260825/
 outputs/escd_open_never_dc_opacity_oscd_densify_u16_seed0_20260825/
+outputs/escd_open_never_dc_opacity_oscd_densify_continuous_u16_seed0_20260825/
 ```
 
 실행 예:
