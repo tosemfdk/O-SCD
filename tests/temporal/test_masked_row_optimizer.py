@@ -58,3 +58,31 @@ def test_masked_row_adam_supports_all_direct_gaussian_tensor_shapes():
         assert torch.count_nonzero(parameter[0]) == 0
         assert torch.count_nonzero(parameter[1]) > 0
         assert torch.count_nonzero(parameter[2]) == 0
+
+
+def test_masked_row_adam_accepts_distinct_parameter_row_masks():
+    parameters = {
+        "dc": nn.Parameter(torch.zeros(3, 1)),
+        "xyz": nn.Parameter(torch.zeros(3, 1)),
+        "opacity": nn.Parameter(torch.zeros(3, 1)),
+    }
+    optimizer = MaskedRowAdam(
+        parameters,
+        thaw_names=tuple(parameters),
+        lrs={name: 0.01 for name in parameters},
+    )
+    for parameter in parameters.values():
+        parameter.grad = torch.ones_like(parameter)
+    optimizer.step(
+        {
+            "dc": torch.tensor([True, True, False]),
+            "xyz": torch.tensor([True, False, False]),
+            "opacity": torch.tensor([True, True, False]),
+        }
+    )
+
+    assert torch.count_nonzero(parameters["dc"][:2]) == 2
+    assert torch.count_nonzero(parameters["opacity"][:2]) == 2
+    assert torch.count_nonzero(parameters["xyz"][0]) == 1
+    assert torch.count_nonzero(parameters["xyz"][1:]) == 0
+    assert optimizer.state[parameters["xyz"]]["step"].tolist() == [1, 0, 0]

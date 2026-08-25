@@ -168,15 +168,60 @@ class PersistentGaussianLifespanModel(nn.Module):
 
     def get_active_render_attributes(self, timestamp: float) -> dict[str, torch.Tensor]:
         """Return direct parameters, gradient-detaching every inactive row."""
+        return self._get_render_attributes(timestamp, include_never_open=False)
+
+    def get_open_or_never_open_render_attributes(
+        self,
+        timestamp: float,
+        *,
+        train_never_open_dc_opacity: bool = False,
+    ) -> dict[str, torch.Tensor]:
+        """Render OPEN rows plus fixed zero-change occluders that never opened.
+
+        A never-opened row still represents the reference surface.  Keeping its
+        opacity in the compositor restores the alpha/transmittance occlusion
+        that the original O-SCD change bank receives from zero-DC Gaussians.
+        By default such rows remain detached and emit zero change color.  The
+        explicit ``train_never_open_dc_opacity`` ablation lets only their DC
+        and opacity adapt while geometry remains detached.
+
+        Once a row has opened, a later CLOSE hides it completely because its
+        persistent geometry/opacity may describe stale changed content.
+        """
+        return self._get_render_attributes(
+            timestamp,
+            include_never_open=True,
+            train_never_open_dc_opacity=train_never_open_dc_opacity,
+        )
+
+    def _get_render_attributes(
+        self,
+        timestamp: float,
+        *,
+        include_never_open: bool,
+        train_never_open_dc_opacity: bool = False,
+    ) -> dict[str, torch.Tensor]:
+        if train_never_open_dc_opacity and not include_never_open:
+            raise ValueError("never-open appearance training requires render support")
         indices = self.get_active_state_indices(timestamp)
         active = indices >= 0
-        dc = self._active_rows(self.change_dc, active) * active[:, None, None]
-        opacity_raw = self._active_rows(self.opacity, active)
+        never_open = self.num_states == 0
+        render_support = active | (never_open if include_never_open else False)
+        appearance_trainable = active | (
+            never_open if train_never_open_dc_opacity else False
+        )
+        if train_never_open_dc_opacity:
+            dc = self._active_rows(self.change_dc, appearance_trainable)
+            dc = dc * render_support[:, None, None]
+        else:
+            dc = self._active_rows(self.change_dc, active) * active[:, None, None]
+        opacity_raw = self._active_rows(self.opacity, appearance_trainable)
         return {
             "dc": dc,
             "features_rest": self._active_rows(self.features_rest, active),
             "xyz": self._active_rows(self.xyz, active),
-            "opacity": self.base.opacity_activation(opacity_raw) * active[:, None],
+            "opacity": self.base.opacity_activation(opacity_raw)
+            * render_support[:, None],
             "scaling": self.base.scaling_activation(
                 self._active_rows(self.scaling, active)
             ),
@@ -184,6 +229,9 @@ class PersistentGaussianLifespanModel(nn.Module):
                 self._active_rows(self.rotation, active)
             ),
             "active": active,
+            "never_open": never_open,
+            "appearance_trainable": appearance_trainable,
+            "render_support": render_support,
             "indices": indices,
         }
 

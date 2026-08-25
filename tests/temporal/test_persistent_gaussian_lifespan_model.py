@@ -113,3 +113,70 @@ def test_inactive_rows_are_gradient_detached_but_active_rows_are_trainable():
         assert parameter.grad is not None
         assert torch.count_nonzero(parameter.grad[0]) > 0
         assert torch.count_nonzero(parameter.grad[1]) == 0
+
+
+def test_never_open_rows_render_as_fixed_zero_change_occluders_but_closed_rows_hide():
+    model = PersistentGaussianLifespanModel(make_bank(3), max_states=2)
+    model.reset_all_lifespans_closed()
+    model.open_rows([0, 2], timestamp=0)
+    model.close_rows([2], timestamp=1)
+
+    attrs = model.get_open_or_never_open_render_attributes(1.0)
+
+    assert attrs["active"].tolist() == [True, False, False]
+    assert attrs["never_open"].tolist() == [False, True, False]
+    assert attrs["render_support"].tolist() == [True, True, False]
+    assert torch.count_nonzero(attrs["dc"][1]) == 0
+    assert attrs["opacity"][0].item() > 0
+    assert attrs["opacity"][1].item() > 0
+    assert attrs["opacity"][2].item() == 0
+
+    loss = (
+        attrs["dc"].sum()
+        + attrs["xyz"].sum()
+        + attrs["features_rest"].sum()
+        + attrs["opacity"].sum()
+        + attrs["scaling"].sum()
+        + attrs["rotation"].sum()
+    )
+    loss.backward()
+    for _name, parameter in model.persistent_parameter_items():
+        assert parameter.grad is not None
+        assert torch.count_nonzero(parameter.grad[0]) > 0
+        assert torch.count_nonzero(parameter.grad[1]) == 0
+        assert torch.count_nonzero(parameter.grad[2]) == 0
+
+
+def test_never_open_rows_can_train_dc_opacity_without_geometry():
+    model = PersistentGaussianLifespanModel(make_bank(3), max_states=2)
+    model.reset_all_lifespans_closed()
+    model.open_rows([0], timestamp=0)
+    model.open_rows([2], timestamp=0)
+    model.close_rows([2], timestamp=1)
+
+    attrs = model.get_open_or_never_open_render_attributes(
+        1.0, train_never_open_dc_opacity=True
+    )
+    assert attrs["appearance_trainable"].tolist() == [True, True, False]
+    assert attrs["render_support"].tolist() == [True, True, False]
+    loss = (
+        attrs["dc"].sum()
+        + attrs["xyz"].sum()
+        + attrs["features_rest"].sum()
+        + attrs["opacity"].sum()
+        + attrs["scaling"].sum()
+        + attrs["rotation"].sum()
+    )
+    loss.backward()
+
+    assert torch.count_nonzero(model.change_dc.grad[1]) > 0
+    assert torch.count_nonzero(model.opacity.grad[1]) > 0
+    for parameter in (
+        model.xyz,
+        model.features_rest,
+        model.scaling,
+        model.rotation,
+    ):
+        assert torch.count_nonzero(parameter.grad[1]) == 0
+    for _name, parameter in model.persistent_parameter_items():
+        assert torch.count_nonzero(parameter.grad[2]) == 0

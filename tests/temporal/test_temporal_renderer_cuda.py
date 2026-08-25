@@ -25,6 +25,7 @@ from utils.general_utils import inverse_sigmoid  # noqa: E402
 from utils.graphics_utils import getProjectionMatrix  # noqa: E402
 from utils.sh_utils import RGB2SH  # noqa: E402
 from temporal import (  # noqa: E402
+    PersistentGaussianLifespanModel,
     TemporalGeometryChangeModel,
     TemporalSharedGeometryChangeModel,
 )
@@ -248,6 +249,57 @@ def test_signed_removal_influence_marks_dark_occluder_and_bright_change():
 
     assert signed[0] < 0  # dark front Gaussian suppresses the bright one
     assert signed[1] > 0  # bright rear Gaussian adds change brightness
+
+
+def test_never_open_zero_dc_gaussian_occludes_open_change_gaussian():
+    device = torch.device("cuda")
+    base = GaussianModel(sh_degree=3, active_sh_degree=0)
+    base._xyz = nn.Parameter(
+        torch.tensor([[0.0, 0.0, 2.0], [0.0, 0.0, 3.0]], device=device)
+    )
+    base._features_dc = nn.Parameter(
+        RGB2SH(torch.tensor([[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]], device=device))
+        .view(2, 1, 3)
+    )
+    base._features_rest = nn.Parameter(torch.zeros((2, 15, 3), device=device))
+    base._opacity = nn.Parameter(
+        inverse_sigmoid(torch.full((2, 1), 0.8, device=device))
+    )
+    base._scaling = nn.Parameter(torch.full((2, 3), math.log(0.3), device=device))
+    rotation = torch.zeros((2, 4), device=device)
+    rotation[:, 0] = 1.0
+    base._rotation = nn.Parameter(rotation)
+    model = PersistentGaussianLifespanModel(base, max_states=2)
+    model.reset_all_lifespans_closed()
+    model.open_rows([1], timestamp=0)
+
+    fov = math.radians(60.0)
+    world_view = torch.eye(4, device=device)
+    projection = getProjectionMatrix(0.01, 100.0, fov, fov).t().to(device)
+    full_projection = world_view.unsqueeze(0).bmm(projection.unsqueeze(0)).squeeze(0)
+    camera = MiniCam(64, 64, fov, fov, 0.01, 100.0, world_view, full_projection)
+    pipe = SimpleNamespace(
+        compute_cov3D_python=False,
+        convert_SHs_python=False,
+        debug=False,
+    )
+    background = torch.zeros(3, device=device)
+
+    open_only = render_change_temporal(
+        camera, model, pipe, background, timestamp=0
+    )["render"]
+    with_occluder = render_change_temporal(
+        camera,
+        model,
+        pipe,
+        background,
+        timestamp=0,
+        include_never_open_occluders=True,
+    )["render"]
+
+    center = (slice(None), 32, 32)
+    assert open_only[center].mean() > 0
+    assert with_occluder[center].mean() < open_only[center].mean()
 
 
 def test_geometry_overrides_validate_and_receive_only_active_state_gradients():

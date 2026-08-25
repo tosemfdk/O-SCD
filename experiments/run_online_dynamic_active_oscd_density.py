@@ -2,7 +2,11 @@
 
 The current mutable Gaussian bank is both detector support and representation:
 
-``mutable alpha-T evidence -> binary ACTIVE/INACTIVE -> active-visible training``
+``mutable alpha-T evidence -> binary ACTIVE/INACTIVE -> selective training``
+
+The default remains OPEN-only rendering/training.  Two explicit occlusion
+ablations can additionally keep NEVER_OPEN rows in the compositor: fixed
+zero-DC occluders, or DC/opacity-plastic occluders with frozen geometry.
 
 At local update four of a 16-update online schedule, ACTIVE rows alone may be
 cloned/split by the original O-SCD screen-space gradient rule.  The same event
@@ -42,7 +46,6 @@ from experiments.run_online_binary_state_lifespan_thaw import (
 from experiments.run_online_persistent_gaussian_lifespan import (
     DIRECT_PARAMETER_NAMES,
     _cpu_tree,
-    _inactive_gradient_audit,
     _write_csv,
 )
 from experiments.run_ref_sc1_change_cue_density import (
@@ -58,6 +61,53 @@ from experiments.run_ref_sc1_change_cue_density import (
 
 SCOPES = ("scene_change1", "scene_change2", "scene_change3")
 DENSITY_POLICIES = ("none", "active_oscd")
+RENDER_SUPPORT_MODES = (
+    "open_only",
+    "open_or_never_open",
+    "open_or_never_open_dc_opacity",
+)
+
+
+def _includes_never_open(mode: str) -> bool:
+    return mode in {"open_or_never_open", "open_or_never_open_dc_opacity"}
+
+
+def _trains_never_open_appearance(mode: str) -> bool:
+    return mode == "open_or_never_open_dc_opacity"
+
+
+def _optimizer_row_masks(
+    mode: str,
+    *,
+    active_visible: torch.Tensor,
+    never_open_visible: torch.Tensor,
+) -> torch.Tensor | dict[str, torch.Tensor]:
+    if not _trains_never_open_appearance(mode):
+        return active_visible
+    appearance = active_visible | never_open_visible
+    return {
+        name: appearance if name in {"dc", "opacity"} else active_visible
+        for name in DIRECT_PARAMETER_NAMES
+    }
+
+
+def _gradient_audit(
+    model: Any,
+    masks: torch.Tensor | dict[str, torch.Tensor],
+) -> dict[str, float | int]:
+    violations = 0
+    maximum = 0.0
+    for name, parameter in model.persistent_parameter_items():
+        if parameter.grad is None:
+            continue
+        selected = masks if isinstance(masks, torch.Tensor) else masks[name]
+        gradient = parameter.grad.detach().reshape(parameter.shape[0], -1)
+        outside = gradient[~selected]
+        nonzero = int(torch.count_nonzero(outside).item())
+        violations += nonzero
+        if nonzero:
+            maximum = max(maximum, float(outside.abs().max().item()))
+    return {"count": int(violations), "max_abs": float(maximum)}
 
 
 def positive_int(value: str) -> int:
@@ -268,6 +318,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("only independent SC1/SC2/SC3 scopes are supported")
     if args.density_policy not in DENSITY_POLICIES:
         raise ValueError("unknown density policy")
+    if args.render_support_mode not in RENDER_SUPPORT_MODES:
+        raise ValueError("unknown render support mode")
     if args.max_frames is not None and args.max_frames > SCOPE_MAX_FRAMES[args.scope]:
         raise ValueError("max_frames exceeds the selected independent scope")
     if not 0 <= args.densify_update_index < args.updates_per_frame:
@@ -426,7 +478,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
         optimizer.zero_grad(set_to_none=True)
         pre_package = render_change_temporal(
-            current_view, model, pipe, background, timestamp=float(timestamp)
+            current_view,
+            model,
+            pipe,
+            background,
+            timestamp=float(timestamp),
+            include_never_open_occluders=(
+                _includes_never_open(args.render_support_mode)
+            ),
+            train_never_open_dc_opacity=_trains_never_open_appearance(
+                args.render_support_mode
+            ),
         )
         pre_prediction, _ = _prediction_from_package(
             pre_package, config.evaluation_threshold
@@ -434,6 +496,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         pre_predictions.append(pre_prediction)
 
         selected_stable_ids: list[torch.Tensor] = []
+        selected_never_open_stable_ids: list[torch.Tensor] = []
         sampled_view_indices: list[int] = []
         density_result = None
         density_event = {
@@ -455,12 +518,44 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             )
             sampled_view_indices.append(sampled_index)
             package = render_change_temporal(
-                train_view, model, pipe, background, timestamp=float(timestamp)
+                train_view,
+                model,
+                pipe,
+                background,
+                timestamp=float(timestamp),
+                include_never_open_occluders=(
+                    _includes_never_open(args.render_support_mode)
+                ),
+                train_never_open_dc_opacity=_trains_never_open_appearance(
+                    args.render_support_mode
+                ),
             )
             active = topology.active_mask()
-            selected = active & (package["radii"].detach() > 0)
-            if bool(selected.any()):
-                selected_stable_ids.append(topology.stable_id[selected].detach().clone())
+            visible = package["radii"].detach() > 0
+            selected = active & visible
+            never_open_selected = (model.num_states == 0) & visible
+            optimizer_masks = _optimizer_row_masks(
+                args.render_support_mode,
+                active_visible=selected,
+                never_open_visible=never_open_selected,
+            )
+            any_selected = selected | (
+                never_open_selected
+                if _trains_never_open_appearance(args.render_support_mode)
+                else False
+            )
+            if bool(any_selected.any()):
+                if bool(selected.any()):
+                    selected_stable_ids.append(
+                        topology.stable_id[selected].detach().clone()
+                    )
+                if (
+                    _trains_never_open_appearance(args.render_support_mode)
+                    and bool(never_open_selected.any())
+                ):
+                    selected_never_open_stable_ids.append(
+                        topology.stable_id[never_open_selected].detach().clone()
+                    )
                 optimizer.zero_grad(set_to_none=True)
                 loss, _parts = oscd_positive_sparsity_loss(
                     train_view.training_target, package["render"]
@@ -476,7 +571,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         max_features_rest_gradient,
                         float(rest_gradient.detach().abs().max().item()),
                     )
-                audit = _inactive_gradient_audit(model, selected)
+                audit = _gradient_audit(model, optimizer_masks)
                 inactive_gradient_violations += int(audit["count"])
                 inactive_gradient_max_abs = max(
                     inactive_gradient_max_abs, float(audit["max_abs"])
@@ -484,7 +579,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 topology.add_gradient_stats(
                     package["viewspace_points"], package["radii"], active
                 )
-                optimizer.step(selected)
+                optimizer.step(optimizer_masks)
 
             if (
                 args.density_policy == "active_oscd"
@@ -531,7 +626,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             raise RuntimeError("online replay accessed a future view")
 
         post_package = render_change_temporal(
-            current_view, model, pipe, background, timestamp=float(timestamp)
+            current_view,
+            model,
+            pipe,
+            background,
+            timestamp=float(timestamp),
+            include_never_open_occluders=(
+                _includes_never_open(args.render_support_mode)
+            ),
+            train_never_open_dc_opacity=_trains_never_open_appearance(
+                args.render_support_mode
+            ),
         )
         post_prediction, _ = _prediction_from_package(
             post_package, config.evaluation_threshold
@@ -540,6 +645,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         selected_count = (
             int(torch.unique(torch.cat(selected_stable_ids)).numel())
             if selected_stable_ids
+            else 0
+        )
+        never_open_selected_count = (
+            int(torch.unique(torch.cat(selected_never_open_stable_ids)).numel())
+            if selected_never_open_stable_ids
             else 0
         )
         counts = binary["action_counts"]
@@ -571,6 +681,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "q_stats": binary["q_stats"],
                 "active_gaussian_count": active_count,
                 "optimizer_selected_active_visible_rows": selected_count,
+                "optimizer_selected_never_open_visible_rows": never_open_selected_count,
                 "clone_count": int(density_event["clone_child_count"]),
                 "split_source_count": int(density_event["split_source_count"]),
                 "split_child_count": int(density_event["split_child_count"]),
@@ -606,7 +717,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     summary = {
         "schema_version": 1,
         "script": "experiments/run_online_dynamic_active_oscd_density.py",
-        "contract": "equal_status_mutable_rchange_active_only_oscd_density",
+        "contract": (
+            "equal_status_mutable_rchange_never_open_appearance"
+            if _trains_never_open_appearance(args.render_support_mode)
+            else "equal_status_mutable_rchange_active_only_oscd_density"
+        ),
         "scope": SCOPE_LABELS[args.scope],
         "scope_key": args.scope,
         "frames": len(records),
@@ -621,9 +736,27 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         },
         "representation": {
             "gaussian_classes": "none; every row has equal mutable status",
-            "only_distinction": "ACTIVE vs INACTIVE",
+            "render_support_mode": args.render_support_mode,
+            "render_support_contract": (
+                "OPEN union NEVER_OPEN; NEVER_OPEN DC/opacity trainable; CLOSED hidden"
+                if _trains_never_open_appearance(args.render_support_mode)
+                else (
+                    "OPEN union fixed zero-DC NEVER_OPEN; CLOSED hidden"
+                    if _includes_never_open(args.render_support_mode)
+                    else "OPEN only"
+                )
+            ),
+            "lifecycle_render_distinction": (
+                "OPEN vs NEVER_OPEN vs CLOSED"
+                if _includes_never_open(args.render_support_mode)
+                else "OPEN vs non-OPEN"
+            ),
             "parameters": list(DIRECT_PARAMETER_NAMES),
-            "optimizer_mask": "currently ACTIVE and visible in sampled causal training view",
+            "optimizer_mask": (
+                "OPEN-visible all attributes; NEVER_OPEN-visible DC/opacity only"
+                if _trains_never_open_appearance(args.render_support_mode)
+                else "currently ACTIVE and visible in sampled causal training view"
+            ),
             "closed_behavior": "hidden and exact parameter/Adam preservation",
             "features_rest_note": "SH degree 0 keeps features_rest gradient exactly zero",
         },
@@ -720,6 +853,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-frames", type=positive_int, default=None)
     parser.add_argument("--resolution", type=float, default=4.0)
     parser.add_argument("--density-policy", choices=DENSITY_POLICIES, default="active_oscd")
+    parser.add_argument(
+        "--render-support-mode",
+        choices=RENDER_SUPPORT_MODES,
+        default="open_only",
+    )
     parser.add_argument("--updates-per-frame", type=positive_int, default=16)
     parser.add_argument("--densify-update-index", type=int, default=4)
     parser.add_argument("--oscd-grad-threshold", type=nonnegative_float, default=0.001)

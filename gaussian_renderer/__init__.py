@@ -340,15 +340,36 @@ def render_change_temporal(
     pipe,
     background: torch.Tensor,
     timestamp: float | None = None,
+    include_never_open_occluders: bool = False,
+    train_never_open_dc_opacity: bool = False,
 ):
     """Render the active state attributes without changing Gaussian topology."""
     if timestamp is None:
         timestamp = getattr(viewpoint_camera, "timestamp", None)
     if timestamp is None:
         raise ValueError("timestamp is required for temporal change rendering")
+    if train_never_open_dc_opacity and not include_never_open_occluders:
+        raise ValueError(
+            "never-open DC/opacity training requires never-open render support"
+        )
 
     if hasattr(temporal_model, "get_active_render_attributes"):
-        attributes = temporal_model.get_active_render_attributes(timestamp)
+        if include_never_open_occluders:
+            getter = getattr(
+                temporal_model,
+                "get_open_or_never_open_render_attributes",
+                None,
+            )
+            if getter is None:
+                raise TypeError(
+                    "temporal model does not support never-open occluder rendering"
+                )
+            attributes = getter(
+                timestamp,
+                train_never_open_dc_opacity=train_never_open_dc_opacity,
+            )
+        else:
+            attributes = temporal_model.get_active_render_attributes(timestamp)
         return render_change(
             viewpoint_camera,
             temporal_model.base,

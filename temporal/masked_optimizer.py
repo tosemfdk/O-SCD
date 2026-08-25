@@ -348,20 +348,50 @@ class MaskedRowAdam(Optimizer):
         return mask.to(device=parameter.device)
 
     @torch.no_grad()
-    def step(self, active_rows: torch.Tensor, closure=None):  # type: ignore[override]
+    def step(
+        self,
+        active_rows: torch.Tensor | Mapping[str, torch.Tensor],
+        closure=None,
+    ):  # type: ignore[override]
+        """Update selected rows, optionally with a distinct mask per parameter.
+
+        A single boolean ``[N]`` tensor preserves the original shared-mask
+        contract.  A mapping allows appearance-only plasticity, for example
+        updating ``dc``/``opacity`` on one row set while restricting geometry
+        parameters to another.  Unselected parameter rows and their Adam state
+        remain bitwise unchanged.
+        """
         loss = None
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
-        if active_rows.dtype != torch.bool or active_rows.ndim != 1:
-            raise ValueError("active_rows must be a boolean [N] tensor")
+        if isinstance(active_rows, torch.Tensor):
+            if active_rows.dtype != torch.bool or active_rows.ndim != 1:
+                raise ValueError("active_rows must be a boolean [N] tensor")
+            row_masks: Mapping[str, torch.Tensor] | None = None
+        elif isinstance(active_rows, Mapping):
+            row_masks = active_rows
+            group_names = {str(group["name"]) for group in self.param_groups}
+            unknown = sorted(set(row_masks) - group_names)
+            missing = sorted(group_names - set(row_masks))
+            if unknown:
+                raise ValueError(f"unknown parameter row masks: {unknown}")
+            if missing:
+                raise ValueError(f"missing parameter row masks: {missing}")
+        else:
+            raise TypeError("active_rows must be a tensor or parameter-mask mapping")
 
         for group in self.param_groups:
             parameter = group["params"][0]
             gradient = parameter.grad
             if gradient is None:
                 continue
-            mask = self._validate_row_mask(active_rows, parameter)
+            selected_rows = (
+                active_rows
+                if row_masks is None
+                else row_masks[str(group["name"])]
+            )
+            mask = self._validate_row_mask(selected_rows, parameter)
             indices = torch.nonzero(mask, as_tuple=False).flatten()
             if indices.numel() == 0:
                 continue
