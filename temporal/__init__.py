@@ -53,6 +53,11 @@ from .checkpoint import load_temporal_model
 from .fusion import compute_growth_replay_regularization, compute_ssf_loss
 from .geometry_change_model import TemporalGeometryChangeModel
 from .persistent_gaussian_lifespan_model import PersistentGaussianLifespanModel
+from .dynamic_gaussian_topology import (
+    DynamicDensityMasks,
+    DynamicDensityResult,
+    DynamicGaussianTopologyManager,
+)
 from .masked_optimizer import MaskedRowAdam, MaskedRowSlotAdam
 from .lifespan import get_active_state_indices, temporal_gate
 from .picking import GaussianRayPick, pick_gaussian_along_ray

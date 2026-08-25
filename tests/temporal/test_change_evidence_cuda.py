@@ -11,7 +11,14 @@ from experiments.temporal_lifespan_smoke import build_synthetic_temporal_scene  
 from gaussian_renderer import render_change, render_change_temporal  # noqa: E402
 from temporal.change_evidence import accumulate_change_evidence  # noqa: E402
 from temporal.change_model import CLOSED, EMPTY, OPEN  # noqa: E402
+from temporal.binary_state_filter import BinaryStateFilter  # noqa: E402
+from temporal.dynamic_gaussian_topology import DynamicGaussianTopologyManager  # noqa: E402
 from temporal.geometry_change_model import TemporalGeometryChangeModel  # noqa: E402
+from temporal.masked_optimizer import MaskedRowAdam  # noqa: E402
+from temporal.persistent_gaussian_lifespan_model import PersistentGaussianLifespanModel  # noqa: E402
+from temporal.view_consistent_binary_lifespan_controller import (  # noqa: E402
+    ViewConsistentBinaryLifespanController,
+)
 
 
 def test_override_color_contracts_cuda():
@@ -196,3 +203,48 @@ def test_alpha_t_vjp_preserves_existing_base_gradients():
     )
     for name, grad in expected.items():
         assert torch.equal(getattr(model.base, name).grad, grad)
+
+
+def test_dynamic_child_remains_detector_observable_after_it_becomes_inactive():
+    synthetic, camera, pipe, background = build_synthetic_temporal_scene(image_size=32)
+    temporal = PersistentGaussianLifespanModel(synthetic.base, max_states=4)
+    temporal.reset_all_lifespans_closed()
+    temporal.open_rows(torch.tensor([0], device="cuda"), timestamp=0)
+    optimizer = MaskedRowAdam(
+        dict(temporal.persistent_parameter_items()),
+        lrs={name: 1e-3 for name, _ in temporal.persistent_parameter_items()},
+    )
+    tracker = BinaryStateFilter(temporal.current_state_index.numel(), device="cuda")
+    controller = ViewConsistentBinaryLifespanController(temporal)
+    topology = DynamicGaussianTopologyManager(
+        temporal,
+        optimizer,
+        tracker,
+        controller,
+        percent_dense=1000.0,
+    )
+    topology.xyz_gradient_accum[0] = 1.0
+    topology.denom[0] = 1.0
+    result = topology.apply_active_oscd_density_control(
+        timestamp=1,
+        scene_extent=1.0,
+        grad_threshold=1e-3,
+        min_opacity=0.0,
+    )
+    assert result.clone_child_count == 1
+    child = topology.count - 1
+    temporal.close_rows(torch.tensor([child], device="cuda"), timestamp=2)
+    attributes = temporal.get_active_render_attributes(timestamp=2)
+    assert attributes["opacity"][child].item() == 0.0
+
+    cue = torch.ones((1, 32, 32), device="cuda")
+    evidence = accumulate_change_evidence(
+        camera,
+        temporal.base,
+        pipe,
+        background,
+        cue,
+        cue_mode="binary",
+        cue_threshold=0.5,
+    )
+    assert evidence.total_mass[child] > 0
