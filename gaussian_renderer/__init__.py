@@ -135,6 +135,22 @@ def _validate_override_dc(pc: GaussianModel, override_dc: torch.Tensor) -> None:
         raise ValueError("override_dc must be on the same device as the base DC")
 
 
+def _validate_override_features_rest(
+    pc: GaussianModel, override_features_rest: torch.Tensor
+) -> None:
+    if not isinstance(override_features_rest, torch.Tensor):
+        raise TypeError("override_features_rest must be a tensor")
+    if override_features_rest.shape != pc._features_rest.shape:
+        raise ValueError(
+            "override_features_rest must have shape "
+            f"{tuple(pc._features_rest.shape)}"
+        )
+    if override_features_rest.dtype != pc._features_rest.dtype:
+        raise ValueError("override_features_rest must match the base SH-rest dtype")
+    if override_features_rest.device != pc._features_rest.device:
+        raise ValueError("override_features_rest must share the base SH-rest device")
+
+
 def _validate_override_opacity(pc: GaussianModel, override_opacity: torch.Tensor) -> None:
     if not isinstance(override_opacity, torch.Tensor):
         raise TypeError("override_opacity must be a tensor")
@@ -178,6 +194,7 @@ def render_change(
     override_scaling=None,
     override_rotation=None,
     clamp_output=True,
+    override_features_rest=None,
 ):
     """
     Render the scene.
@@ -191,6 +208,8 @@ def render_change(
         _validate_override_color(pc, override_color)
     if override_dc is not None:
         _validate_override_dc(pc, override_dc)
+    if override_features_rest is not None:
+        _validate_override_features_rest(pc, override_features_rest)
     if override_opacity is not None:
         _validate_override_opacity(pc, override_opacity)
     if override_xyz is not None:
@@ -277,7 +296,12 @@ def render_change(
     if override_color is not None:
         colors_precomp = override_color
     elif override_dc is not None:
-        dc, shs = override_dc, pc._features_rest
+        dc = override_dc
+        shs = (
+            pc._features_rest
+            if override_features_rest is None
+            else override_features_rest
+        )
     elif pipe.convert_SHs_python:
         shs_view = pc.get_features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
         dir_pp = (means3D - viewpoint_camera.camera_center.repeat(pc.get_features.shape[0], 1))
@@ -331,6 +355,7 @@ def render_change_temporal(
             pipe,
             background,
             override_dc=attributes["dc"],
+            override_features_rest=attributes.get("features_rest"),
             override_opacity=attributes["opacity"],
             override_xyz=attributes["xyz"],
             override_scaling=attributes["scaling"],

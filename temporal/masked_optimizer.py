@@ -11,6 +11,14 @@ from torch.optim import Optimizer
 
 
 ALLOWED_NAMES = ("dc", "xyz", "opacity", "scaling", "rotation")
+PERSISTENT_ALLOWED_NAMES = (
+    "dc",
+    "xyz",
+    "features_rest",
+    "opacity",
+    "scaling",
+    "rotation",
+)
 
 
 def active_visible_pair_mask(
@@ -238,4 +246,168 @@ class MaskedRowSlotAdam(Optimizer):
             step_term = (exp_active / bias_correction1) / denom
             parameter_pair.index_add_(0, active_indices, -lr * step_term)
 
+        return loss
+
+
+class MaskedRowAdam(Optimizer):
+    """Adam that updates only explicitly selected Gaussian rows.
+
+    This optimizer is the direct-parameter counterpart of
+    :class:`MaskedRowSlotAdam`.  Its tensors have shape ``[N, ...]`` rather
+    than ``[N, S, ...]`` because the parameters persist across every lifespan.
+    Inactive and current-view-invisible rows preserve both values and Adam
+    moments exactly.  Reopening a row intentionally resumes those moments.
+    """
+
+    def __init__(
+        self,
+        named_parameters: Mapping[
+            str, torch.nn.Parameter
+        ] | Iterable[tuple[str, torch.nn.Parameter]],
+        *,
+        thaw_names: Iterable[str] = PERSISTENT_ALLOWED_NAMES,
+        lrs: Mapping[str, float] | None = None,
+        betas: tuple[float, float] = (0.9, 0.999),
+        eps: float = 1e-8,
+        weight_decay: float = 0.0,
+        amsgrad: bool = False,
+    ) -> None:
+        named_parameters = dict(named_parameters)
+        requested = tuple(thaw_names)
+        allowed = set(PERSISTENT_ALLOWED_NAMES)
+        if not requested:
+            raise ValueError("at least one persistent parameter must be enabled")
+        if len(requested) != len(set(requested)):
+            raise ValueError("thaw_names must not contain duplicates")
+        unknown = sorted(set(requested) - allowed)
+        if unknown:
+            raise ValueError(f"unknown persistent parameter names: {unknown}")
+        lrs = {} if lrs is None else dict(lrs)
+        unknown_lrs = sorted(set(lrs) - allowed)
+        if unknown_lrs:
+            raise ValueError(f"unknown persistent learning-rate names: {unknown_lrs}")
+
+        groups: list[dict[str, Any]] = []
+        row_count: int | None = None
+        for name in PERSISTENT_ALLOWED_NAMES:
+            if name not in requested:
+                continue
+            if name not in named_parameters:
+                raise KeyError(f"missing expected persistent parameter: {name}")
+            parameter = named_parameters[name]
+            if not isinstance(parameter, torch.nn.Parameter):
+                raise TypeError(f"{name} must be an nn.Parameter")
+            if parameter.ndim < 1 or not torch.is_floating_point(parameter):
+                raise ValueError(f"{name} must be a floating [N,...] parameter")
+            if row_count is None:
+                row_count = int(parameter.shape[0])
+            elif int(parameter.shape[0]) != row_count:
+                raise ValueError("all persistent parameters must share row count N")
+            lr = float(lrs.get(name, 1e-3))
+            if not math.isfinite(lr) or lr < 0:
+                raise ValueError(f"learning rate for {name} must be finite and nonnegative")
+            groups.append({"params": [parameter], "lr": lr, "name": name})
+
+        if not (
+            isinstance(betas, tuple)
+            and len(betas) == 2
+            and all(math.isfinite(float(v)) and 0 <= float(v) < 1 for v in betas)
+        ):
+            raise ValueError("betas must be a pair in [0,1)")
+        if not math.isfinite(float(eps)) or eps <= 0:
+            raise ValueError("eps must be finite and positive")
+        if not math.isfinite(float(weight_decay)) or weight_decay < 0:
+            raise ValueError("weight_decay must be finite and nonnegative")
+        super().__init__(
+            groups,
+            {
+                "lr": 1e-3,
+                "betas": betas,
+                "eps": eps,
+                "weight_decay": weight_decay,
+                "amsgrad": amsgrad,
+            },
+        )
+        for group in self.param_groups:
+            parameter = group["params"][0]
+            n = int(parameter.shape[0])
+            self.state[parameter]["step"] = torch.zeros(
+                n, device=parameter.device, dtype=torch.long
+            )
+            self.state[parameter]["exp_avg"] = torch.zeros_like(parameter)
+            self.state[parameter]["exp_avg_sq"] = torch.zeros_like(parameter)
+            if amsgrad:
+                self.state[parameter]["max_exp_avg_sq"] = torch.zeros_like(parameter)
+
+    @staticmethod
+    def _validate_row_mask(mask: torch.Tensor, parameter: torch.Tensor) -> torch.Tensor:
+        if mask.ndim != 1 or mask.dtype != torch.bool:
+            raise ValueError("row mask must be boolean [N]")
+        if mask.shape[0] != parameter.shape[0]:
+            raise ValueError("row mask must match persistent parameter row count")
+        return mask.to(device=parameter.device)
+
+    @torch.no_grad()
+    def step(self, active_rows: torch.Tensor, closure=None):  # type: ignore[override]
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        if active_rows.dtype != torch.bool or active_rows.ndim != 1:
+            raise ValueError("active_rows must be a boolean [N] tensor")
+
+        for group in self.param_groups:
+            parameter = group["params"][0]
+            gradient = parameter.grad
+            if gradient is None:
+                continue
+            mask = self._validate_row_mask(active_rows, parameter)
+            indices = torch.nonzero(mask, as_tuple=False).flatten()
+            if indices.numel() == 0:
+                continue
+            state = self.state[parameter]
+            beta1, beta2 = group["betas"]
+            parameter_rows = parameter.reshape(parameter.shape[0], -1)
+            gradient_rows = gradient.reshape(gradient.shape[0], -1)
+            exp_avg_rows = state["exp_avg"].reshape(parameter.shape[0], -1)
+            exp_avg_sq_rows = state["exp_avg_sq"].reshape(parameter.shape[0], -1)
+            step_rows = state["step"]
+
+            selected_gradient = gradient_rows.index_select(0, indices)
+            if float(group["weight_decay"]) != 0.0:
+                selected_gradient = selected_gradient + float(
+                    group["weight_decay"]
+                ) * parameter_rows.index_select(0, indices)
+            selected_step = step_rows.index_select(0, indices).add_(1)
+            step_rows.index_copy_(0, indices, selected_step)
+            step_float = selected_step.to(dtype=parameter.dtype).unsqueeze(1)
+
+            selected_avg = exp_avg_rows.index_select(0, indices).mul_(beta1).add_(
+                selected_gradient, alpha=1 - beta1
+            )
+            selected_avg_sq = exp_avg_sq_rows.index_select(0, indices).mul_(
+                beta2
+            ).addcmul_(selected_gradient, selected_gradient, value=1 - beta2)
+            exp_avg_rows.index_copy_(0, indices, selected_avg)
+            exp_avg_sq_rows.index_copy_(0, indices, selected_avg_sq)
+
+            beta1_power = torch.pow(
+                torch.as_tensor(beta1, device=parameter.device, dtype=parameter.dtype),
+                step_float,
+            )
+            beta2_power = torch.pow(
+                torch.as_tensor(beta2, device=parameter.device, dtype=parameter.dtype),
+                step_float,
+            )
+            variance = selected_avg_sq / (1.0 - beta2_power)
+            if bool(group["amsgrad"]):
+                max_rows = state["max_exp_avg_sq"].reshape(parameter.shape[0], -1)
+                selected_max = max_rows.index_select(0, indices)
+                torch.maximum(selected_max, selected_avg_sq, out=selected_max)
+                max_rows.index_copy_(0, indices, selected_max)
+                variance = selected_max / (1.0 - beta2_power)
+            update = (selected_avg / (1.0 - beta1_power)) / (
+                variance.sqrt().add_(float(group["eps"]))
+            )
+            parameter_rows.index_add_(0, indices, -float(group["lr"]) * update)
         return loss

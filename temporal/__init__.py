@@ -52,7 +52,8 @@ from .active_density_topology import (
 from .checkpoint import load_temporal_model
 from .fusion import compute_growth_replay_regularization, compute_ssf_loss
 from .geometry_change_model import TemporalGeometryChangeModel
-from .masked_optimizer import MaskedRowSlotAdam
+from .persistent_gaussian_lifespan_model import PersistentGaussianLifespanModel
+from .masked_optimizer import MaskedRowAdam, MaskedRowSlotAdam
 from .lifespan import get_active_state_indices, temporal_gate
 from .picking import GaussianRayPick, pick_gaussian_along_ray
 from .shared_geometry_change_model import TemporalSharedGeometryChangeModel
@@ -125,6 +126,7 @@ __all__ = [
     "BOCDUpdate",
     "BocdMode",
     "MaskedRowSlotAdam",
+    "MaskedRowAdam",
     "cue_to_probability",
     "counts_from_evidence",
     "accumulate_alpha_t_evidence",
@@ -180,6 +182,7 @@ __all__ = [
     "aggregate_temporal_view_evidence",
     "compute_temporal_multiview_score",
     "TemporalGeometryChangeModel",
+    "PersistentGaussianLifespanModel",
     "TemporalSharedGeometryChangeModel",
     "compute_growth_replay_regularization",
     "compute_ssf_loss",

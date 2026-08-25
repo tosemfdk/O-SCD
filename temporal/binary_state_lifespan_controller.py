@@ -111,6 +111,13 @@ class BinaryStateLifespanController:
         """
         if rows.numel() == 0:
             return
+        if bool(
+            getattr(self.model, "persistent_parameters_across_lifespans", False)
+        ):
+            # Persistent-bank ablations allocate only interval metadata.  The
+            # learned DC/geometry and Adam moments intentionally survive CLOSE
+            # and are reused by a later REOPEN.
+            return
         if hasattr(self.model, "state_parameter_items"):
             items = self.model.state_parameter_items()
         else:
