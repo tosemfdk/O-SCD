@@ -19,6 +19,7 @@ from typing import Any
 
 import torch
 from torch import nn
+from utils.sh_utils import RGB2SH
 
 from .change_model import CLOSED, EMPTY, OPEN
 from .lifespan import get_active_state_indices
@@ -175,15 +176,20 @@ class PersistentGaussianLifespanModel(nn.Module):
         timestamp: float,
         *,
         train_never_open_dc_opacity: bool = False,
+        black_never_open: bool = False,
     ) -> dict[str, torch.Tensor]:
         """Render OPEN rows plus fixed zero-change occluders that never opened.
 
         A never-opened row still represents the reference surface.  Keeping its
-        opacity in the compositor restores the alpha/transmittance occlusion
-        that the original O-SCD change bank receives from zero-DC Gaussians.
-        By default such rows remain detached and emit zero change color.  The
-        explicit ``train_never_open_dc_opacity`` ablation lets only their DC
+        opacity in the compositor restores alpha/transmittance occlusion. Raw
+        SH DC zero renders as the neutral value RGB 0.5 before alpha
+        compositing because the rasterizer adds 0.5 after SH evaluation. The
+        explicit ``train_never_open_dc_opacity`` ablation lets their stored DC
         and opacity adapt while geometry remains detached.
+
+        ``black_never_open`` instead overrides every never-open row with the
+        raw degree-zero SH value for RGB zero.  Geometry and opacity still
+        occlude OPEN rows, but the occluder itself contributes no change color.
 
         Once a row has opened, a later CLOSE hides it completely because its
         persistent geometry/opacity may describe stale changed content.
@@ -192,6 +198,7 @@ class PersistentGaussianLifespanModel(nn.Module):
             timestamp,
             include_never_open=True,
             train_never_open_dc_opacity=train_never_open_dc_opacity,
+            black_never_open=black_never_open,
         )
 
     def _get_render_attributes(
@@ -200,9 +207,14 @@ class PersistentGaussianLifespanModel(nn.Module):
         *,
         include_never_open: bool,
         train_never_open_dc_opacity: bool = False,
+        black_never_open: bool = False,
     ) -> dict[str, torch.Tensor]:
         if train_never_open_dc_opacity and not include_never_open:
             raise ValueError("never-open appearance training requires render support")
+        if black_never_open and not include_never_open:
+            raise ValueError("black never-open override requires render support")
+        if black_never_open and train_never_open_dc_opacity:
+            raise ValueError("black never-open override requires frozen appearance")
         indices = self.get_active_state_indices(timestamp)
         active = indices >= 0
         never_open = self.num_states == 0
@@ -215,6 +227,9 @@ class PersistentGaussianLifespanModel(nn.Module):
             dc = dc * render_support[:, None, None]
         else:
             dc = self._active_rows(self.change_dc, active) * active[:, None, None]
+            if black_never_open:
+                black_dc = RGB2SH(dc.new_zeros(()))
+                dc = dc + black_dc * never_open[:, None, None]
         opacity_raw = self._active_rows(self.opacity, appearance_trainable)
         return {
             "dc": dc,

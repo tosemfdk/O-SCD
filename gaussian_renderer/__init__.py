@@ -342,6 +342,7 @@ def render_change_temporal(
     timestamp: float | None = None,
     include_never_open_occluders: bool = False,
     train_never_open_dc_opacity: bool = False,
+    black_never_open_occluders: bool = False,
 ):
     """Render the active state attributes without changing Gaussian topology."""
     if timestamp is None:
@@ -351,6 +352,14 @@ def render_change_temporal(
     if train_never_open_dc_opacity and not include_never_open_occluders:
         raise ValueError(
             "never-open DC/opacity training requires never-open render support"
+        )
+    if black_never_open_occluders and not include_never_open_occluders:
+        raise ValueError(
+            "black never-open override requires never-open render support"
+        )
+    if black_never_open_occluders and train_never_open_dc_opacity:
+        raise ValueError(
+            "black never-open override requires frozen never-open appearance"
         )
 
     if hasattr(temporal_model, "get_active_render_attributes"):
@@ -367,6 +376,7 @@ def render_change_temporal(
             attributes = getter(
                 timestamp,
                 train_never_open_dc_opacity=train_never_open_dc_opacity,
+                black_never_open=black_never_open_occluders,
             )
         else:
             attributes = temporal_model.get_active_render_attributes(timestamp)

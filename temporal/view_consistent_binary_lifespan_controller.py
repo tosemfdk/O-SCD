@@ -96,6 +96,8 @@ class ViewConsistentBinaryLifespanController(BinaryStateLifespanController):
     Markov prior odds, yielding a likelihood Bayes-factor diagnostic.
     """
 
+    topology_buffer_names = ("open_support_count", "close_support_count")
+
     def __init__(
         self,
         temporal_model,

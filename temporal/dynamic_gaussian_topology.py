@@ -7,7 +7,10 @@ row copies its source detector/controller/lifespan state at the topology event,
 but owns independent tensors and Bayesian state afterwards.
 
 This module deliberately has no immutable-prefix, root, or residual-bank
-semantics.  Stable IDs and parent IDs are diagnostics only.
+parameter semantics.  Generation and direct-parent metadata additionally guard
+the optional child-only black pruning ablation: initial rows are never eligible,
+and at least one live representative is retained when a removed split source no
+longer exists.
 """
 
 from __future__ import annotations
@@ -50,6 +53,8 @@ class DynamicDensityMasks:
 
     active: torch.Tensor
     gradient_observed: torch.Tensor
+    gradient_split: torch.Tensor
+    cue_mixture_split: torch.Tensor
     clone: torch.Tensor
     split: torch.Tensor
 
@@ -64,9 +69,15 @@ class DynamicDensityResult:
     clone_child_count: int
     split_source_count: int
     split_child_count: int
+    gradient_split_source_count: int
+    cue_mixture_split_source_count: int
+    cue_mixture_only_split_source_count: int
     split_source_removed_count: int
     opacity_pruned_count: int
     size_pruned_count: int
+    black_child_prune_candidate_count: int
+    black_child_pruned_count: int
+    black_child_retained_for_support_count: int
     total_removed_count: int
     masks: DynamicDensityMasks
 
@@ -119,6 +130,21 @@ class DynamicGaussianTopologyManager:
 
     def active_mask(self) -> torch.Tensor:
         return self.model.current_state_index >= 0
+
+    @staticmethod
+    def _row_buffer_names(owner: Any, fallback: tuple[str, ...]) -> tuple[str, ...]:
+        """Resolve explicitly declared row-aligned state for topology mutation."""
+
+        names = tuple(getattr(owner, "topology_buffer_names", fallback))
+        if len(names) != len(set(names)):
+            raise RuntimeError("topology buffer names must be unique")
+        for name in names:
+            value = getattr(owner, name, None)
+            if not isinstance(value, torch.Tensor) or value.ndim != 1:
+                raise RuntimeError(
+                    f"topology buffer {type(owner).__name__}.{name} must be a 1D tensor"
+                )
+        return names
 
     def _sync_base_density_buffers(self) -> None:
         base = self.model.base
@@ -277,13 +303,29 @@ class DynamicGaussianTopologyManager:
         min_opacity: float = 0.4,
         max_screen_size: float | None = None,
         split_children: int = 2,
+        cue_mixture_score: torch.Tensor | None = None,
+        cue_mixture_threshold: float = 0.5,
+        black_child_prune_threshold: float | None = None,
+        black_child_prune_min_age_frames: int = 1,
     ) -> DynamicDensityResult:
-        """Run active-only O-SCD clone/split plus explicit active-only pruning.
+        """Run active-only O-SCD density plus optional cue-mixture splitting.
 
         The online O-SCD loop supplies the gradient clone/split schedule.  Its
         16-step loop does not prune; the opacity/size pruning below is the
         explicit extension requested by this ablation and uses the same
         criteria as ``GaussianModel.densify_and_prune``.
+
+        ``cue_mixture_score`` is an optional detached per-row value in ``[0,1]``
+        computed from the current frame's pre-optimization raw cue evidence.
+        It may only add large-Gaussian split sources; it never clones small
+        rows, changes lifecycle state, or replaces the original gradient rule.
+
+        ``black_child_prune_threshold`` optionally hard-prunes only previously
+        densified ACTIVE children whose learned intrinsic DC render value is
+        below the threshold.  Initial rows and children born in this density
+        event are protected.  If a direct parent is already gone and all of its
+        surviving children are black candidates, the least-black child is kept
+        so detector support for that split lineage is not deleted wholesale.
         """
 
         if isinstance(timestamp, bool) or not isinstance(timestamp, int):
@@ -301,6 +343,41 @@ class DynamicGaussianTopologyManager:
             )
         if isinstance(split_children, bool) or int(split_children) < 2:
             raise ValueError("split_children must be an integer >= 2")
+        cue_mixture_threshold = _validate_positive_finite(
+            "cue_mixture_threshold", cue_mixture_threshold
+        )
+        if cue_mixture_threshold > 1.0:
+            raise ValueError("cue_mixture_threshold must be at most one")
+        if black_child_prune_threshold is not None:
+            black_child_prune_threshold = _validate_positive_finite(
+                "black_child_prune_threshold",
+                black_child_prune_threshold,
+                allow_zero=True,
+            )
+            if black_child_prune_threshold > 1.0:
+                raise ValueError("black_child_prune_threshold must be at most one")
+        if (
+            isinstance(black_child_prune_min_age_frames, bool)
+            or not isinstance(black_child_prune_min_age_frames, int)
+            or black_child_prune_min_age_frames < 1
+        ):
+            raise ValueError("black_child_prune_min_age_frames must be an integer >= 1")
+        if cue_mixture_score is None:
+            mixture_score = torch.zeros(
+                self.count, device=self.model.xyz.device, dtype=self.model.xyz.dtype
+            )
+        else:
+            if not isinstance(cue_mixture_score, torch.Tensor):
+                raise TypeError("cue_mixture_score must be a tensor")
+            mixture_score = cue_mixture_score.detach().to(
+                device=self.model.xyz.device, dtype=self.model.xyz.dtype
+            ).flatten()
+            if mixture_score.shape != (self.count,):
+                raise ValueError("cue_mixture_score must match the current topology")
+            if not bool(torch.isfinite(mixture_score).all()) or bool(
+                ((mixture_score < 0.0) | (mixture_score > 1.0)).any()
+            ):
+                raise ValueError("cue_mixture_score must be finite and in [0,1]")
 
         old_count = self.count
         active = self.active_mask()
@@ -313,8 +390,15 @@ class DynamicGaussianTopologyManager:
         small = self.model.base.get_scaling.max(dim=1).values <= (
             self.percent_dense * scene_extent
         )
-        clone = active & observed & gradient_ok & small
-        split = active & observed & gradient_ok & ~small
+        gradient_candidate = active & observed & gradient_ok
+        clone = gradient_candidate & small
+        gradient_split = gradient_candidate & ~small
+        cue_mixture_split = (
+            active
+            & ~small
+            & (mixture_score >= float(cue_mixture_threshold))
+        )
+        split = gradient_split | cue_mixture_split
         clone_rows = torch.nonzero(clone, as_tuple=False).flatten()
         split_rows = torch.nonzero(split, as_tuple=False).flatten()
 
@@ -334,12 +418,16 @@ class DynamicGaussianTopologyManager:
             name: torch.cat((getattr(self.model, name), getattr(self.model, name)[source_rows]), dim=0)
             for name in _LIFECYCLE_BUFFERS
         }
+        filter_names = self._row_buffer_names(self.tracker, _FILTER_BUFFERS)
         combined_filter = {
             name: torch.cat((getattr(self.tracker, name), getattr(self.tracker, name)[source_rows]), dim=0)
-            for name in _FILTER_BUFFERS
+            for name in filter_names
         }
-        controller_names = tuple(
-            name for name in _CONTROLLER_BUFFERS if hasattr(self.controller, name)
+        controller_names = self._row_buffer_names(
+            self.controller,
+            tuple(
+                name for name in _CONTROLLER_BUFFERS if hasattr(self.controller, name)
+            ),
         )
         combined_controller = {
             name: torch.cat((getattr(self.controller, name), getattr(self.controller, name)[source_rows]), dim=0)
@@ -390,7 +478,100 @@ class DynamicGaussianTopologyManager:
                 > 0.1 * scene_extent
             )
             size_prune = combined_active & (screen_large | world_large)
-        remove = split_source_mask | opacity_prune | size_prune
+        base_remove = split_source_mask | opacity_prune | size_prune
+
+        black_child_candidate = torch.zeros_like(base_remove)
+        black_child_prune = torch.zeros_like(base_remove)
+        black_child_retained = torch.zeros_like(base_remove)
+        if black_child_prune_threshold is not None:
+            intrinsic_dc = (
+                combined_parameters["dc"] * 0.28209479177387814 + 0.5
+            ).mean(dim=tuple(range(1, combined_parameters["dc"].ndim)))
+            old_enough = (
+                combined_creation >= 0
+            ) & (
+                int(timestamp) - combined_creation
+                >= int(black_child_prune_min_age_frames)
+            )
+            black_child_candidate = (
+                combined_active
+                & (combined_generation > 0)
+                & old_enough
+                & (intrinsic_dc < float(black_child_prune_threshold))
+                & ~base_remove
+            )
+
+            if bool(black_child_candidate.any()):
+                supporting = ~base_remove & ~black_child_candidate
+                id_capacity = int(self.next_stable_id) + child_count
+                stable_support = torch.zeros(
+                    id_capacity, device=active.device, dtype=torch.bool
+                )
+                stable_support[combined_stable_id[supporting]] = True
+                sibling_support_count = torch.zeros(
+                    id_capacity, device=active.device, dtype=torch.long
+                )
+                supporting_children = supporting & (combined_parent_id >= 0)
+                sibling_support_count.scatter_add_(
+                    0,
+                    combined_parent_id[supporting_children],
+                    torch.ones_like(
+                        combined_parent_id[supporting_children], dtype=torch.long
+                    ),
+                )
+
+                candidate_rows = torch.nonzero(
+                    black_child_candidate, as_tuple=False
+                ).flatten()
+                candidate_parents = combined_parent_id[candidate_rows]
+                has_support = (
+                    stable_support[candidate_parents]
+                    | (sibling_support_count[candidate_parents] > 0)
+                )
+                black_child_prune[candidate_rows[has_support]] = True
+
+                unsupported_rows = candidate_rows[~has_support]
+                if int(unsupported_rows.numel()):
+                    unsupported_parents = combined_parent_id[unsupported_rows]
+                    unique_parents, inverse = torch.unique(
+                        unsupported_parents, sorted=False, return_inverse=True
+                    )
+                    best_dc = torch.full(
+                        (int(unique_parents.numel()),),
+                        -torch.inf,
+                        device=intrinsic_dc.device,
+                        dtype=intrinsic_dc.dtype,
+                    )
+                    best_dc.scatter_reduce_(
+                        0,
+                        inverse,
+                        intrinsic_dc[unsupported_rows],
+                        reduce="amax",
+                        include_self=True,
+                    )
+                    is_best = intrinsic_dc[unsupported_rows] == best_dc[inverse]
+                    max_stable_id = torch.iinfo(torch.long).max
+                    best_stable_id = torch.full(
+                        (int(unique_parents.numel()),),
+                        max_stable_id,
+                        device=combined_stable_id.device,
+                        dtype=torch.long,
+                    )
+                    best_stable_id.scatter_reduce_(
+                        0,
+                        inverse[is_best],
+                        combined_stable_id[unsupported_rows[is_best]],
+                        reduce="amin",
+                        include_self=True,
+                    )
+                    retain = (
+                        combined_stable_id[unsupported_rows]
+                        == best_stable_id[inverse]
+                    )
+                    black_child_retained[unsupported_rows[retain]] = True
+                    black_child_prune[unsupported_rows[~retain]] = True
+
+        remove = base_remove | black_child_prune
         keep = ~remove
         if not bool(keep.any()):
             raise RuntimeError("active-only density control would remove every Gaussian")
@@ -416,6 +597,8 @@ class DynamicGaussianTopologyManager:
                 reason = "low_opacity"
             elif bool(size_prune[row]):
                 reason = "oversized"
+            elif bool(black_child_prune[row]):
+                reason = "black_child"
             self.lineage_events.append(
                 {
                     "action": "DELETE",
@@ -448,13 +631,27 @@ class DynamicGaussianTopologyManager:
             clone_child_count=int(clone.sum().item()),
             split_source_count=int(split.sum().item()),
             split_child_count=int(split.sum().item()) * int(split_children),
+            gradient_split_source_count=int(gradient_split.sum().item()),
+            cue_mixture_split_source_count=int(cue_mixture_split.sum().item()),
+            cue_mixture_only_split_source_count=int(
+                (cue_mixture_split & ~gradient_split).sum().item()
+            ),
             split_source_removed_count=int(split_source_mask.sum().item()),
             opacity_pruned_count=int(opacity_prune.sum().item()),
             size_pruned_count=int(size_prune.sum().item()),
+            black_child_prune_candidate_count=int(
+                black_child_candidate.sum().item()
+            ),
+            black_child_pruned_count=int(black_child_prune.sum().item()),
+            black_child_retained_for_support_count=int(
+                black_child_retained.sum().item()
+            ),
             total_removed_count=int(remove.sum().item()),
             masks=DynamicDensityMasks(
                 active=active.detach().clone(),
                 gradient_observed=observed.detach().clone(),
+                gradient_split=gradient_split.detach().clone(),
+                cue_mixture_split=cue_mixture_split.detach().clone(),
                 clone=clone.detach().clone(),
                 split=split.detach().clone(),
             ),
@@ -495,11 +692,16 @@ class DynamicGaussianTopologyManager:
         for name in _LIFECYCLE_BUFFERS:
             if getattr(self.model, name).shape[0] != n:
                 raise RuntimeError(f"lifecycle buffer {name} lost topology alignment")
-        for name in _FILTER_BUFFERS:
+        for name in self._row_buffer_names(self.tracker, _FILTER_BUFFERS):
             if getattr(self.tracker, name).shape != (n,):
                 raise RuntimeError(f"filter buffer {name} lost topology alignment")
-        for name in _CONTROLLER_BUFFERS:
-            if hasattr(self.controller, name) and getattr(self.controller, name).shape != (n,):
+        for name in self._row_buffer_names(
+            self.controller,
+            tuple(
+                name for name in _CONTROLLER_BUFFERS if hasattr(self.controller, name)
+            ),
+        ):
+            if getattr(self.controller, name).shape != (n,):
                 raise RuntimeError(f"controller buffer {name} lost topology alignment")
         for name in (
             "stable_id",

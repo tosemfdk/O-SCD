@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 from collections import defaultdict
 import json
+import math
 from pathlib import Path
 import time
 from types import SimpleNamespace
@@ -107,6 +108,207 @@ def raw_render_grayscale(raw: np.ndarray) -> np.ndarray:
     return np.repeat(gray[..., None], 3, axis=2)
 
 
+def threshold_render_rgb(
+    raw: np.ndarray, threshold: float = 0.5
+) -> np.ndarray:
+    """Threshold the channel-mean R_change render into a white binary mask."""
+
+    if not 0.0 <= float(threshold) <= 1.0:
+        raise ValueError("threshold must be in [0,1]")
+    array = np.asarray(raw)
+    if array.ndim != 3 or array.shape[2] != 3:
+        raise ValueError("raw render must have shape [H,W,3]")
+    score = array.astype(np.float32).mean(axis=2)
+    if np.issubdtype(array.dtype, np.integer) or (
+        score.size and float(score.max()) > 1.0
+    ):
+        score = score / 255.0
+    mask = score >= float(threshold)
+    return np.repeat((mask.astype(np.uint8) * 255)[..., None], 3, axis=2)
+
+
+def load_evaluation_mask_rgb(
+    path: Path | None,
+    *,
+    raw_render: np.ndarray,
+    threshold: float,
+) -> tuple[np.ndarray, str]:
+    """Load the exact saved metric mask, falling back to raw-render thresholding."""
+
+    if path is None:
+        return threshold_render_rgb(raw_render, threshold=threshold), "recomputed"
+    if not path.exists():
+        raise FileNotFoundError(path)
+    with Image.open(path) as image:
+        mask = np.asarray(image.convert("L")) >= 128
+    if mask.shape != raw_render.shape[:2]:
+        raise ValueError(
+            "saved evaluation mask and raw R_change render must have matching shapes"
+        )
+    return (
+        np.repeat((mask.astype(np.uint8) * 255)[..., None], 3, axis=2),
+        "saved_metric_prediction",
+    )
+
+
+def _nice_axis(maximum: int, target_ticks: int = 5) -> tuple[int, int]:
+    maximum = max(1, int(maximum))
+    raw_step = maximum / max(1, int(target_ticks))
+    exponent = 10 ** math.floor(math.log10(raw_step))
+    fraction = raw_step / exponent
+    if fraction < 1.5:
+        nice_fraction = 1
+    elif fraction < 3:
+        nice_fraction = 2
+    elif fraction < 7:
+        nice_fraction = 5
+    else:
+        nice_fraction = 10
+    step = max(1, int(nice_fraction * exponent))
+    limit = int(math.ceil(maximum / step) * step)
+    return limit, step
+
+
+def open_close_timeline_chart(
+    open_counts: Sequence[int],
+    close_counts: Sequence[int],
+    *,
+    current_timestamp: int,
+    width: int,
+    height: int = 280,
+    boundaries: Sequence[int] = (),
+    segment_names: Sequence[str] = (),
+) -> Image.Image:
+    """Draw causal per-frame OPEN/CLOSE counts on one absolute-count axis."""
+
+    opens = [max(0, int(value)) for value in open_counts]
+    closes = [max(0, int(value)) for value in close_counts]
+    if not opens or len(opens) != len(closes):
+        raise ValueError("OPEN/CLOSE count series must be nonempty and aligned")
+    if current_timestamp < 0 or current_timestamp >= len(opens):
+        raise IndexError("current timestamp is outside the lifecycle timeline")
+    if width < 320 or height < 180:
+        raise ValueError("timeline chart is too small")
+
+    left, right, top, bottom = 104, 24, 54, 48
+    plot_w = width - left - right
+    plot_h = height - top - bottom
+    canvas = Image.new("RGB", (int(width), int(height)), "white")
+    draw = ImageDraw.Draw(canvas)
+    small = _font(14)
+    title_font = _font(18)
+    n = len(opens)
+    boundary_values = sorted({int(value) for value in boundaries if 0 < value < n})
+    spans = [0, *boundary_values, n]
+    shades = ((239, 247, 253), (247, 251, 232), (255, 248, 230))
+    for index, (start, end) in enumerate(zip(spans, spans[1:])):
+        x0 = left + int(start * plot_w / max(1, n - 1))
+        x1 = left + int(min(end, n - 1) * plot_w / max(1, n - 1))
+        draw.rectangle((x0, top, x1, top + plot_h), fill=shades[index % len(shades)])
+        if index < len(segment_names):
+            label = str(segment_names[index])
+            box = draw.textbbox((0, 0), label, font=small)
+            draw.text(
+                ((x0 + x1 - (box[2] - box[0])) // 2, top + 3),
+                label,
+                fill=(70, 78, 92),
+                font=small,
+            )
+
+    y_limit, y_step = _nice_axis(max(max(opens), max(closes)))
+    for value in range(0, y_limit + 1, y_step):
+        y = top + plot_h - int(value * plot_h / y_limit)
+        draw.line((left, y, left + plot_w, y), fill=(213, 220, 226), width=1)
+        label = f"{value:,}"
+        box = draw.textbbox((0, 0), label, font=small)
+        draw.text(
+            (left - 10 - (box[2] - box[0]), y - 7),
+            label,
+            fill=(40, 40, 40),
+            font=small,
+        )
+    for boundary in boundary_values:
+        x = left + int(boundary * plot_w / max(1, n - 1))
+        draw.line((x, top, x, top + plot_h), fill=(90, 90, 90), width=2)
+
+    x_tick_step = 50 if n > 150 else 20
+    x_ticks = list(range(0, n, x_tick_step))
+    if n - 1 - x_ticks[-1] >= max(8, x_tick_step // 2):
+        x_ticks.append(n - 1)
+    for value in x_ticks:
+        x = left + int(value * plot_w / max(1, n - 1))
+        draw.line((x, top + plot_h, x, top + plot_h + 5), fill="black", width=1)
+        label = str(value)
+        box = draw.textbbox((0, 0), label, font=small)
+        draw.text((x - (box[2] - box[0]) // 2, top + plot_h + 7), label, fill="black", font=small)
+
+    def points(values: Sequence[int]) -> list[tuple[int, int]]:
+        return [
+            (
+                left + int(index * plot_w / max(1, n - 1)),
+                top + plot_h - int(int(value) * plot_h / y_limit),
+            )
+            for index, value in enumerate(values[: current_timestamp + 1])
+        ]
+
+    open_color = (18, 163, 81)
+    close_color = (232, 45, 71)
+    for values, color in ((opens, open_color), (closes, close_color)):
+        line = points(values)
+        if len(line) > 1:
+            draw.line(line, fill=color, width=3)
+        x, y = line[-1]
+        draw.ellipse((x - 4, y - 4, x + 4, y + 4), fill=color)
+
+    current_x = left + int(current_timestamp * plot_w / max(1, n - 1))
+    draw.line((current_x, top, current_x, top + plot_h), fill=(34, 80, 190), width=2)
+    draw.text((left, 12), "Lifecycle mutations by image timestamp", fill="black", font=title_font)
+    legend_x = max(left + 420, width - 520)
+    draw.line((legend_x, 25, legend_x + 28, 25), fill=open_color, width=4)
+    draw.text(
+        (legend_x + 36, 15),
+        f"OPEN@t {opens[current_timestamp]:,}",
+        fill="black",
+        font=small,
+    )
+    close_x = legend_x + 190
+    draw.line((close_x, 25, close_x + 28, 25), fill=close_color, width=4)
+    draw.text(
+        (close_x + 36, 15),
+        f"CLOSE@t {closes[current_timestamp]:,}",
+        fill="black",
+        font=small,
+    )
+    current_label = f"t={current_timestamp}"
+    current_box = draw.textbbox((0, 0), current_label, font=small)
+    current_label_width = current_box[2] - current_box[0]
+    current_label_x = min(
+        current_x + 5,
+        left + plot_w - current_label_width - 4,
+    )
+    draw.text(
+        (current_label_x, top + 20),
+        current_label,
+        fill=(34, 80, 190),
+        font=small,
+    )
+    x_label = "Image timestamp"
+    box = draw.textbbox((0, 0), x_label, font=small)
+    draw.text(
+        (left + (plot_w - (box[2] - box[0])) // 2, height - 20),
+        x_label,
+        fill="black",
+        font=small,
+    )
+    y_label = Image.new("RGBA", (160, 24), (255, 255, 255, 0))
+    ImageDraw.Draw(y_label).text((0, 2), "Gaussian count", fill="black", font=small)
+    y_label = y_label.rotate(90, expand=True)
+    canvas.paste(y_label, (2, top + max(0, (plot_h - y_label.height) // 2)), y_label)
+    draw.line((left, top, left, top + plot_h), fill="black", width=2)
+    draw.line((left, top + plot_h, left + plot_w, top + plot_h), fill="black", width=2)
+    return canvas
+
+
 def resize_rgb(array: np.ndarray, width: int) -> Image.Image:
     image = Image.fromarray(array.astype(np.uint8, copy=False)).convert("RGB")
     height = max(1, int(round(image.height * int(width) / image.width)))
@@ -133,18 +335,37 @@ def compose_frame_panel(
     open_count: int,
     close_count: int,
     panel_width: int,
+    thresholded_render: np.ndarray | None = None,
+    lifecycle_chart: Image.Image | None = None,
 ) -> Image.Image:
-    panels = (
+    panel_items = [
         labeled_panel(rgb, "Inference RGB", panel_width),
         labeled_panel(turbo_heatmap(cue), "Combined change cue", panel_width),
         labeled_panel(raw_render_grayscale(raw_render), "Causal raw R_change", panel_width),
-        labeled_panel(event_render, "Lifespan events @ current t", panel_width),
+    ]
+    if thresholded_render is not None:
+        panel_items.append(
+            labeled_panel(
+                thresholded_render,
+                "R_change mask (>= 0.5)",
+                panel_width,
+            )
+        )
+    panel_items.append(
+        labeled_panel(event_render, "Lifespan events @ current t", panel_width)
     )
+    panels = tuple(panel_items)
     gap = 8
     body_width = sum(panel.width for panel in panels) + gap * (len(panels) - 1)
     body_height = max(panel.height for panel in panels)
     header_height = 58
-    canvas = Image.new("RGB", (body_width, header_height + body_height), "white")
+    chart_gap = 8 if lifecycle_chart is not None else 0
+    chart_height = lifecycle_chart.height if lifecycle_chart is not None else 0
+    canvas = Image.new(
+        "RGB",
+        (body_width, header_height + body_height + chart_gap + chart_height),
+        "white",
+    )
     draw = ImageDraw.Draw(canvas)
     draw.text(
         (8, 7),
@@ -172,6 +393,13 @@ def compose_frame_panel(
     for panel in panels:
         canvas.paste(panel, (x, header_height))
         x += panel.width + gap
+    if lifecycle_chart is not None:
+        chart = lifecycle_chart.convert("RGB")
+        if chart.width != body_width:
+            chart = chart.resize(
+                (body_width, chart.height), Image.Resampling.BILINEAR
+            )
+        canvas.paste(chart, (0, header_height + body_height + chart_gap))
     return canvas
 
 
@@ -253,7 +481,10 @@ def render_event_rows(
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-dir", type=Path, required=True)
-    parser.add_argument("--raw-render-dir", type=Path, required=True)
+    parser.add_argument("--raw-render-dir", type=Path, default=None)
+    parser.add_argument("--thresholded-render-dir", type=Path, default=None)
+    parser.add_argument("--captured-event-render-dir", type=Path, default=None)
+    parser.add_argument("--evaluation-threshold", type=float, default=None)
     parser.add_argument("--source-path", type=Path, default=None)
     parser.add_argument("--fixed-cameras-json", type=Path, default=None)
     parser.add_argument("--cue-cache-root", type=Path, default=None)
@@ -263,6 +494,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--panel-width", type=int, default=300)
     parser.add_argument("--gif-width", type=int, default=1200)
     parser.add_argument("--gif-duration-ms", type=int, default=160)
+    parser.add_argument("--timeline-height", type=int, default=280)
     return parser.parse_args(argv)
 
 
@@ -273,26 +505,90 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise RuntimeError("CUDA is required by the Gaussian renderer")
     summary = json.loads((args.run_dir / "summary.json").read_text())
     run_arguments: Mapping[str, Any] = summary.get("run_arguments", {})
+    visual_capture: Mapping[str, Any] = summary.get("visual_capture") or {}
     source_path = args.source_path or Path(run_arguments["source_path"])
     fixed_cameras = args.fixed_cameras_json or Path(run_arguments["fixed_cameras_json"])
     cue_cache_root = args.cue_cache_root or Path(run_arguments["cue_cache_root"])
     resolution = float(args.resolution or run_arguments.get("resolution", 4.0))
+    raw_render_dir = args.raw_render_dir
+    if raw_render_dir is None and visual_capture.get("raw_render"):
+        raw_render_dir = Path(str(visual_capture["raw_render"]))
+    if raw_render_dir is None:
+        raise ValueError(
+            "--raw-render-dir is required when the run summary has no visual capture"
+        )
+    thresholded_render_dir = args.thresholded_render_dir
+    if thresholded_render_dir is None and visual_capture.get("thresholded_render"):
+        thresholded_render_dir = Path(str(visual_capture["thresholded_render"]))
+    captured_event_render_dir = args.captured_event_render_dir
+    if captured_event_render_dir is None and visual_capture.get("event_render"):
+        captured_event_render_dir = Path(str(visual_capture["event_render"]))
+    evaluation_threshold = float(
+        args.evaluation_threshold
+        if args.evaluation_threshold is not None
+        else visual_capture.get(
+            "threshold", run_arguments.get("evaluation_threshold", 0.5)
+        )
+    )
+    if not 0.0 <= evaluation_threshold <= 1.0:
+        raise ValueError("evaluation threshold must be in [0,1]")
+    max_frames = (
+        args.max_frames
+        if args.max_frames is not None
+        else run_arguments.get("max_frames")
+    )
 
     from experiments.run_online_bayesian_lifespan_thaw import build_causal_records
     from experiments.train_cue_temporal_rchange import (
         build_fixed_cue_views,
         load_fixed_camera_index,
     )
-    from scene import GaussianModel
-
-    records, _names = build_causal_records(source_path, max_frames=args.max_frames)
+    records, _names = build_causal_records(source_path, max_frames=max_frames)
     cameras = load_fixed_camera_index(fixed_cameras)
-    base_ply = (source_path / "reference_reconstruction/point_cloud/iteration_30000/point_cloud.ply").resolve()
-    base = GaussianModel(sh_degree=3, active_sh_degree=0)
-    base.load_ply_change(str(base_ply))
-    pipe = SimpleNamespace(compute_cov3D_python=False, convert_SHs_python=False, debug=False)
-    background = torch.zeros(3, device=base.get_xyz.device, dtype=base.get_xyz.dtype)
+    base = None
+    pipe = None
+    background = None
+    if captured_event_render_dir is None:
+        from scene import GaussianModel
+
+        base_ply = (
+            source_path
+            / "reference_reconstruction/point_cloud/iteration_30000/point_cloud.ply"
+        ).resolve()
+        base = GaussianModel(sh_degree=3, active_sh_degree=0)
+        base.load_ply_change(str(base_ply))
+        pipe = SimpleNamespace(
+            compute_cov3D_python=False,
+            convert_SHs_python=False,
+            debug=False,
+        )
+        background = torch.zeros(
+            3, device=base.get_xyz.device, dtype=base.get_xyz.dtype
+        )
     events = load_transition_rows(args.run_dir / "lifecycle_events.jsonl")
+    open_counts = [
+        len(events.get(int(record.global_index), {"OPEN": (), "CLOSE": ()})["OPEN"])
+        for record in records
+    ]
+    close_counts = [
+        len(events.get(int(record.global_index), {"OPEN": (), "CLOSE": ()})["CLOSE"])
+        for record in records
+    ]
+    segment_names: list[str] = []
+    segment_boundaries: list[int] = []
+    previous_segment: str | None = None
+    for position, record in enumerate(records):
+        segment = str(record.segment_name)
+        if segment != previous_segment:
+            if position:
+                segment_boundaries.append(position)
+            segment_names.append(segment)
+            previous_segment = segment
+    panel_count = 5
+    panel_gap = 8
+    composed_width = int(args.panel_width) * panel_count + panel_gap * (
+        panel_count - 1
+    )
 
     panels_dir = args.output_dir / "panels"
     event_dir = args.output_dir / "event_render"
@@ -303,22 +599,36 @@ def main(argv: Sequence[str] | None = None) -> int:
     manifest_rows: list[dict[str, Any]] = []
 
     with torch.no_grad():
-        for record in records:
+        for position, record in enumerate(records):
             timestamp = int(record.global_index)
             view = build_fixed_cue_views(
                 [record], cameras, cue_cache_root, resolution
             )[0][0]
             action_rows = events.get(timestamp, {"OPEN": (), "CLOSE": ()})
-            event_rgb = render_event_rows(
-                view,
-                base,
-                pipe,
-                background,
-                action_rows["OPEN"],
-                action_rows["CLOSE"],
-            )
             stem = Path(record.name).stem
-            raw_path = args.raw_render_dir / f"{stem}.png"
+            captured_event_path = (
+                captured_event_render_dir / f"{stem}.png"
+                if captured_event_render_dir is not None
+                else None
+            )
+            if captured_event_path is not None:
+                if not captured_event_path.exists():
+                    raise FileNotFoundError(captured_event_path)
+                with Image.open(captured_event_path) as image:
+                    event_rgb = np.asarray(image.convert("RGB"))
+                event_source = "saved_causal_event_render"
+            else:
+                assert base is not None and pipe is not None and background is not None
+                event_rgb = render_event_rows(
+                    view,
+                    base,
+                    pipe,
+                    background,
+                    action_rows["OPEN"],
+                    action_rows["CLOSE"],
+                )
+                event_source = "reconstructed_immutable_base"
+            raw_path = raw_render_dir / f"{stem}.png"
             if not raw_path.exists():
                 raise FileNotFoundError(raw_path)
             with Image.open(record.image_path) as image:
@@ -331,6 +641,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             cue = view.candidate_map.detach().float().squeeze().cpu().numpy()
             with Image.open(raw_path) as image:
                 raw = np.asarray(image.convert("RGB"))
+            threshold_path = (
+                thresholded_render_dir / f"{stem}.png"
+                if thresholded_render_dir is not None
+                else None
+            )
+            thresholded, threshold_source = load_evaluation_mask_rgb(
+                threshold_path,
+                raw_render=raw,
+                threshold=evaluation_threshold,
+            )
+            chart = open_close_timeline_chart(
+                open_counts,
+                close_counts,
+                current_timestamp=position,
+                width=composed_width,
+                height=int(args.timeline_height),
+                boundaries=segment_boundaries,
+                segment_names=segment_names,
+            )
             panel = compose_frame_panel(
                 rgb,
                 cue,
@@ -341,6 +670,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 open_count=len(action_rows["OPEN"]),
                 close_count=len(action_rows["CLOSE"]),
                 panel_width=int(args.panel_width),
+                thresholded_render=thresholded,
+                lifecycle_chart=chart,
             )
             event_path = event_dir / f"{timestamp:06d}_{stem}.png"
             panel_path = panels_dir / f"{timestamp:06d}_{stem}.png"
@@ -357,7 +688,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "close_count": len(action_rows["CLOSE"]),
                     "panel": str(panel_path),
                     "event_render": str(event_path),
+                    "event_render_source": event_source,
                     "raw_render": str(raw_path),
+                    "thresholded_render": (
+                        str(threshold_path) if threshold_path is not None else None
+                    ),
+                    "threshold_source": threshold_source,
                 }
             )
 
@@ -383,7 +719,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         "schema_version": 1,
         "contract": "exact-timestamp OPEN/CLOSE event-only immutable-base Gaussian render",
         "run_dir": str(args.run_dir),
-        "raw_render_dir": str(args.raw_render_dir),
+        "raw_render_dir": str(raw_render_dir),
+        "thresholded_render_dir": (
+            str(thresholded_render_dir)
+            if thresholded_render_dir is not None
+            else None
+        ),
+        "captured_event_render_dir": (
+            str(captured_event_render_dir)
+            if captured_event_render_dir is not None
+            else None
+        ),
+        "evaluation_threshold": evaluation_threshold,
+        "threshold_panel_source": (
+            "saved post-opt metric prediction"
+            if thresholded_render_dir is not None
+            else "recomputed from saved raw render"
+        ),
+        "lifecycle_timeline": "causal line prefix; Gaussian counts on one shared axis",
         "frames": len(panel_paths),
         "continuous_gif": str(continuous_gif),
         "segment_gifs": segment_gifs,

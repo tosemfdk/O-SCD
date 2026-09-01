@@ -106,6 +106,13 @@ class BayesianLifespanController:
     calls ``open_rows`` or ``close_rows``.
     """
 
+    topology_buffer_names = (
+        "committed_run_label",
+        "committed_run_start",
+        "pending_run_start",
+        "pending_changepoint_probability",
+    )
+
     def __init__(
         self,
         temporal_model,

@@ -18,6 +18,7 @@ from gaussian_renderer import render_change
 
 CueMode = Literal["binary", "soft"]
 EvidenceCountMode = Literal["raw", "capped"]
+ProbeScalingMode = Literal["native", "isotropic_min"]
 
 
 @dataclass(frozen=True)
@@ -34,6 +35,35 @@ class EvidenceResult:
     mode: CueMode
     count_mode: EvidenceCountMode
     soft_is_fractional_extension: bool
+
+
+def evidence_probe_scaling(
+    scaling: torch.Tensor,
+    *,
+    mode: ProbeScalingMode = "native",
+) -> torch.Tensor:
+    """Return detached detector-probe scales without expanding support.
+
+    ``isotropic_min`` replaces every 3D axis with the row's shortest native
+    axis.  It therefore removes elongated evidence footprints without growing
+    a Gaussian along either of its shorter axes.  This affects only the
+    alpha-transmittance evidence probe, not the learned/rendered representation.
+    """
+
+    if not isinstance(scaling, torch.Tensor):
+        raise TypeError("scaling must be a tensor")
+    if scaling.ndim != 2 or scaling.shape[1] != 3:
+        raise ValueError("scaling must have shape [N,3]")
+    if not torch.is_floating_point(scaling):
+        raise TypeError("scaling must be floating point")
+    if not bool(torch.isfinite(scaling).all()) or bool((scaling <= 0).any()):
+        raise ValueError("scaling must be finite and strictly positive")
+    if mode == "native":
+        return scaling.detach()
+    if mode != "isotropic_min":
+        raise ValueError("probe scaling mode must be native|isotropic_min")
+    shortest = scaling.detach().amin(dim=1, keepdim=True)
+    return shortest.expand_as(scaling).contiguous()
 
 
 def cue_to_change_probability(
@@ -120,6 +150,7 @@ def alpha_t_evidence_vjp(
     mass_saturation: float = 1.0,
     min_evidence_mass: float = 0.0,
     eps: float = 1e-8,
+    probe_scaling_mode: ProbeScalingMode = "native",
 ) -> EvidenceResult:
     """Accumulate per-Gaussian ``alpha_i T_i`` evidence with one VJP.
 
@@ -152,6 +183,9 @@ def alpha_t_evidence_vjp(
         for name in ("_xyz", "_features_dc", "_features_rest", "_opacity", "_scaling", "_rotation")
     }
     probe_color = torch.zeros((n, 3), device=device, dtype=dtype, requires_grad=True)
+    probe_scaling = evidence_probe_scaling(
+        base.get_scaling.detach(), mode=probe_scaling_mode
+    )
     rendered = render_change(
         view,
         base,
@@ -160,7 +194,7 @@ def alpha_t_evidence_vjp(
         override_color=probe_color,
         override_opacity=base.get_opacity.detach(),
         override_xyz=base.get_xyz.detach(),
-        override_scaling=base.get_scaling.detach(),
+        override_scaling=probe_scaling,
         override_rotation=base.get_rotation.detach(),
         clamp_output=False,
     )["render"]
@@ -230,6 +264,7 @@ def accumulate_change_evidence(
     count_mode: EvidenceCountMode = "raw",
     mass_saturation: float = 1.0,
     min_evidence_mass: float = 0.0,
+    probe_scaling_mode: ProbeScalingMode = "native",
 ) -> EvidenceResult:
     """Full cue conversion + lifespan-agnostic alpha-T VJP evidence."""
     cue = cue_to_change_probability(
@@ -247,6 +282,7 @@ def accumulate_change_evidence(
         count_mode=count_mode,
         mass_saturation=mass_saturation,
         min_evidence_mass=min_evidence_mass,
+        probe_scaling_mode=probe_scaling_mode,
     )
     return EvidenceResult(
         e_plus=result.e_plus,

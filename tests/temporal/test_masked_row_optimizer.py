@@ -86,3 +86,43 @@ def test_masked_row_adam_accepts_distinct_parameter_row_masks():
     assert torch.count_nonzero(parameters["xyz"][0]) == 1
     assert torch.count_nonzero(parameters["xyz"][1:]) == 0
     assert optimizer.state[parameters["xyz"]]["step"].tolist() == [1, 0, 0]
+
+
+def test_reset_state_rows_is_exact_and_parameter_group_specific():
+    parameters = {
+        "dc": nn.Parameter(torch.zeros(3, 1, 3)),
+        "opacity": nn.Parameter(torch.zeros(3, 1)),
+    }
+    optimizer = MaskedRowAdam(
+        parameters,
+        thaw_names=("dc", "opacity"),
+        lrs={"dc": 0.01, "opacity": 0.01},
+        amsgrad=True,
+    )
+    for parameter in parameters.values():
+        parameter.grad = torch.ones_like(parameter)
+    optimizer.step(torch.tensor([True, True, True]))
+
+    dc_value_before = parameters["dc"].detach().clone()
+    opacity_state_before = {
+        name: value.detach().clone()
+        for name, value in optimizer.state[parameters["opacity"]].items()
+        if isinstance(value, torch.Tensor)
+    }
+    dc_unselected_before = {
+        name: value[[0, 2]].detach().clone()
+        for name, value in optimizer.state[parameters["dc"]].items()
+        if isinstance(value, torch.Tensor)
+    }
+
+    optimizer.reset_state_rows(
+        torch.tensor([False, True, False]), names=("dc",)
+    )
+
+    assert torch.equal(parameters["dc"], dc_value_before)
+    dc_state = optimizer.state[parameters["dc"]]
+    for name in ("step", "exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
+        assert torch.count_nonzero(dc_state[name][1]) == 0
+        assert torch.equal(dc_state[name][[0, 2]], dc_unselected_before[name])
+    for name, expected in opacity_state_before.items():
+        assert torch.equal(optimizer.state[parameters["opacity"]][name], expected)

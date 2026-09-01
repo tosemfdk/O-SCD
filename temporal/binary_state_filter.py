@@ -72,6 +72,7 @@ class BinaryStateFilter:
     """Causal direct binary filter over Gaussian active/inactive state."""
 
     algorithm = "direct_binary_state_filter"
+    topology_buffer_names = ("p_active", "visible_observations", "last_timestamp")
 
     def __init__(
         self,

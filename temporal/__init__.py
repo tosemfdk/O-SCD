@@ -30,6 +30,10 @@ from .bernoulli_bocd import (
     beta_binomial_log_predictive,
     make_bocd_filter,
 )
+from .single_candidate_beta import (
+    SingleCandidateBetaConfig,
+    SingleCandidateBetaFilter,
+)
 from .change_evidence import (
     ChangeEvidence,
     EvidenceResult,
@@ -141,6 +145,8 @@ __all__ = [
     "BetaBernoulliBOCD",
     "BernoulliBOCDConfig",
     "make_bocd_filter",
+    "SingleCandidateBetaConfig",
+    "SingleCandidateBetaFilter",
     "LifespanAction",
     "BayesianLifespanControllerConfig",
     "BayesianLifespanController",

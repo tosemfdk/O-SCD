@@ -348,6 +348,38 @@ class MaskedRowAdam(Optimizer):
         return mask.to(device=parameter.device)
 
     @torch.no_grad()
+    def reset_state_rows(
+        self,
+        row_mask: torch.Tensor,
+        *,
+        names: Iterable[str] | None = None,
+    ) -> None:
+        """Zero Adam state on selected rows of selected parameter groups.
+
+        This is intentionally narrower than recreating an optimizer.  It lets
+        an experiment replace one persistent attribute (for example DC on a
+        first OPEN) without discarding geometry/opacity history or touching
+        unselected rows.  Parameter values themselves are never modified.
+        """
+
+        available = {str(group["name"]) for group in self.param_groups}
+        selected_names = available if names is None else set(names)
+        unknown = sorted(selected_names - available)
+        if unknown:
+            raise ValueError(f"unknown optimizer state names: {unknown}")
+
+        for group in self.param_groups:
+            if str(group["name"]) not in selected_names:
+                continue
+            parameter = group["params"][0]
+            mask = self._validate_row_mask(row_mask, parameter)
+            state = self.state[parameter]
+            for state_name in ("step", "exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
+                value = state.get(state_name)
+                if isinstance(value, torch.Tensor):
+                    value[mask] = 0
+
+    @torch.no_grad()
     def step(
         self,
         active_rows: torch.Tensor | Mapping[str, torch.Tensor],

@@ -10,6 +10,9 @@ from temporal.binary_state_filter import BinaryStateFilter
 from temporal.dynamic_gaussian_topology import DynamicGaussianTopologyManager
 from temporal.masked_optimizer import MaskedRowAdam
 from temporal.persistent_gaussian_lifespan_model import PersistentGaussianLifespanModel
+from temporal.bayesian_lifespan_controller import BayesianLifespanController
+from temporal.bernoulli_bocd import BernoulliBOCDConfig
+from temporal.single_candidate_beta import SingleCandidateBetaFilter
 from temporal.view_consistent_binary_lifespan_controller import (
     ViewConsistentBinaryLifespanController,
 )
@@ -137,6 +140,65 @@ def test_clone_copies_detector_lifecycle_and_then_becomes_independent():
     assert manager.validate()
 
 
+def test_clone_copies_declared_single_candidate_and_bayesian_controller_buffers():
+    model = PersistentGaussianLifespanModel(_Base(3), max_states=4)
+    model.reset_all_lifespans_closed()
+    optimizer = MaskedRowAdam(
+        dict(model.persistent_parameter_items()),
+        lrs={name: 1e-2 for name, _ in model.persistent_parameter_items()},
+    )
+    tracker = SingleCandidateBetaFilter(3)
+    controller = BayesianLifespanController(
+        model,
+        BernoulliBOCDConfig(
+            prior_a=1.0,
+            prior_b=1.0,
+            hazard=0.01,
+            open_probability=0.6,
+            close_probability=0.4,
+            changepoint_probability=0.5,
+            min_run_evidence=1.0,
+            min_visible_observations=1,
+        ),
+    )
+    manager = DynamicGaussianTopologyManager(
+        model, optimizer, tracker, controller, percent_dense=0.01
+    )
+    model.open_rows(torch.tensor([0]), timestamp=0)
+    tracker.initialized[0] = True
+    tracker.stable_a[0] = 8.0
+    tracker.stable_b[0] = 2.0
+    tracker.candidate_active[0] = True
+    tracker.candidate_delta_b[0] = 1.0
+    tracker.candidate_start[0] = 4
+    tracker.candidate_visible_observations[0] = 1
+    controller.committed_run_label[0] = 1
+    controller.committed_run_start[0] = 0
+    controller.pending_run_start[0] = 4
+    controller.pending_changepoint_probability[0] = 1.0
+    manager.xyz_gradient_accum[0] = 1.0
+    manager.denom[0] = 1.0
+
+    result = manager.apply_active_oscd_density_control(
+        timestamp=5,
+        scene_extent=1.0,
+        grad_threshold=1e-3,
+        min_opacity=0.0,
+    )
+
+    assert result.clone_child_count == 1
+    child = 3
+    for name in tracker.topology_buffer_names:
+        assert torch.equal(getattr(tracker, name)[child], getattr(tracker, name)[0]), name
+    for name in controller.topology_buffer_names:
+        assert torch.equal(
+            getattr(controller, name)[child], getattr(controller, name)[0]
+        ), name
+    tracker.stable_a[child] = 3.0
+    assert tracker.stable_a[0].item() == pytest.approx(8.0)
+    assert manager.validate()
+
+
 def test_active_only_prune_can_remove_an_initial_row_but_not_inactive_row():
     model, _optimizer, tracker, _controller, manager = _objects()
     model.open_rows(torch.tensor([0, 2]), timestamp=0)
@@ -235,4 +297,139 @@ def test_split_replaces_any_active_source_with_two_equal_status_children():
         assert torch.count_nonzero(state["exp_avg"][child_rows]).item() == 0
         assert torch.count_nonzero(state["exp_avg_sq"][child_rows]).item() == 0
         assert torch.count_nonzero(state["step"][child_rows]).item() == 0
+    assert manager.validate()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="split primitive is CUDA-only")
+def test_cue_mixture_can_split_large_active_row_without_xyz_gradient():
+    model, _optimizer, _tracker, _controller, manager = _objects(device="cuda")
+    model.open_rows(torch.tensor([0], device="cuda"), timestamp=0)
+    model.scaling.data[0].fill_(math.log(0.1))
+    source_id = int(manager.stable_id[0].item())
+
+    result = manager.apply_active_oscd_density_control(
+        timestamp=1,
+        scene_extent=1.0,
+        grad_threshold=1e-3,
+        min_opacity=0.0,
+        cue_mixture_score=torch.tensor([0.75, 0.0, 0.0], device="cuda"),
+        cue_mixture_threshold=0.5,
+    )
+
+    assert result.gradient_split_source_count == 0
+    assert result.cue_mixture_split_source_count == 1
+    assert result.cue_mixture_only_split_source_count == 1
+    assert result.split_source_count == 1
+    assert result.split_child_count == 2
+    assert result.masks.cue_mixture_split.tolist() == [True, False, False]
+    assert source_id not in manager.stable_id.tolist()
+    assert manager.count == 4
+    assert manager.validate()
+
+
+def test_cue_mixture_does_not_clone_small_or_inactive_rows():
+    model, _optimizer, _tracker, _controller, manager = _objects()
+    model.open_rows(torch.tensor([0]), timestamp=0)
+
+    result = manager.apply_active_oscd_density_control(
+        timestamp=1,
+        scene_extent=1.0,
+        grad_threshold=1e-3,
+        min_opacity=0.0,
+        cue_mixture_score=torch.tensor([1.0, 1.0, 0.0]),
+        cue_mixture_threshold=0.5,
+    )
+
+    assert result.clone_source_count == 0
+    assert result.split_source_count == 0
+    assert result.cue_mixture_split_source_count == 0
+    assert manager.count == 3
+
+
+def test_black_child_pruning_never_removes_initial_rows_or_same_event_children():
+    model, _optimizer, _tracker, _controller, manager = _objects()
+    model.open_rows(torch.tensor([0]), timestamp=0)
+    model.change_dc.data[0].fill_(-1.0)
+    initial_stable_id = int(manager.stable_id[0].item())
+    manager.xyz_gradient_accum[0] = 1.0
+    manager.denom[0] = 1.0
+
+    born = manager.apply_active_oscd_density_control(
+        timestamp=0,
+        scene_extent=1.0,
+        grad_threshold=1e-3,
+        min_opacity=0.0,
+        black_child_prune_threshold=0.5,
+        black_child_prune_min_age_frames=1,
+    )
+
+    assert born.clone_child_count == 1
+    assert born.black_child_prune_candidate_count == 0
+    assert born.black_child_pruned_count == 0
+    assert manager.count == 4
+    assert initial_stable_id in manager.stable_id.tolist()
+
+    pruned = manager.apply_active_oscd_density_control(
+        timestamp=1,
+        scene_extent=1.0,
+        grad_threshold=1.0,
+        min_opacity=0.0,
+        black_child_prune_threshold=0.5,
+        black_child_prune_min_age_frames=1,
+    )
+
+    assert pruned.black_child_prune_candidate_count == 1
+    assert pruned.black_child_pruned_count == 1
+    assert pruned.black_child_retained_for_support_count == 0
+    assert manager.count == 3
+    assert initial_stable_id in manager.stable_id.tolist()
+    assert bool((manager.generation == 0).all())
+    assert manager.validate()
+
+
+def test_black_child_pruning_keeps_one_child_when_removed_parent_has_no_support():
+    model, _optimizer, _tracker, _controller, manager = _objects()
+    model.open_rows(torch.tensor([0]), timestamp=0)
+    model.change_dc.data[0].fill_(-1.0)
+    parent_stable_id = int(manager.stable_id[0].item())
+
+    for timestamp in (0, 1):
+        parent_row = manager.stable_id.tolist().index(parent_stable_id)
+        manager.xyz_gradient_accum[parent_row] = 1.0
+        manager.denom[parent_row] = 1.0
+        result = manager.apply_active_oscd_density_control(
+            timestamp=timestamp,
+            scene_extent=1.0,
+            grad_threshold=1e-3,
+            min_opacity=0.0,
+        )
+        assert result.clone_child_count == 1
+
+    parent_row = manager.stable_id.tolist().index(parent_stable_id)
+    child_rows = torch.nonzero(
+        manager.parent_stable_id == parent_stable_id, as_tuple=False
+    ).flatten()
+    assert child_rows.numel() == 2
+    model.opacity.data[parent_row] = -10.0
+    model.opacity.data[child_rows] = 2.0
+
+    result = manager.apply_active_oscd_density_control(
+        timestamp=2,
+        scene_extent=1.0,
+        grad_threshold=1.0,
+        min_opacity=0.4,
+        black_child_prune_threshold=0.5,
+        black_child_prune_min_age_frames=1,
+    )
+
+    assert result.opacity_pruned_count == 1
+    assert result.black_child_prune_candidate_count == 2
+    assert result.black_child_pruned_count == 1
+    assert result.black_child_retained_for_support_count == 1
+    assert parent_stable_id not in manager.stable_id.tolist()
+    surviving_children = torch.nonzero(
+        manager.parent_stable_id == parent_stable_id, as_tuple=False
+    ).flatten()
+    assert surviving_children.numel() == 1
+    assert manager.generation[surviving_children].item() == 1
     assert manager.validate()

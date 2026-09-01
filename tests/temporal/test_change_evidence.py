@@ -1,7 +1,11 @@
 import pytest
 import torch
 
-from temporal.change_evidence import cue_to_change_probability, evidence_counts
+from temporal.change_evidence import (
+    cue_to_change_probability,
+    evidence_counts,
+    evidence_probe_scaling,
+)
 
 
 def test_cue_modes_binary_and_soft_fractional_extension():
@@ -32,3 +36,26 @@ def test_invalid_cues_and_evidence_are_rejected():
         evidence_counts(torch.ones(2), torch.ones(3))
     with pytest.raises(ValueError, match="nonnegative"):
         evidence_counts(torch.tensor([-1.0]), torch.tensor([1.0]))
+
+
+def test_isotropic_min_probe_scaling_shortens_only_long_axes_and_detaches():
+    scaling = torch.tensor(
+        [[1.0, 4.0, 2.0], [0.5, 0.25, 3.0]], requires_grad=True
+    )
+
+    native = evidence_probe_scaling(scaling, mode="native")
+    isotropic = evidence_probe_scaling(scaling, mode="isotropic_min")
+
+    assert not native.requires_grad
+    assert not isotropic.requires_grad
+    assert torch.equal(native, scaling.detach())
+    assert torch.equal(
+        isotropic,
+        torch.tensor([[1.0, 1.0, 1.0], [0.25, 0.25, 0.25]]),
+    )
+    assert bool((isotropic <= scaling.detach()).all())
+
+
+def test_probe_scaling_rejects_unknown_mode():
+    with pytest.raises(ValueError, match=r"native\|isotropic_min"):
+        evidence_probe_scaling(torch.ones(2, 3), mode="unknown")

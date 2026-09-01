@@ -296,10 +296,20 @@ def test_never_open_zero_dc_gaussian_occludes_open_change_gaussian():
         timestamp=0,
         include_never_open_occluders=True,
     )["render"]
+    with_black_occluder = render_change_temporal(
+        camera,
+        model,
+        pipe,
+        background,
+        timestamp=0,
+        include_never_open_occluders=True,
+        black_never_open_occluders=True,
+    )["render"]
 
     center = (slice(None), 32, 32)
     assert open_only[center].mean() > 0
     assert with_occluder[center].mean() < open_only[center].mean()
+    assert with_black_occluder[center].mean() < with_occluder[center].mean()
 
 
 def test_geometry_overrides_validate_and_receive_only_active_state_gradients():

@@ -9,6 +9,7 @@ from temporal.binary_state_lifespan_controller import (
     BinaryStateLifespanController,
     BinaryStateLifespanControllerConfig,
 )
+from utils.sh_utils import SH2RGB
 
 
 def make_bank(n: int = 2) -> SimpleNamespace:
@@ -145,6 +146,32 @@ def test_never_open_rows_render_as_fixed_zero_change_occluders_but_closed_rows_h
         assert torch.count_nonzero(parameter.grad[0]) > 0
         assert torch.count_nonzero(parameter.grad[1]) == 0
         assert torch.count_nonzero(parameter.grad[2]) == 0
+
+
+def test_never_open_black_override_is_rgb_zero_and_remains_frozen():
+    model = PersistentGaussianLifespanModel(make_bank(3), max_states=2)
+    model.reset_all_lifespans_closed()
+    model.open_rows([0, 2], timestamp=0)
+    model.close_rows([2], timestamp=1)
+
+    neutral = model.get_open_or_never_open_render_attributes(1.0)
+    black = model.get_open_or_never_open_render_attributes(
+        1.0, black_never_open=True
+    )
+
+    assert torch.allclose(
+        SH2RGB(neutral["dc"][1]), torch.full_like(neutral["dc"][1], 0.5)
+    )
+    assert torch.allclose(
+        SH2RGB(black["dc"][1]), torch.zeros_like(black["dc"][1])
+    )
+    assert black["opacity"][1].item() == neutral["opacity"][1].item()
+    assert black["opacity"][2].item() == 0.0
+
+    black["dc"].sum().backward()
+    assert torch.count_nonzero(model.change_dc.grad[0]) > 0
+    assert torch.count_nonzero(model.change_dc.grad[1]) == 0
+    assert torch.count_nonzero(model.change_dc.grad[2]) == 0
 
 
 def test_never_open_rows_can_train_dc_opacity_without_geometry():

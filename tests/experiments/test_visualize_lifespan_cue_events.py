@@ -10,7 +10,10 @@ from experiments.visualize_lifespan_cue_events import (
     OPEN_COLOR,
     compose_frame_panel,
     event_probe_tensors,
+    load_evaluation_mask_rgb,
     load_transition_rows,
+    open_close_timeline_chart,
+    threshold_render_rgb,
     turbo_heatmap,
 )
 
@@ -81,3 +84,68 @@ def test_panel_uses_turbo_cue_and_exact_event_palette():
     )
     assert panel.width == 30 * 4 + 8 * 3
     assert panel.height > 30
+
+
+def test_threshold_render_uses_channel_mean_at_half():
+    raw = np.array(
+        [[[255, 255, 0], [255, 0, 0], [128, 128, 127], [127, 127, 128]]],
+        dtype=np.uint8,
+    )
+
+    thresholded = threshold_render_rgb(raw, threshold=0.5)
+
+    assert thresholded.tolist() == [
+        [[255, 255, 255], [0, 0, 0], [255, 255, 255], [0, 0, 0]]
+    ]
+
+
+def test_saved_evaluation_mask_is_used_instead_of_rethresholding_raw(tmp_path: Path):
+    raw = np.full((2, 2, 3), 255, dtype=np.uint8)
+    saved = np.array([[0, 255], [255, 0]], dtype=np.uint8)
+    path = tmp_path / "mask.png"
+    from PIL import Image
+
+    Image.fromarray(saved).save(path)
+
+    rendered, source = load_evaluation_mask_rgb(
+        path,
+        raw_render=raw,
+        threshold=0.5,
+    )
+
+    assert source == "saved_metric_prediction"
+    assert rendered[..., 0].tolist() == saved.tolist()
+    assert np.array_equal(rendered[..., 0], rendered[..., 1])
+    assert np.array_equal(rendered[..., 1], rendered[..., 2])
+
+
+def test_extended_panel_adds_threshold_mask_and_absolute_count_timeline():
+    panel_width = 70
+    total_width = panel_width * 5 + 8 * 4
+    chart = open_close_timeline_chart(
+        [0, 4, 2, 7],
+        [0, 1, 3, 2],
+        current_timestamp=2,
+        width=total_width,
+        height=180,
+        boundaries=[2],
+        segment_names=["SC1", "SC2"],
+    )
+    rgb = np.zeros((4, 3, 3), dtype=np.uint8)
+    panel = compose_frame_panel(
+        rgb,
+        np.zeros((4, 3), dtype=np.float32),
+        rgb,
+        rgb,
+        timestamp=2,
+        segment="scene_change2",
+        open_count=2,
+        close_count=3,
+        panel_width=panel_width,
+        thresholded_render=rgb,
+        lifecycle_chart=chart,
+    )
+
+    assert chart.size == (total_width, 180)
+    assert panel.width == total_width
+    assert panel.height > chart.height
