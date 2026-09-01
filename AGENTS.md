@@ -2,6 +2,14 @@
 
 이 저장소에서 작업하는 모든 Codex 에이전트는 사용자가 달리 명시하지 않는 한 아래 내용을 프로젝트의 기본 연구 방향과 문제 정의로 간주한다.
 
+## 수식 출력 규칙
+
+현재 사용하는 Codex CLI TUI는 LaTeX/KaTeX를 렌더링하지 않는다. 대화 응답에서는 `$...$`, `$$...$$`, `\(...\)`, `\[...\]` 구문을 사용하지 않는다.
+
+- 짧은 수식은 Unicode 수학 기호와 위·아래 첨자로 적는다. 예: `πᵢ = aᵢ / (aᵢ + bᵢ)`
+- 복잡한 수식은 `text` 코드 블록에 ASCII/Unicode 분수선과 정렬을 사용한다.
+- LaTeX 원문이 필요한 경우에만 별도로 제공하고, 항상 바로 읽히는 Unicode 버전을 먼저 제공한다.
+
 ## 우리가 푸는 문제
 
 기존 online Scene Change Detection(SCD)은 고정된 기준 장면 `R_ref`와 순차적으로 들어오는 이미지 사이의 변화를 검출한다. O-SCD는 이전 프레임에서 얻은 변화 단서를 `R_change`에 누적하여 멀티뷰 일관성을 확보하지만, 하나의 관측 구간 동안 post-change scene이 고정되어 있다고 가정한다.
@@ -47,6 +55,32 @@ g_i: {(change state, start time, end time, confidence)}
 - **Outdated evidence handling:** 과거 변화 evidence와 현재 evidence를 구분하고, 오래된 evidence가 현재 결과를 오염시키지 않도록 해야 한다.
 - **Repeated evolution:** 같은 Gaussian 영역이 changed, reverted, removed, 또는 changed-again 상태로 반복 전이할 수 있음을 전제로 한다.
 
+## 현재 detector의 확정 범위와 입력 계약
+
+현재 Gaussian lifespan detector는 Gaussian별 **binary reference-change validity**만
+추적한다.
+
+```text
+inactive/reference-consistent -> active/reference-different -> inactive -> active
+```
+
+- 동일 Gaussian이 `SC1`과 `SC2`에서 모두 reference와 다르면 `active -> active`
+  `KEEP`으로 처리한다. 두 changed appearance 사이의 의미적 상태 구분이나 새
+  lifespan 분리는 현재 설계 범위가 아니며, 이는 의도된 동작이다.
+- Detector는 각 신규 online frame에서 representation optimization을 시작하기 전에
+  계산한 raw cue의 Gaussian별 alpha-transmittance evidence만 한 번 사용한다.
+- 학습된 change DC `C_i`, `C_i`와 cue의 차이, optimizer가 `C_i`를 움직인 양,
+  같은 timestamp의 post-optimization render, 과거 replay view는 detector evidence로
+  다시 사용하지 않는다.
+- Candidate가 살아 있어도 stable/candidate Beta에는 이후 신규 frame의
+  pre-optimization raw evidence만 추가한다. Representation 학습 결과가 이미 처리한
+  frame의 detector 판단으로 역류해서는 안 된다.
+- Learned-DC agreement 및 detached-anchor/K3 detector는 비교 실험으로만 보존하며
+  현재 기본 detector가 아니다.
+- Representation renderer에서는 frozen `NEVER_OPEN` Gaussian의 geometry/opacity
+  occlusion을 유지하되 change color는 RGB black으로 override한다. `CLOSED`는
+  렌더링하지 않는다.
+
 ## 한 문장 요약
 
 > Detect not only where the scene differs from the reference, but also when that difference itself changes.
@@ -73,4 +107,7 @@ g_i: {(change state, start time, end time, confidence)}
 - Persistent direct R_change ablation: lifespan slot에서 DC/geometry delta를 제거하고 Gaussian마다 하나의 mutable change DC/xyz/SH-rest/opacity/scaling/rotation을 직접 유지한다. CLOSE는 opacity gate만 숨기며 값과 Adam moment를 보존하고, REOPEN은 새 interval slot을 할당하되 같은 값에서 학습을 재개한다. 동일 K3/BF3 detector의 독립 SC1/SC2/SC3 u120에서 lifecycle event는 state-local baseline과 정확히 같았고 frame-weighted mIoU/F1은 `0.5882/0.7091 -> 0.5897/0.7102`였다. Peak CUDA memory는 약 `62%`, runtime은 `35--39%` 감소했지만 chattering은 그대로이므로 detector blocker를 해결하지는 않는다. 상세 내용은 [`docs/persistent-direct-rchange-lifespan-ablation-ko.md`](docs/persistent-direct-rchange-lifespan-ablation-ko.md)에 기록한다.
 - Equal-status dynamic ACTIVE O-SCD density ablation: reference-prefix/residual class를 없애고 모든 mutable `R_change` row를 동등하게 취급한다. ACTIVE-visible row만 16-step O-SCD loss로 직접 DC/geometry를 학습하고 local update 4에서 ACTIVE-only gradient clone/split을 수행한다. 새 row는 source의 Bayesian/controller/lifespan state를 한 번 복사한 뒤 독립적으로 갱신된다. 독립 SC1/SC2/SC3에서 densify-only weighted mIoU/F1은 fixed topology `0.5779/0.7044` 대비 `0.5768/0.7033`으로 거의 중립이었다. ACTIVE `opacity<0.4` prune을 추가하면 18k--41k row를 제거하며 `0.5715/0.6992`로 하락했다. 상세 내용은 [`docs/dynamic-active-oscd-density-ko.md`](docs/dynamic-active-oscd-density-ko.md)에 기록한다.
 - Never-open occlusion/appearance ablation: OPEN-only renderer가 unchanged foreground occluder를 제거하는 문제를 분리했다. NEVER_OPEN row를 고정 zero-DC occluder로만 복원하면 weighted mIoU가 `0.5779 -> 0.4557`로 하락했지만, 해당 row의 geometry는 고정하고 DC/opacity만 visible-view에서 학습하면 `0.6351/0.7539`까지 회복했다. 여기에 원본 O-SCD식 update-4 gradient clone/split을 켜면 `0.6449/0.7618`로 올라 원본 독립 O-SCD online `0.6471/0.7619`와 `-0.0023/-0.0002` 차이였다. 그러나 동일 state를 유지한 연속 `ref -> SC1 -> SC2 -> SC3`에서는 mIoU/F1 `0.4833/0.6028`로 원본 O-SCD `0.5178/0.6401`보다 낮았다. NEVER_OPEN appearance의 lifespan 우회와 cross-state causal replay가 남은 누적 오염 후보다. CLOSED row는 계속 숨기고 모든 parameter/Adam state drift는 0이었다. 상세 내용은 [`docs/open-never-open-appearance-ablation-ko.md`](docs/open-never-open-appearance-ablation-ko.md)에 기록한다.
+- Raw-cue mixture density + black-child pruning ablation: raw BF30 + black frozen NEVER_OPEN + all-OPEN u16 continuous에서 density-off / gradient-only / gradient+cue-mixture / mixture+child-prune mean-frame mIoU/F1은 `0.4903/0.6271`, `0.4874/0.6248`, `0.4839/0.6209`, `0.4852/0.6224`였다. Child pruning은 generation-zero와 same-event child를 보호하고, 1 frame 이상 지난 OPEN densified child 중 intrinsic DC가 0.5 미만인 일부만 hard-prune하며 직접 부모/sibling support가 모두 없으면 한 child를 보존한다. Continuous에서 8,539개를 삭제해 final black ACTIVE 비율을 `0.6625 -> 0.6446`으로 낮췄지만 density-off를 넘지 못했다. PASLCD 20 scenes/500 frames에서는 네 조건이 `0.4566/0.6125`, `0.4561/0.6120`, `0.4515/0.6077`, `0.4523/0.6084`였고 child 62,678개를 삭제해도 O-SCD online `0.4887/0.6423`보다 낮았다. Mixture 대비 `+0.0008` mIoU point estimate는 Cantina CUDA 반복 변동과 같은 규모라 개선 증거로 보지 않는다. Cue-mixture OR split과 child pruning은 기본 방법으로 채택하지 않는다. 상세 내용은 [`docs/bf30-black-cue-mixture-density-ablation-ko.md`](docs/bf30-black-cue-mixture-density-ablation-ko.md), [`docs/bf30-black-child-prune-paslcd-ablation-ko.md`](docs/bf30-black-child-prune-paslcd-ablation-ko.md)에 기록한다.
+- CLOSE-only asymmetric candidate output gate: `lifespan_gate_beta` BF30의 detector evidence/commit과 hard-gated training/density는 유지하면서, committed OPEN의 CLOSE candidate만 normalized log-BF 진행도에 따라 output opacity를 줄이고 CLOSED의 OPEN candidate는 commit 전까지 숨긴다. 연속 304 frames에서 hard 대비 mean-frame mIoU/F1은 `0.4261/0.5696 -> 0.4403/0.5833`이었고 FP는 684,942 pixel 줄었다. PASLCD 20 scenes/500 frames에서도 `0.3711/0.5125 -> 0.3840/0.5257`, 19/20 scene 개선, FP `-7.86%`를 기록했다. 양방향 gate는 PASLCD mIoU `0.2094`로 무너졌다. CLOSE-only는 유효한 precision 보정이지만 PASLCD O-SCD online `0.4887/0.6423`보다 여전히 낮으므로 detector/representation 전체 해법으로 해석하지 않는다. 상세 내용은 [`docs/bf30-close-only-transition-opacity-gate-ablation-ko.md`](docs/bf30-close-only-transition-opacity-gate-ablation-ko.md)에 기록한다.
+- Raw-cue learned-DC CLOSE-candidate output ablation: pre-optimization raw alpha-T cue 분포만 사용하는 `single_candidate_beta` BF30과 learned persistent DC를 다시 결합하고, committed OPEN 중 fresh candidate Beta mean이 `<=0.4`인 CLOSE 방향 row만 `1-clamp(logBF/log30,0,1)`로 output opacity를 감쇠한다. Learned DC/geometry/opacity, detector, training, replay, density, hard lifecycle은 변경하지 않으며 frozen black NEVER_OPEN은 full-opacity occluder로 유지한다. 동일 run의 동일 parameter/lifecycle에서 hard/soft render를 함께 평가한 결과 연속 304 frames mIoU/F1은 `0.4896/0.6263 -> 0.4938/0.6304`, PASLCD 20 scenes/500 frames는 `0.4566/0.6124 -> 0.4604/0.6159`였고 19/20 scene에서 mIoU가 증가했다. Detector의 learned-DC input, OPEN-candidate preview, CLOSED drift, wrong gradient, future-view access는 모두 0이었다. 이는 detector 개선이 아니라 candidate uncertainty를 이용한 output precision 보정으로 해석한다. 상세 내용은 [`docs/bf30-raw-cue-learned-dc-close-candidate-output-ablation-ko.md`](docs/bf30-raw-cue-learned-dc-close-candidate-output-ablation-ko.md)에 기록한다.
 - 이 checkpoint에는 MCMC, SGLD, relocation, unrestricted image-space Gaussian birth는 포함하지 않는다. Production temporal model의 기본 topology는 fixed이며, dynamic topology는 active residual density와 equal-status mutable-bank ablation runner에서만 명시적으로 사용한다.
