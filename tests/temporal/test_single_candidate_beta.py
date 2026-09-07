@@ -49,6 +49,7 @@ def _update(
     mass=None,
     rows=None,
     support=None,
+    log_threshold=None,
 ):
     positive = torch.as_tensor(positive, dtype=torch.float64).flatten()
     negative = torch.as_tensor(negative, dtype=torch.float64).flatten()
@@ -57,6 +58,7 @@ def _update(
         negative,
         total_mass=positive + negative if mass is None else mass,
         candidate_support=support,
+        log_bayes_factor_threshold=log_threshold,
         row_indices=rows,
         timestamp=timestamp,
     )
@@ -128,6 +130,59 @@ def test_two_surprising_failures_commit_reset_at_candidate_start():
     assert tracker.stable_b.tolist() == pytest.approx([3.0])
     assert tracker.stable_visible_observations.tolist() == [2]
     assert tracker.candidate_active.tolist() == [False]
+
+
+
+
+def test_log_threshold_override_can_commit_only_selected_row_early():
+    tracker = _filter(threshold=30.0, rows=2)
+    tracker.initialized[:] = True
+    tracker.stable_a[:] = 10.0
+    tracker.stable_b[:] = 1.0
+    tracker.stable_total_evidence[:] = 9.0
+    tracker.stable_run_start[:] = 0
+    tracker.stable_visible_observations[:] = 9
+
+    _update(
+        tracker,
+        [0.0, 0.0],
+        [1.0, 1.0],
+        10,
+        log_threshold=torch.log(torch.tensor([10.0, 30.0], dtype=torch.float64)),
+    )
+    second = _update(
+        tracker,
+        [0.0, 0.0],
+        [1.0, 1.0],
+        11,
+        log_threshold=torch.log(torch.tensor([10.0, 30.0], dtype=torch.float64)),
+    )
+
+    assert second.candidate_committed.tolist() == [True, False]
+    assert second.candidate_active.tolist() == [False, True]
+
+    third = _update(
+        tracker,
+        [0.0],
+        [1.0],
+        12,
+        rows=torch.tensor([1]),
+        log_threshold=math.log(30.0),
+    )
+
+    assert third.candidate_committed.tolist() == [True]
+
+
+def test_log_threshold_override_validation_happens_before_mutation():
+    tracker = _filter(rows=1)
+    _update(tracker, [1.0], [0.0], 0)
+    before = tracker.state_dict()
+
+    with pytest.raises(ValueError, match="> 0"):
+        _update(tracker, [0.0], [1.0], 1, log_threshold=0.0)
+
+    for name, expected in before.items():
+        assert torch.equal(getattr(tracker, name), expected), name
 
 
 def test_commit_waits_for_requested_number_of_supporting_views():

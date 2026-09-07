@@ -1,0 +1,170 @@
+{
+  "schema_version": 2,
+  "checkpoint_date": "2026-09-04",
+  "status": "superseded_timestamp_mismatch_checkpoint",
+  "launcher": "run_bayesian_detector_viewer.sh",
+  "viewer_module": "experiments/view_bayesian_detector_steps.py",
+  "artifacts": {
+    "learned_cue_boundary": "outputs/stage2_l1_power_sigmoid_boundary_causal_prequential/learned_boundaries_causal.json",
+    "da3_seed_proposals": "outputs/causal_da3metric_scene123_panel7pos010_depthpos003_dynamiccoverage_20260904/da3_seed_replay.pt",
+    "signed_sam_trace": "outputs/e4_online_xfeat_new_seed_scene123_120_final_corrected_20260814"
+  },
+  "sha256": {
+    "learned_cue_boundary": "5031d760d54e8cacc146d40ada2a17de99db29fb093082135ebf47bd60bb6d85",
+    "da3_seed_proposals": "1aa135bae68b19590edeb2528963f6eea9272bf9b1302add86de0e1b69231a5f",
+    "launcher_at_checkpoint": "be93780423c43edef09044539d93ef85aa02b1d3148146ab2daa87fcdd908f41"
+  },
+  "cue": {
+    "fusion": "l1_power_product",
+    "product_exponent": 0.3,
+    "mode": "soft",
+    "cue_scale": 2.0,
+    "remap": "learned_sigmoid",
+    "initial_tau": 0.25,
+    "initial_width": 0.1
+  },
+  "depth": {
+    "model": "depth-anything/DA3METRIC-LARGE",
+    "scale_fit_reference_alpha_min": 0.5,
+    "scale_fit_q_max_exclusive": 0.2,
+    "signed_sam_panel": 8,
+    "signed_sam_absolute_support_threshold": 0.1,
+    "depth_difference_panel": 9,
+    "depth_difference_absolute_threshold": 0.03,
+    "depth_difference_normalization": "per_frame_overlap_abs_q95"
+  },
+  "seed_birth": {
+    "rule": "reference_alpha >= 0.5 AND panel8 > +0.1 AND rendered_gs_depth - scaled_da3_depth > +0.03",
+    "hard_q_threshold": null,
+    "sam_top_magnitude_quantile": null,
+    "fixed_voxel_occupancy_m": null,
+    "sampling_stride": 4,
+    "max_proposals_per_frame": 2048
+  },
+  "learned_coverage": {
+    "minimum_geometry_updates": 4,
+    "radius_rule": "2.0 * max(current_learned_scale_xyz)",
+    "center_rule": "current_learned_xyz",
+    "eligible_states": [
+      "NEVER_OPEN",
+      "OPEN"
+    ],
+    "excluded_states": [
+      "CLOSED"
+    ]
+  },
+  "detector": {
+    "stable_beta_flip_keep": [
+      1.0,
+      10.0
+    ],
+    "reset_beta_flip_keep": [
+      1.0,
+      1.0
+    ],
+    "bayes_factor_threshold": 30.0,
+    "seed_initial_lifecycle": "NEVER_OPEN with start=inf and end=inf",
+    "seed_birth_frame_detector_evidence": false,
+    "seed_detector_evidence_starts": "next newly observed frame",
+    "commit_handoff": "swap_selected_reset_posterior_without_reinjecting_stable_prior"
+  },
+  "representation": {
+    "updates_per_frame": 120,
+    "latest_frame_branch_probability": 0.33,
+    "final_change_mask_threshold": 0.5,
+    "base_never_open": "frozen_black_occluder",
+    "base_open": "dc_only_visible_rows",
+    "base_closed": "hidden",
+    "seed_never_open": "xyz_scale_rotation_only",
+    "seed_open": "dc_xyz_opacity_scale_rotation",
+    "seed_closed": "hidden",
+    "dc_objective": {
+      "name": "joint_original_oscd_ssf",
+      "target": "full learned sigmoid cue Q without NEW/REMOVE partition",
+      "render_population": [
+        "base OPEN learned DC",
+        "base NEVER_OPEN black occluder",
+        "DA3 OPEN learned DC",
+        "DA3 NEVER_OPEN black occluder"
+      ],
+      "excluded_population": [
+        "base CLOSED",
+        "DA3 CLOSED"
+      ],
+      "probability": "sigmoid(mean_rgb(joint_raw_render))",
+      "detection": "mean(Q * (1 - probability))",
+      "sparsity": "log(mean(probability)^2 + 1)",
+      "loss": "detection + sparsity",
+      "optimized_dc_rows": [
+        "visible base OPEN",
+        "visible DA3 OPEN"
+      ],
+      "uses_nine_point_bce": false,
+      "uses_seed_only_projected_coverage_dc_loss": false
+    },
+    "geometry_objective": {
+      "target": "full learned sigmoid cue Q without NEW/REMOVE partition",
+      "inside_weight": 1.0,
+      "outside_weight": 0.1,
+      "seed_never_open_parameters": [
+        "xyz",
+        "scale",
+        "rotation"
+      ],
+      "seed_open_parameters": [
+        "xyz",
+        "opacity",
+        "scale",
+        "rotation"
+      ]
+    },
+    "new_remove_loss_partition": false,
+    "new_remove_usage": "signed SAM and positive depth residual are used only for DA3 proposal birth"
+  },
+  "viewer": {
+    "panel1_population": "base Gaussians plus every causally born DA3 seed",
+    "panel1_colors": {
+      "NEVER_OPEN": "black",
+      "OPEN": "green",
+      "CLOSED": "red"
+    },
+    "panel5_population": "current-valid base Gaussians plus DA3 sidecar",
+    "panel5_output": "continuous raw R_change score in [0,1]",
+    "panel6_output": "binary prediction mask from the identical panel5 raw tensor with score >= 0.5",
+    "panel7_output": "evaluation-only ADD union REMOVE ground truth",
+    "panel8_output": "upsampled signed SAM difference multiplied by learned Q",
+    "panel9_output": "scale-aligned rendered-GS minus DA3 depth difference"
+  },
+  "proposal_counts": {
+    "scene1": 16842,
+    "scene2": 24206,
+    "scene3": 24631,
+    "total": 65679
+  },
+  "causal_audit": {
+    "future_view_accesses": 0,
+    "ground_truth_birth_accesses": 0,
+    "reference_geometry_mutated": false
+  },
+  "verification": {
+    "targeted_tests_passed": 67,
+    "python_compile": "passed",
+    "git_diff_check": "passed",
+    "gpu_smoke": {
+      "frames": 14,
+      "first_da3_open_frame": 10,
+      "active_da3_seeds_at_frame_13": 56,
+      "joint_oscd_backward": "passed",
+      "smoke_updates_per_frame": 1,
+      "note": "u120 launcher startup verified separately; smoke used one current-view update per frame to validate the joint gradient path"
+    }
+  },
+  "superseded_on": "2026-09-06",
+  "superseded_by": "docs/bayesian-da3-historical-lifespan-replay-20260906.json",
+  "known_issue": {
+    "name": "historical_target_current_lifecycle_timestamp_mismatch",
+    "old_behavior": "sampled camera/cue at k rendered with base and DA3 lifecycle at current t",
+    "replacement_behavior": "sampled camera/cue at k rendered with base and DA3 lifecycle at k"
+  },
+  "sha256_note": "launcher_at_checkpoint authenticates the 2026-09-04 preset, not the current run_bayesian_detector_viewer.sh file"
+}

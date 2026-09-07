@@ -1,0 +1,203 @@
+{
+  "schema_version": 1,
+  "checkpoint_date": "2026-09-06",
+  "status": "canonical_historical_lifespan_replay",
+  "supersedes": [
+    "docs/bayesian-da3-viewer-pipeline-checkpoint-20260904-ko.md",
+    "docs/bayesian-da3-viewer-pipeline-checkpoint-20260904.json"
+  ],
+  "launcher": "run_bayesian_detector_viewer.sh",
+  "viewer_module": "experiments/view_bayesian_detector_steps.py",
+  "canonical_arguments": {
+    "representation_updates": 120,
+    "current_view_probability": 0.33,
+    "representation_cue_amplitude": 2.0,
+    "dc_replay_mode": "sampled",
+    "seed_dc_supervision": "joint",
+    "train_never_open_geometry": true
+  },
+  "replay_contract": {
+    "current_timestamp": "t",
+    "sampled_timestamp": "k with 0 <= k <= t",
+    "camera": "I_k",
+    "dc_target": "2 * Q_k",
+    "geometry_target": "Q_k",
+    "base_population": "OPEN or NEVER_OPEN according to half-open lifespan history at k",
+    "seed_population": "materialized by k and OPEN or NEVER_OPEN according to lifespan history at k",
+    "closed_at_k": "excluded",
+    "seed_materialized_after_k": "excluded",
+    "optimizer_rows": "lifespan-valid at k and visible in the sampled camera",
+    "future_view_access": "forbidden"
+  },
+  "parameter_semantics": {
+    "scope": "one persistent learnable parameter set per Gaussian row",
+    "sharing": "all causal replay views that include the row jointly optimize the same parameter and Adam state",
+    "lifespan_role": "timestamped render and optimizer participation gate",
+    "historical_replay_restores": "the Gaussian population valid at the sampled timestamp",
+    "historical_replay_does_not_restore": "past parameter snapshots",
+    "close_reopen_behavior": "the same Gaussian row resumes with its shared parameter; a new interval changes liveness, not parameter identity",
+    "intended_multiview_optimization": true
+  },
+  "artifacts": {
+    "learned_cue_boundary": "outputs/stage2_l1_power_sigmoid_boundary_causal_prequential/learned_boundaries_causal.json",
+    "da3_seed_proposals": "outputs/causal_da3metric_scene123_panel7pos010_depthpos003_dynamiccoverage_20260904/da3_seed_replay.pt",
+    "signed_sam_trace": "outputs/e4_online_xfeat_new_seed_scene123_120_final_corrected_20260814",
+    "full_run_summary": "outputs/bayesian_da3_historical_replay_20260906/B_h1_amplitude2/summary.json",
+    "full_run_frames": "outputs/bayesian_da3_historical_replay_20260906/B_h1_amplitude2/frame_metrics.csv",
+    "full_run_state": "outputs/bayesian_da3_historical_replay_20260906/B_h1_amplitude2/controlled_state.pt"
+  },
+  "sha256": {
+    "launcher": "b4a69b66f5d3f221cc2c7ab9158a0df80ec52002897f4fc54bd5717037e82b8d",
+    "seed_concat_module": "2494e22257f12880feaa929a426cb099f01454cc774893688d6e872127ea6c22",
+    "seed_loss_module": "1f37e68da6817c6b960ce2a2814f6e9cae951b6ce0e42245c98806706ea3ad1c",
+    "evaluator_module": "74102efab0039da499512edea20dede94dcd3f0fba6cd6dee00334413839da90",
+    "learned_cue_boundary": "5031d760d54e8cacc146d40ada2a17de99db29fb093082135ebf47bd60bb6d85",
+    "da3_seed_proposals": "1aa135bae68b19590edeb2528963f6eea9272bf9b1302add86de0e1b69231a5f",
+    "full_run_summary": "78c581ddc076cf746c2dc7c54be3310cdb0486afa3a522a13a6fb704340904f9",
+    "viewer_module_at_full_run": "ab069b1c00b7a2e967438edf38d1776919cf93359a5b3e52078975e2803ae65e",
+    "viewer_module_current": "8e1e7c182887e9dd5049c8a4d755f5c2d51afd37ad154a8fb992ecc2f752746a"
+  },
+  "full_run": {
+    "condition": "B_h1_amplitude2",
+    "frames": 304,
+    "updates_per_frame": 120,
+    "metrics": {
+      "mean_frame_iou": 0.5249274992793795,
+      "mean_frame_f1": 0.6588015939289984,
+      "precision": 0.6400506290003757,
+      "recall": 0.8567397585067223,
+      "cue_mean_frame_iou": 0.502961990670731,
+      "scene_mean_frame_iou": {
+        "scene_change1": 0.4750317269812008,
+        "scene_change2": 0.6032732558724981,
+        "scene_change3": 0.4924716867331192
+      }
+    },
+    "events": {
+      "base_open": 80742,
+      "base_close": 22062,
+      "seed_open": 5886,
+      "seed_close": 2863,
+      "seed_proposed": 65679,
+      "seed_accepted": 5853,
+      "seed_coverage_rejected": 59826
+    },
+    "historical_lifespan_replay_updates": 23916,
+    "lifespan_render_violations": 0,
+    "future_view_accesses": 0,
+    "runtime_seconds": 916.5961174964905,
+    "peak_cuda_bytes": 10710277632,
+    "gradient_finite_difference_audit": {
+      "status": "ok",
+      "timestamp": 13,
+      "flat_parameter_index": 162,
+      "epsilon": 0.05,
+      "analytic_gradient": -5.1176361012039706e-05,
+      "finite_difference_gradient": -5.125999450683594e-05,
+      "relative_error": 0.0016315548918968024,
+      "loss_plus": 0.28344598412513733,
+      "loss_minus": 0.283451110124588
+    },
+    "interval_history": {
+      "base": {
+        "total_intervals": 80742,
+        "ever_open_rows": 76475,
+        "multi_interval_rows": 3862,
+        "extra_intervals_after_first": 4267,
+        "max_intervals_per_row": 6
+      },
+      "seed": {
+        "total_intervals": 5886,
+        "ever_open_rows": 4802,
+        "multi_interval_rows": 842,
+        "extra_intervals_after_first": 1084,
+        "max_intervals_per_row": 6
+      }
+    }
+  },
+  "comparison_to_20260905_mismatched_B": {
+    "old_metrics": {
+      "mean_frame_iou": 0.5162195630809463,
+      "mean_frame_f1": 0.6496806337364589,
+      "precision": 0.6535756917454445,
+      "recall": 0.8008440633000479,
+      "cue_mean_frame_iou": 0.4746156437034939,
+      "scene_mean_frame_iou": {
+        "scene_change1": 0.4782194980111197,
+        "scene_change2": 0.6143550409469488,
+        "scene_change3": 0.45339972006732004
+      }
+    },
+    "new_metrics": {
+      "mean_frame_iou": 0.5249274992793795,
+      "mean_frame_f1": 0.6588015939289984,
+      "precision": 0.6400506290003757,
+      "recall": 0.8567397585067223,
+      "cue_mean_frame_iou": 0.502961990670731,
+      "scene_mean_frame_iou": {
+        "scene_change1": 0.4750317269812008,
+        "scene_change2": 0.6032732558724981,
+        "scene_change3": 0.4924716867331192
+      }
+    },
+    "delta_new_minus_old": {
+      "mean_frame_iou": 0.008707936198433242,
+      "mean_frame_f1": 0.009120960192539496,
+      "precision": -0.013525062745068817,
+      "recall": 0.05589569520667448,
+      "cue_mean_frame_iou": 0.02834634696723709,
+      "scene_mean_frame_iou": {
+        "scene_change1": -0.0031877710299189066,
+        "scene_change2": -0.011081785074450679,
+        "scene_change3": 0.03907196666579915
+      }
+    }
+  },
+  "comparison_to_current_only_F": {
+    "current_only_metrics": {
+      "mean_frame_iou": 0.5237260883755026,
+      "mean_frame_f1": 0.6595948168013885,
+      "precision": 0.6312988688688501,
+      "recall": 0.8734306872935811,
+      "cue_mean_frame_iou": 0.5176476715906628,
+      "scene_mean_frame_iou": {
+        "scene_change1": 0.4793927562879726,
+        "scene_change2": 0.5900423720904567,
+        "scene_change3": 0.49815249829893227
+      }
+    },
+    "historical_minus_current_only_mean_frame_iou": 0.0012014109038769316,
+    "historical_minus_current_only_mean_frame_f1": -0.0007932228723901424,
+    "historical_minus_current_only_cue_mean_frame_iou": -0.014685680919931832
+  },
+  "verification": {
+    "targeted_tests_passed": 90,
+    "python_compile": "passed",
+    "bash_syntax": "passed",
+    "gpu_smoke": {
+      "frames": 14,
+      "historical_lifespan_replay_updates": 841,
+      "lifespan_render_violations": 0,
+      "future_view_accesses": 0
+    },
+    "full_run": {
+      "frames": 304,
+      "historical_lifespan_replay_updates": 23916,
+      "lifespan_render_violations": 0,
+      "future_view_accesses": 0
+    }
+  },
+  "viewer_only_geometry_variant": {
+    "status": "running_interactive_not_full_evaluated",
+    "arguments": [
+      "--no-train-never-open-geometry",
+      "--geometry-cue-amplitude 2"
+    ],
+    "base_geometry": "frozen",
+    "da3_never_open_geometry": "frozen",
+    "da3_open_geometry": "train xyz, opacity, scale, rotation at sampled historical lifespan",
+    "dc_target": "2 * Q_k",
+    "geometry_target": "unclipped 2 * Q_k",
+    "full_304_frame_metrics_available": false
+  }
+}

@@ -6,8 +6,11 @@ import pytest
 import torch
 
 from experiments.visualize_lifespan_cue_events import (
+    CLOSED_STATE_COLOR,
     CLOSE_COLOR,
     OPEN_COLOR,
+    OPEN_STATE_COLOR,
+    advance_lifecycle_state,
     compose_frame_panel,
     event_probe_tensors,
     load_evaluation_mask_rgb,
@@ -52,12 +55,58 @@ def test_event_probe_colors_only_current_open_and_close_rows():
     assert torch.count_nonzero(colors[[0, 2, 4]]).item() == 0
 
 
+def test_event_probe_keeps_committed_states_dim_and_current_events_bright():
+    colors, selected = event_probe_tensors(
+        6,
+        open_rows=[1],
+        close_rows=[4],
+        open_state_rows=[1, 2],
+        closed_state_rows=[3, 4],
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+
+    assert selected.tolist() == [False, True, True, True, True, False]
+    assert torch.equal(colors[1], torch.tensor([0.0, 1.0, 0.0]))
+    assert torch.equal(colors[2], torch.tensor([0.0, 0.5, 0.0]))
+    assert torch.equal(colors[3], torch.tensor([0.5, 0.0, 0.0]))
+    assert torch.equal(colors[4], torch.tensor([1.0, 0.0, 0.0]))
+
+
+def test_lifecycle_state_persists_until_the_opposite_event():
+    opened, closed = advance_lifecycle_state(
+        set(), set(), open_rows=[1, 2], close_rows=[]
+    )
+    assert opened == {1, 2}
+    assert closed == set()
+
+    opened, closed = advance_lifecycle_state(
+        opened, closed, open_rows=[], close_rows=[1]
+    )
+    assert opened == {2}
+    assert closed == {1}
+
+    opened, closed = advance_lifecycle_state(
+        opened, closed, open_rows=[1], close_rows=[]
+    )
+    assert opened == {1, 2}
+    assert closed == set()
+
+
 def test_event_probe_rejects_same_row_open_and_close_and_bad_indices():
     kwargs = dict(gaussian_count=3, device=torch.device("cpu"), dtype=torch.float32)
     with pytest.raises(ValueError, match="cannot OPEN and CLOSE"):
         event_probe_tensors(open_rows=[1], close_rows=[1], **kwargs)
     with pytest.raises(IndexError, match="out-of-range"):
         event_probe_tensors(open_rows=[3], close_rows=[], **kwargs)
+    with pytest.raises(ValueError, match="OPEN and CLOSED"):
+        event_probe_tensors(
+            open_rows=[],
+            close_rows=[],
+            open_state_rows=[1],
+            closed_state_rows=[1],
+            **kwargs,
+        )
 
 
 def test_panel_uses_turbo_cue_and_exact_event_palette():
@@ -71,6 +120,8 @@ def test_panel_uses_turbo_cue_and_exact_event_palette():
     event = np.zeros_like(rgb)
     event[0, 0] = OPEN_COLOR
     event[1, 1] = CLOSE_COLOR
+    event[2, 1] = OPEN_STATE_COLOR
+    event[3, 2] = CLOSED_STATE_COLOR
     panel = compose_frame_panel(
         rgb,
         np.zeros((4, 3), dtype=np.float32),
@@ -81,6 +132,8 @@ def test_panel_uses_turbo_cue_and_exact_event_palette():
         open_count=1,
         close_count=1,
         panel_width=30,
+        open_state_count=2,
+        closed_state_count=2,
     )
     assert panel.width == 30 * 4 + 8 * 3
     assert panel.height > 30

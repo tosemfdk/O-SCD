@@ -17,7 +17,7 @@ import torch
 from gaussian_renderer import render_change
 
 CueMode = Literal["binary", "soft"]
-EvidenceCountMode = Literal["raw", "capped"]
+EvidenceCountMode = Literal["raw", "capped", "capped_binary"]
 ProbeScalingMode = Literal["native", "isotropic_min"]
 
 
@@ -116,8 +116,8 @@ def evidence_counts(
         raise ValueError("evidence masses must be finite")
     if bool((e_plus < 0).any() or (e_minus < 0).any()):
         raise ValueError("evidence masses must be nonnegative")
-    if mode not in ("raw", "capped"):
-        raise ValueError("evidence count mode must be 'raw' or 'capped'")
+    if mode not in ("raw", "capped", "capped_binary"):
+        raise ValueError("evidence count mode must be 'raw', 'capped', or 'capped_binary'")
     if not math.isfinite(float(mass_saturation)) or mass_saturation <= 0:
         raise ValueError("mass_saturation must be finite and positive")
     if not math.isfinite(float(min_evidence_mass)) or min_evidence_mass < 0:
@@ -130,10 +130,15 @@ def evidence_counts(
         delta_a = e_plus.clone()
         delta_b = e_minus.clone()
     else:
-        q = e_plus / (total_mass + float(eps))
         w = torch.clamp(total_mass / float(mass_saturation), 0.0, 1.0)
-        delta_a = w * q
-        delta_b = w * (1.0 - q)
+        if mode == "capped":
+            q = e_plus / (total_mass + float(eps))
+            delta_a = w * q
+            delta_b = w * (1.0 - q)
+        else:
+            z = (e_plus > e_minus).to(dtype=e_plus.dtype)
+            delta_a = w * z
+            delta_b = w * (1.0 - z)
     delta_a = torch.where(observed, delta_a, torch.zeros_like(delta_a))
     delta_b = torch.where(observed, delta_b, torch.zeros_like(delta_b))
     return delta_a, delta_b, total_mass, observed

@@ -127,6 +127,51 @@ def test_half_open_lifespans_and_close_active():
     assert model.active_mask(3.5).tolist() == [False, False, False]
 
 
+def test_never_open_rows_are_black_occluders_until_opened():
+    model = NewSeedGaussianModel()
+    model.render_never_open_black = True
+    model.append(
+        xyz=torch.tensor([[0.0, 0.0, 2.0], [0.1, 0.0, 2.0]]),
+        start=float("inf"),
+        end=float("inf"),
+        dc=torch.tensor([[[0.7, 0.7, 0.7]], [[0.9, 0.9, 0.9]]]),
+    )
+
+    assert model.never_open_mask().tolist() == [True, True]
+    assert model.active_mask(4.0).tolist() == [False, False]
+    model.open_rows(torch.tensor([0]), timestamp=5.0)
+
+    attrs = model.get_lifecycle_render_attributes(5.0)
+    assert attrs["mask"].tolist() == [True, True]
+    torch.testing.assert_close(attrs["dc"][0], model.seed_dc[0])
+    assert torch.equal(attrs["dc"][1], torch.zeros_like(attrs["dc"][1]))
+    assert model.never_open_mask().tolist() == [False, True]
+
+    model.close_rows(torch.tensor([0]), timestamp=6.0)
+    attrs = model.get_lifecycle_render_attributes(6.0)
+    assert attrs["mask"].tolist() == [False, True]
+    assert torch.equal(attrs["dc"], torch.zeros_like(attrs["dc"]))
+    assert model.closed_mask(6.0).tolist() == [True, False]
+
+
+def test_concatenated_detector_view_can_probe_all_lifecycle_rows():
+    base = DummyBase(n=2)
+    seeds = NewSeedGaussianModel()
+    seeds.append(
+        xyz=torch.tensor([[10.0, 0.0, 1.0], [20.0, 0.0, 1.0]]),
+        start=float("inf"),
+        end=float("inf"),
+    )
+    seeds.open_rows(torch.tensor([0]), timestamp=2.0)
+    seeds.close_rows(torch.tensor([0]), timestamp=3.0)
+
+    detector_view = ConcatenatedChangeView(
+        base, seeds, timestamp=3.0, seed_attribute_mode="all"
+    )
+    assert detector_view.get_xyz.shape == (4, 3)
+    assert torch.equal(detector_view.get_xyz[-2:], seeds.get_xyz)
+
+
 def test_checkpoint_roundtrip_preserves_tensors_and_metadata():
     model = NewSeedGaussianModel(sh_degree=1)
     model.append(

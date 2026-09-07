@@ -20,7 +20,7 @@ then evolve independently.
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 import json
 import math
 from pathlib import Path
@@ -31,6 +31,7 @@ import time
 import numpy as np
 from PIL import Image
 import torch
+import torch.nn.functional as F
 from utils.sh_utils import RGB2SH, SH2RGB
 
 from experiments.run_online_bayesian_lifespan_thaw import BASE_PLY_REL, quantile_summary
@@ -68,6 +69,7 @@ DENSITY_POLICIES = (
     "active_oscd",
     "active_oscd_cue_mixture",
     "active_oscd_cue_mixture_black_child_prune",
+    "active_signed_lifespan_score",
 )
 _CUE_MIXTURE_DENSITY_POLICIES = {
     "active_oscd_cue_mixture",
@@ -165,6 +167,321 @@ def _cue_mixture_score(
     ratio = delta_change / total.clamp_min(torch.finfo(total.dtype).eps)
     balanced_fraction = 2.0 * torch.minimum(ratio, 1.0 - ratio)
     return total.clamp(0.0, 1.0) * balanced_fraction
+
+
+@dataclass(frozen=True)
+class SignedScoreArtifact:
+    """Causal PC1/sign-posterior arrays used only for density control."""
+
+    frame_names: tuple[str, ...]
+    pc1_axes: np.ndarray
+    epsilon_negative: np.ndarray
+    epsilon_positive: np.ndarray
+    p_plus_is_new: np.ndarray
+    posterior_key: str
+    path: Path
+
+
+def _load_signed_score_artifact(
+    path: Path,
+    *,
+    expected_frame_names: Sequence[str],
+    posterior: str,
+) -> SignedScoreArtifact:
+    """Load and validate precomputed causal sign arrays for this exact stream."""
+
+    if posterior not in {"balanced", "global"}:
+        raise ValueError("signed-score posterior must be balanced or global")
+    posterior_key = (
+        "balanced_p_plus_is_add"
+        if posterior == "balanced"
+        else "global_p_plus_is_add"
+    )
+    with np.load(path, allow_pickle=False) as arrays:
+        required = {
+            "frame_names",
+            "pc1_axes",
+            "epsilon_negative",
+            "epsilon_positive",
+            posterior_key,
+        }
+        missing = sorted(required.difference(arrays.files))
+        if missing:
+            raise ValueError(f"signed-score artifact missing keys: {missing}")
+        frame_names = tuple(str(item) for item in arrays["frame_names"].tolist())
+        expected = tuple(str(item) for item in expected_frame_names)
+        if len(frame_names) < len(expected) or frame_names[: len(expected)] != expected:
+            raise ValueError(
+                "signed-score artifact frame_names do not match selected causal prefix"
+            )
+        frame_names = frame_names[: len(expected)]
+        pc1_axes = np.asarray(arrays["pc1_axes"], dtype=np.float32)
+        epsilon_negative = np.asarray(arrays["epsilon_negative"], dtype=np.float32)
+        epsilon_positive = np.asarray(arrays["epsilon_positive"], dtype=np.float32)
+        p_plus_is_new = np.asarray(arrays[posterior_key], dtype=np.float32)
+    count = len(frame_names)
+    pc1_axes = pc1_axes[:count]
+    epsilon_negative = epsilon_negative[:count]
+    epsilon_positive = epsilon_positive[:count]
+    p_plus_is_new = p_plus_is_new[:count]
+    if pc1_axes.shape != (count, 256) or not np.isfinite(pc1_axes).all():
+        raise ValueError("signed-score pc1_axes must be finite with shape [frames,256]")
+    for name, values in {
+        "epsilon_negative": epsilon_negative,
+        "epsilon_positive": epsilon_positive,
+        posterior_key: p_plus_is_new,
+    }.items():
+        if values.shape != (count,) or not np.isfinite(values).all():
+            raise ValueError(f"signed-score {name} must be finite [frames]")
+    if np.any((p_plus_is_new < 0.0) | (p_plus_is_new > 1.0)):
+        raise ValueError("signed-score posterior values must lie in [0,1]")
+    if np.any(epsilon_negative >= epsilon_positive):
+        raise ValueError(
+            "signed-score thresholds require epsilon_negative < epsilon_positive"
+        )
+    return SignedScoreArtifact(
+        frame_names=frame_names,
+        pc1_axes=pc1_axes,
+        epsilon_negative=epsilon_negative,
+        epsilon_positive=epsilon_positive,
+        p_plus_is_new=p_plus_is_new,
+        posterior_key=posterior_key,
+        path=path,
+    )
+
+
+@torch.inference_mode()
+def _extract_signed_sam_delta(
+    view: Any,
+    reference_base: Any,
+    pipe: Any,
+    background: torch.Tensor,
+    sam: Any,
+) -> torch.Tensor:
+    """Return SAM feature delta ``reference - inference`` on the 64×64 grid."""
+
+    from gaussian_renderer import render
+
+    reference = render(view, reference_base, pipe, background)["render"].detach()
+    inference = view.original_image[:3].detach()
+    pair = torch.stack(
+        [
+            F.interpolate(
+                reference[None],
+                (1024, 1024),
+                mode="bilinear",
+                align_corners=False,
+            )[0],
+            F.interpolate(
+                inference[None],
+                (1024, 1024),
+                mode="bilinear",
+                align_corners=False,
+            )[0],
+        ]
+    ).half()
+    embedding = sam.get_image_embeddings(pair)[-1].float()
+    return (embedding[0] - embedding[1]).permute(1, 2, 0).reshape(-1, 256).contiguous()
+
+
+def _signed_score_masks_from_delta(
+    delta: torch.Tensor,
+    candidate_map: torch.Tensor,
+    pc1_axis: np.ndarray,
+    *,
+    epsilon_negative: float,
+    epsilon_positive: float,
+    cue_threshold: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Project causal PC1 signs to full-resolution NEW/REMOVE candidate masks."""
+
+    if delta.shape != (64 * 64, 256):
+        raise ValueError("signed-score SAM delta must have shape [4096,256]")
+    if candidate_map.ndim != 3 or candidate_map.shape[0] != 1:
+        raise ValueError("candidate_map must have shape [1,H,W]")
+    axis = torch.as_tensor(pc1_axis, device=delta.device, dtype=delta.dtype).flatten()
+    if axis.shape != (256,):
+        raise ValueError("pc1_axis must have shape [256]")
+    score64 = (delta @ axis).reshape(64, 64)
+    cue64 = F.interpolate(
+        candidate_map.detach()[None].to(device=delta.device, dtype=delta.dtype),
+        (64, 64),
+        mode="area",
+    )[0, 0]
+    cue_active = cue64 >= float(cue_threshold)
+    plus64 = cue_active & (score64 > float(epsilon_positive))
+    minus64 = cue_active & (score64 < float(epsilon_negative))
+    size = tuple(int(v) for v in candidate_map.shape[-2:])
+    plus = F.interpolate(
+        plus64.to(dtype=delta.dtype)[None, None], size, mode="nearest"
+    )[0]
+    minus = F.interpolate(
+        minus64.to(dtype=delta.dtype)[None, None], size, mode="nearest"
+    )[0]
+    return plus, minus
+
+
+def _current_episode_start(model: Any, timestamp: int) -> torch.Tensor:
+    """Return the start frame of the currently OPEN lifespan for each row."""
+
+    slots = model.current_state_index.detach()
+    rows = torch.arange(slots.shape[0], device=slots.device, dtype=torch.long)
+    starts = torch.full(
+        (slots.shape[0],),
+        float(timestamp),
+        device=model.state_start.device,
+        dtype=model.state_start.dtype,
+    )
+    active = slots >= 0
+    starts[active] = model.state_start[rows[active], slots[active]]
+    return starts
+
+
+@torch.no_grad()
+def _density_source_rows(
+    view: Any,
+    xyz: torch.Tensor,
+    stable_id: torch.Tensor,
+    generation: torch.Tensor,
+    masks: Any,
+    *,
+    selection_signal: torch.Tensor,
+    selection_signal_name: str,
+    signed: Any | None = None,
+) -> list[dict[str, Any]]:
+    """Build posthoc density source/projection rows without reading GT masks."""
+
+    selected = masks.clone | masks.split | masks.signed_score_prune
+    indices = torch.nonzero(selected, as_tuple=False).flatten()
+    if not int(indices.numel()):
+        return []
+    signal = selection_signal.detach().to(device=xyz.device, dtype=xyz.dtype).flatten()
+    if signal.shape != (xyz.shape[0],):
+        raise ValueError("selection_signal must align with pre-mutation rows")
+    homogeneous = torch.cat(
+        (
+            xyz.detach(),
+            torch.ones((xyz.shape[0], 1), device=xyz.device, dtype=xyz.dtype),
+        ),
+        dim=1,
+    )
+    camera = homogeneous @ view.world_view_transform
+    depth = camera[:, 2]
+    fx = float(view.image_width) / (2.0 * math.tan(float(view.FoVx) * 0.5))
+    fy = float(view.image_height) / (2.0 * math.tan(float(view.FoVy) * 0.5))
+    x = fx * camera[:, 0] / depth.clamp_min(1.0e-6) + float(view.image_width) * 0.5
+    y = fy * camera[:, 1] / depth.clamp_min(1.0e-6) + float(view.image_height) * 0.5
+    rows: list[dict[str, Any]] = []
+    for row in indices.detach().cpu().tolist():
+        action = "clone" if bool(masks.clone[row]) else "split"
+        if bool(masks.signed_score_prune[row]):
+            action = "negative_prune"
+        entry = {
+            "row": int(row),
+            "stable_id": int(stable_id[row].detach().cpu().item()),
+            "generation": int(generation[row].detach().cpu().item()),
+            "action": action,
+            "selection_signal": selection_signal_name,
+            "selection_value": float(signal[row].detach().cpu().item()),
+            "selected_for_mutation": True,
+            "x": float(x[row].detach().cpu().item()),
+            "y": float(y[row].detach().cpu().item()),
+            "depth": float(depth[row].detach().cpu().item()),
+            "inside_image": bool(
+                (
+                    (depth[row] > 0.0)
+                    & (x[row] >= 0.0)
+                    & (x[row] < float(view.image_width))
+                    & (y[row] >= 0.0)
+                    & (y[row] < float(view.image_height))
+                ).detach().cpu().item()
+            ),
+            "image_width": int(view.image_width),
+            "image_height": int(view.image_height),
+        }
+        if signed is not None:
+            entry.update(
+                {
+                    "score": float(signed.score[row].detach().cpu().item()),
+                    "sign_support": float(signed.sign_support[row].detach().cpu().item()),
+                    "age": float(signed.age[row].detach().cpu().item()),
+                    "age_weight": float(signed.age_weight[row].detach().cpu().item()),
+                }
+            )
+        rows.append(entry)
+    return rows
+
+
+@torch.no_grad()
+def _signed_negative_suppression_rows(
+    view: Any,
+    xyz: torch.Tensor,
+    stable_id: torch.Tensor,
+    generation: torch.Tensor,
+    signed: Any,
+    *,
+    threshold: float,
+    max_rows: int | None,
+    already_logged: torch.Tensor,
+) -> list[dict[str, Any]]:
+    """Log strongest negative signed rows that are intentionally not densified."""
+
+    candidates = (signed.score < -float(threshold)) & ~already_logged
+    indices = torch.nonzero(candidates, as_tuple=False).flatten()
+    if not int(indices.numel()):
+        return []
+    order_values = signed.score[indices]
+    order = torch.argsort(order_values, descending=False, stable=True)
+    indices = indices[order]
+    if max_rows is not None:
+        indices = indices[: int(max_rows)]
+    if not int(indices.numel()):
+        return []
+    homogeneous = torch.cat(
+        (
+            xyz.detach(),
+            torch.ones((xyz.shape[0], 1), device=xyz.device, dtype=xyz.dtype),
+        ),
+        dim=1,
+    )
+    camera = homogeneous @ view.world_view_transform
+    depth = camera[:, 2]
+    fx = float(view.image_width) / (2.0 * math.tan(float(view.FoVx) * 0.5))
+    fy = float(view.image_height) / (2.0 * math.tan(float(view.FoVy) * 0.5))
+    x = fx * camera[:, 0] / depth.clamp_min(1.0e-6) + float(view.image_width) * 0.5
+    y = fy * camera[:, 1] / depth.clamp_min(1.0e-6) + float(view.image_height) * 0.5
+    rows: list[dict[str, Any]] = []
+    for row in indices.detach().cpu().tolist():
+        rows.append(
+            {
+                "row": int(row),
+                "stable_id": int(stable_id[row].detach().cpu().item()),
+                "generation": int(generation[row].detach().cpu().item()),
+                "action": "negative_suppress",
+                "selection_signal": "signed_lifespan_score",
+                "selection_value": float(signed.score[row].detach().cpu().item()),
+                "selected_for_mutation": False,
+                "score": float(signed.score[row].detach().cpu().item()),
+                "sign_support": float(signed.sign_support[row].detach().cpu().item()),
+                "age": float(signed.age[row].detach().cpu().item()),
+                "age_weight": float(signed.age_weight[row].detach().cpu().item()),
+                "x": float(x[row].detach().cpu().item()),
+                "y": float(y[row].detach().cpu().item()),
+                "depth": float(depth[row].detach().cpu().item()),
+                "inside_image": bool(
+                    (
+                        (depth[row] > 0.0)
+                        & (x[row] >= 0.0)
+                        & (x[row] < float(view.image_width))
+                        & (y[row] >= 0.0)
+                        & (y[row] < float(view.image_height))
+                    ).detach().cpu().item()
+                ),
+                "image_width": int(view.image_width),
+                "image_height": int(view.image_height),
+            }
+        )
+    return rows
 
 
 def _render_change_probability(rendered_change: torch.Tensor) -> torch.Tensor:
@@ -924,35 +1241,48 @@ def _render_to_rgb_u8(rendered: torch.Tensor) -> np.ndarray:
 @torch.no_grad()
 def _render_current_lifecycle_events(
     view: Any,
-    base: Any,
+    model: Any,
     pipe: Any,
     background: torch.Tensor,
     events: Sequence[LifecycleEvent],
 ) -> np.ndarray:
-    """Render exact-timestamp OPEN/CLOSE rows before topology mutation.
+    """Render current lifespan state plus exact-timestamp event highlights.
 
     Dynamic rows cannot be reconstructed later from stable IDs alone because a
     split child has no immutable-reference row.  Capturing the event footprint
     here preserves the row geometry that actually existed at the decision.
+    Existing OPEN/CLOSED rows use half-bright green/red; current OPEN/CLOSE
+    events override them with full-bright green/red.  NEVER_OPEN rows are hidden.
     """
 
     from gaussian_renderer import render_change
+    from experiments.visualize_lifespan_cue_events import event_probe_tensors
 
+    base = model.base
     count = int(base.get_xyz.shape[0])
     device = base.get_xyz.device
     dtype = base._features_dc.dtype
-    colors = torch.zeros((count, 3), device=device, dtype=dtype)
-    selected = torch.zeros(count, device=device, dtype=torch.bool)
+    open_rows: list[int] = []
+    close_rows: list[int] = []
     for event in events:
         row = int(event.gaussian_index)
         if row < 0 or row >= count:
             raise IndexError(f"lifecycle event row {row} is outside topology {count}")
         if event.action == "OPEN":
-            colors[row, 1] = 1.0
-            selected[row] = True
+            open_rows.append(row)
         elif event.action == "CLOSE":
-            colors[row, 0] = 1.0
-            selected[row] = True
+            close_rows.append(row)
+    open_state = model.current_state_index >= 0
+    closed_state = (model.num_states > 0) & ~open_state
+    colors, selected = event_probe_tensors(
+        count,
+        open_rows,
+        close_rows,
+        device=device,
+        dtype=dtype,
+        open_state_rows=torch.nonzero(open_state, as_tuple=False).flatten(),
+        closed_state_rows=torch.nonzero(closed_state, as_tuple=False).flatten(),
+    )
     if not bool(selected.any()):
         return np.zeros(
             (int(view.image_height), int(view.image_width), 3), dtype=np.uint8
@@ -1642,6 +1972,25 @@ def _validate_args(args: argparse.Namespace) -> None:
         and float(args.cue_mixture_threshold) <= 0.0
     ):
         raise ValueError("cue-mixture density requires a positive threshold")
+    if args.density_policy == "active_signed_lifespan_score":
+        if args.signed_score_artifact is None:
+            raise ValueError("active_signed_lifespan_score requires --signed-score-artifact")
+        if not math.isfinite(float(args.signed_score_threshold)) or float(
+            args.signed_score_threshold
+        ) < 0.0:
+            raise ValueError("signed score threshold must be finite and nonnegative")
+        if (
+            args.signed_score_max_sources is not None
+            and int(args.signed_score_max_sources) < 0
+        ):
+            raise ValueError("signed score max sources must be nonnegative")
+        if args.signed_score_posterior not in {"balanced", "global"}:
+            raise ValueError("signed score posterior must be balanced or global")
+        if args.signed_score_prune_threshold is not None and (
+            not math.isfinite(float(args.signed_score_prune_threshold))
+            or float(args.signed_score_prune_threshold) < 0.0
+        ):
+            raise ValueError("signed score prune threshold must be finite and nonnegative")
     if args.render_support_mode not in RENDER_SUPPORT_MODES:
         raise ValueError("unknown render support mode")
     if args.detector_mode not in DETECTOR_MODES:
@@ -1775,6 +2124,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         compute_ssf_loss,
     )
     from temporal.masked_optimizer import MaskedRowAdam
+    from temporal.signed_lifespan_density import compute_signed_lifespan_score
 
     _validate_args(args)
     if not torch.cuda.is_available():
@@ -1791,6 +2141,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     records = select_scope_records(all_records, scope=args.scope, max_frames=frame_limit)
     if [record.global_index for record in records] != list(range(len(records))):
         raise RuntimeError("independent records must be causally reindexed")
+    signed_artifact = (
+        _load_signed_score_artifact(
+            args.signed_score_artifact,
+            expected_frame_names=[record.name for record in records],
+            posterior=args.signed_score_posterior,
+        )
+        if args.density_policy == "active_signed_lifespan_score"
+        else None
+    )
     base_ply = (args.source_path / BASE_PLY_REL).resolve()
     cue_metadata = validate_cue_cache(args.cue_cache_root, base_ply, args.resolution)
     cameras = load_fixed_camera_index(args.fixed_cameras_json)
@@ -1800,6 +2159,30 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     mutable = GaussianModel(sh_degree=3, active_sh_degree=0)
     mutable.load_ply_change(str(base_ply))
+    signed_reference = None
+    signed_sam = None
+    if signed_artifact is not None:
+        from transformers import Sam2Model
+
+        signed_reference = GaussianModel(sh_degree=3, active_sh_degree=0)
+        signed_reference.load_ply(str(base_ply))
+        for parameter_name in (
+            "_xyz",
+            "_features_dc",
+            "_features_rest",
+            "_opacity",
+            "_scaling",
+            "_rotation",
+        ):
+            getattr(signed_reference, parameter_name).requires_grad_(False)
+        signed_sam = (
+            Sam2Model.from_pretrained(
+                args.signed_score_sam_model, local_files_only=True
+            )
+            .half()
+            .cuda()
+            .eval()
+        )
     model = PersistentGaussianLifespanModel.from_gaussians(
         mutable, max_states=config.max_states
     )
@@ -1856,6 +2239,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     total_black_child_prune_candidates = 0
     total_black_children_pruned = 0
     total_black_children_retained_for_support = 0
+    total_signed_score_candidates = 0
+    total_signed_score_clone_sources = 0
+    total_signed_score_split_sources = 0
+    total_signed_score_prune_candidates = 0
+    total_signed_score_pruned = 0
+    signed_density_source_rows: list[dict[str, Any]] = []
     first_open_dc_values: dict[str, list[torch.Tensor]] = {
         "before": [],
         "immediate": [],
@@ -1907,6 +2296,55 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             min_evidence_mass=config.min_evidence_mass,
             probe_scaling_mode=args.detector_probe_scaling,
         )
+        signed_plus_mass = None
+        signed_minus_mass = None
+        signed_frame_delta_nonzero = {"plus": 0, "minus": 0}
+        if signed_artifact is not None:
+            if signed_reference is None or signed_sam is None:
+                raise RuntimeError("signed-score frontend was not initialized")
+            delta = _extract_signed_sam_delta(
+                current_view, signed_reference, pipe, background, signed_sam
+            )
+            plus_mask, minus_mask = _signed_score_masks_from_delta(
+                delta,
+                current_view.candidate_map,
+                signed_artifact.pc1_axes[timestamp],
+                epsilon_negative=float(signed_artifact.epsilon_negative[timestamp]),
+                epsilon_positive=float(signed_artifact.epsilon_positive[timestamp]),
+                cue_threshold=float(args.bayes_cue_threshold),
+            )
+            signed_frame_delta_nonzero = {
+                "plus": int((plus_mask > 0.5).sum().item()),
+                "minus": int((minus_mask > 0.5).sum().item()),
+            }
+            plus_evidence = accumulate_change_evidence(
+                current_view,
+                model.base,
+                pipe,
+                background,
+                plus_mask,
+                cue_mode="binary",
+                cue_threshold=0.5,
+                count_mode="raw",
+                mass_saturation=config.evidence_mass_saturation,
+                min_evidence_mass=0.0,
+                probe_scaling_mode=args.detector_probe_scaling,
+            )
+            minus_evidence = accumulate_change_evidence(
+                current_view,
+                model.base,
+                pipe,
+                background,
+                minus_mask,
+                cue_mode="binary",
+                cue_threshold=0.5,
+                count_mode="raw",
+                mass_saturation=config.evidence_mass_saturation,
+                min_evidence_mass=0.0,
+                probe_scaling_mode=args.detector_probe_scaling,
+            )
+            signed_plus_mass = plus_evidence.e_plus.detach()
+            signed_minus_mass = minus_evidence.e_plus.detach()
         stable_before_decision = topology.stable_id.detach().clone()
         if args.detector_mode in {
             "single_candidate_beta",
@@ -1988,7 +2426,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         if visual_root is not None:
             event_rgb = _render_current_lifecycle_events(
                 current_view,
-                model.base,
+                model,
                 pipe,
                 background,
                 raw_events,
@@ -2017,6 +2455,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             controller.initialize_open_dc(opened_rows, optimizer=optimizer)
         frame_events = _stable_lifecycle_events(raw_events, stable_before_decision)
         lifecycle_events.extend(frame_events)
+        signed_score = None
+        if signed_artifact is not None:
+            if signed_plus_mass is None or signed_minus_mass is None:
+                raise RuntimeError("signed-score masses were not computed")
+            signed_score = compute_signed_lifespan_score(
+                signed_plus_mass,
+                signed_minus_mass,
+                float(signed_artifact.p_plus_is_new[timestamp]),
+                topology.active_mask(),
+                _current_episode_start(model, timestamp),
+                timestamp,
+            )
 
         optimizer.zero_grad(set_to_none=True)
         # Keep the committed-state render as the optimizer/growth baseline.
@@ -2111,6 +2561,23 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "gradient_split_source_count": 0,
             "cue_mixture_split_source_count": 0,
             "cue_mixture_only_split_source_count": 0,
+            "signed_score_candidate_count": 0,
+            "signed_score_clone_source_count": 0,
+            "signed_score_split_source_count": 0,
+            "signed_score_prune_candidate_count": 0,
+            "signed_score_pruned_count": 0,
+            "signed_score_positive_count": 0,
+            "signed_score_negative_count": 0,
+            "signed_score_stats": quantile_summary(model.xyz.new_empty((0,))),
+            "signed_score_support_stats": quantile_summary(model.xyz.new_empty((0,))),
+            "signed_score_age_stats": quantile_summary(model.xyz.new_empty((0,))),
+            "signed_score_plus_mask_pixels": int(signed_frame_delta_nonzero["plus"]),
+            "signed_score_minus_mask_pixels": int(signed_frame_delta_nonzero["minus"]),
+            "signed_score_p_plus_is_new": (
+                float(signed_artifact.p_plus_is_new[timestamp])
+                if signed_artifact is not None
+                else None
+            ),
             "split_source_removed_count": 0,
             "opacity_pruned_count": 0,
             "size_pruned_count": 0,
@@ -2276,9 +2743,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 inactive_gradient_max_abs = max(
                     inactive_gradient_max_abs, float(audit["max_abs"])
                 )
-                topology.add_gradient_stats(
-                    package["viewspace_points"], package["radii"], active
-                )
+                if args.density_policy != "active_signed_lifespan_score":
+                    topology.add_gradient_stats(
+                        package["viewspace_points"], package["radii"], active
+                    )
                 optimizer.step(optimizer_masks)
 
             if update_index == 0:
@@ -2295,12 +2763,34 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     "active_oscd",
                     "active_oscd_cue_mixture",
                     "active_oscd_cue_mixture_black_child_prune",
+                    "active_signed_lifespan_score",
                 }
                 and update_index == int(args.densify_update_index)
             ):
+                pre_density_xyz = model.xyz.detach().clone()
+                pre_density_stable_id = topology.stable_id.detach().clone()
+                pre_density_generation = topology.generation.detach().clone()
+                gradient_signal = (
+                    torch.linalg.vector_norm(
+                        torch.nan_to_num(
+                            topology.xyz_gradient_accum
+                            / topology.denom.clamp_min(1.0)
+                        ),
+                        dim=-1,
+                    )
+                    if topology.xyz_gradient_accum.numel()
+                    else model.xyz.new_empty((0,))
+                )
                 mixture_score = (
                     _cue_mixture_score(evidence.delta_a, evidence.delta_b)
                     if args.density_policy in _CUE_MIXTURE_DENSITY_POLICIES
+                    else None
+                )
+                if args.density_policy == "active_signed_lifespan_score" and signed_score is None:
+                    raise RuntimeError("signed lifespan score was not computed")
+                signed_density = (
+                    signed_score.score
+                    if args.density_policy == "active_signed_lifespan_score"
                     else None
                 )
                 density_result = topology.apply_active_oscd_density_control(
@@ -2315,6 +2805,22 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     ),
                     cue_mixture_score=mixture_score,
                     cue_mixture_threshold=float(args.cue_mixture_threshold),
+                    signed_density_score=signed_density,
+                    signed_density_threshold=float(args.signed_score_threshold),
+                    signed_density_max_sources=(
+                        None
+                        if args.signed_score_max_sources is None
+                        or int(args.signed_score_max_sources) == 0
+                        else int(args.signed_score_max_sources)
+                    ),
+                    signed_density_prune_threshold=(
+                        float(args.signed_score_prune_threshold)
+                        if args.signed_score_prune_threshold is not None
+                        else None
+                    ),
+                    signed_density_prune_min_age_frames=int(
+                        args.signed_score_prune_min_age_frames
+                    ),
                     black_child_prune_threshold=(
                         float(args.black_child_prune_threshold)
                         if args.density_policy
@@ -2342,6 +2848,21 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         "cue_mixture_only_split_source_count": (
                             density_result.cue_mixture_only_split_source_count
                         ),
+                        "signed_score_candidate_count": (
+                            density_result.signed_score_candidate_count
+                        ),
+                        "signed_score_clone_source_count": (
+                            density_result.signed_score_clone_source_count
+                        ),
+                        "signed_score_split_source_count": (
+                            density_result.signed_score_split_source_count
+                        ),
+                        "signed_score_prune_candidate_count": (
+                            density_result.signed_score_prune_candidate_count
+                        ),
+                        "signed_score_pruned_count": (
+                            density_result.signed_score_pruned_count
+                        ),
                         "split_source_removed_count": density_result.split_source_removed_count,
                         "opacity_pruned_count": density_result.opacity_pruned_count,
                         "size_pruned_count": density_result.size_pruned_count,
@@ -2357,6 +2878,73 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         "total_removed_count": density_result.total_removed_count,
                     }
                 )
+                if signed_score is not None:
+                    density_event.update(
+                        {
+                            "signed_score_positive_count": int(
+                                (signed_score.score > float(args.signed_score_threshold))
+                                .sum()
+                                .item()
+                            ),
+                            "signed_score_negative_count": int(
+                                (signed_score.score < -float(args.signed_score_threshold))
+                                .sum()
+                                .item()
+                            ),
+                            "signed_score_stats": quantile_summary(signed_score.score),
+                            "signed_score_support_stats": quantile_summary(
+                                signed_score.sign_support
+                            ),
+                            "signed_score_age_stats": quantile_summary(signed_score.age),
+                        }
+                    )
+                signal = (
+                    signed_score.score
+                    if signed_score is not None
+                    else gradient_signal
+                )
+                signal_name = (
+                    "signed_lifespan_score"
+                    if signed_score is not None
+                    else "screen_gradient"
+                )
+                frame_source_rows = _density_source_rows(
+                    current_view,
+                    pre_density_xyz,
+                    pre_density_stable_id,
+                    pre_density_generation,
+                    density_result.masks,
+                    selection_signal=signal,
+                    selection_signal_name=signal_name,
+                    signed=signed_score,
+                )
+                if signed_score is not None:
+                    already_logged = (
+                        density_result.masks.clone
+                        | density_result.masks.split
+                        | density_result.masks.signed_score_prune
+                    )
+                    frame_source_rows.extend(
+                        _signed_negative_suppression_rows(
+                            current_view,
+                            pre_density_xyz,
+                            pre_density_stable_id,
+                            pre_density_generation,
+                            signed_score,
+                            threshold=float(args.signed_score_threshold),
+                            max_rows=(
+                                None
+                                if args.signed_score_max_sources is None
+                                or int(args.signed_score_max_sources) == 0
+                                else int(args.signed_score_max_sources)
+                            ),
+                            already_logged=already_logged,
+                        )
+                    )
+                for row in frame_source_rows:
+                    row["timestamp"] = int(timestamp)
+                    row["frame"] = record.name
+                    signed_density_source_rows.append(row)
                 total_clones += density_result.clone_child_count
                 total_split_sources += density_result.split_source_count
                 total_split_children += density_result.split_child_count
@@ -2370,6 +2958,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 total_black_children_retained_for_support += (
                     density_result.black_child_retained_for_support_count
                 )
+                total_signed_score_candidates += density_result.signed_score_candidate_count
+                total_signed_score_clone_sources += (
+                    density_result.signed_score_clone_source_count
+                )
+                total_signed_score_split_sources += (
+                    density_result.signed_score_split_source_count
+                )
+                total_signed_score_prune_candidates += (
+                    density_result.signed_score_prune_candidate_count
+                )
+                total_signed_score_pruned += density_result.signed_score_pruned_count
 
         density_event["sampled_training_view_indices"] = sampled_view_indices
         density_event["future_training_view_access_count"] = int(
@@ -2712,6 +3311,35 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "cue_mixture_only_split_source_count": int(
                     density_event["cue_mixture_only_split_source_count"]
                 ),
+                "signed_score_candidate_count": int(
+                    density_event["signed_score_candidate_count"]
+                ),
+                "signed_score_clone_source_count": int(
+                    density_event["signed_score_clone_source_count"]
+                ),
+                "signed_score_split_source_count": int(
+                    density_event["signed_score_split_source_count"]
+                ),
+                "signed_score_prune_candidate_count": int(
+                    density_event["signed_score_prune_candidate_count"]
+                ),
+                "signed_score_pruned_count": int(
+                    density_event["signed_score_pruned_count"]
+                ),
+                "signed_score_positive_count": int(
+                    density_event["signed_score_positive_count"]
+                ),
+                "signed_score_negative_count": int(
+                    density_event["signed_score_negative_count"]
+                ),
+                "signed_score_p_plus_is_new": (
+                    density_event["signed_score_p_plus_is_new"]
+                ),
+                "signed_score_stats": density_event["signed_score_stats"],
+                "signed_score_support_stats": density_event[
+                    "signed_score_support_stats"
+                ],
+                "signed_score_age_stats": density_event["signed_score_age_stats"],
                 "pruned_count": int(density_event["total_removed_count"]),
                 "black_child_pruned_count": int(
                     density_event["black_child_pruned_count"]
@@ -3137,10 +3765,44 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "updates_per_frame": int(args.updates_per_frame),
             "local_update_index": int(args.densify_update_index),
             "densification": (
-                "original online O-SCD ACTIVE-only gradient clone/split plus current-frame pre-optimization raw-cue mixture splitting for large ACTIVE rows"
-                if args.density_policy in _CUE_MIXTURE_DENSITY_POLICIES
-                else "original online O-SCD gradient-only clone/split restricted to ACTIVE rows"
+                "current-frame signed SAM-diff alpha-T support times inverse active-lifespan age; positive NEW-aligned scores clone/split and negative scores suppress densification"
+                if args.density_policy == "active_signed_lifespan_score"
+                else (
+                    "original online O-SCD ACTIVE-only gradient clone/split plus current-frame pre-optimization raw-cue mixture splitting for large ACTIVE rows"
+                    if args.density_policy in _CUE_MIXTURE_DENSITY_POLICIES
+                    else "original online O-SCD gradient-only clone/split restricted to ACTIVE rows"
+                )
             ),
+            "signed_lifespan_score": {
+                "enabled": args.density_policy == "active_signed_lifespan_score",
+                "formula": "active * (2*p_plus_is_new - 1) * (plus_alphaT - minus_alphaT) / (timestamp - current_lifespan_start + 1)",
+                "artifact": str(args.signed_score_artifact)
+                if args.signed_score_artifact is not None
+                else None,
+                "posterior_key": (
+                    signed_artifact.posterior_key
+                    if signed_artifact is not None
+                    else None
+                ),
+                "sam_model": args.signed_score_sam_model,
+                "threshold": float(args.signed_score_threshold),
+                "max_sources": (
+                    None
+                    if args.signed_score_max_sources is None
+                    or int(args.signed_score_max_sources) == 0
+                    else int(args.signed_score_max_sources)
+                ),
+                "negative_prune_threshold": (
+                    float(args.signed_score_prune_threshold)
+                    if args.signed_score_prune_threshold is not None
+                    else None
+                ),
+                "negative_prune_scope": "optional generation>0 ACTIVE descendants only; generation-zero rows are protected",
+                "detector_input": "unchanged current-frame pre-optimization raw O-SCD alpha-T evidence; signed score never updates lifecycle posterior",
+                "frame_name_policy": "artifact exact causal prefix; unused tail ignored for smoke runs",
+                "source_log": str(args.output_dir / "density_source_events.csv"),
+                "source_log_contents": "mutation rows and strongest negative_suppress rows without GT masks",
+            },
             "cue_mixture": {
                 "enabled": args.density_policy in _CUE_MIXTURE_DENSITY_POLICIES,
                 "score": "capped_total_mass * 2 * min(change_ratio, nonchange_ratio)",
@@ -3153,15 +3815,24 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 or float(args.max_screen_size) > 0.0
                 or args.density_policy
                 == "active_oscd_cue_mixture_black_child_prune"
+                or (
+                    args.density_policy == "active_signed_lifespan_score"
+                    and args.signed_score_prune_threshold is not None
+                )
             ),
             "pruning": (
                 "requested extension: O-SCD opacity/size criteria restricted to ACTIVE rows"
                 if float(args.min_opacity) > 0.0 or float(args.max_screen_size) > 0.0
                 else (
-                    "hard-prune previously densified black ACTIVE children with direct-parent support guard"
-                    if args.density_policy
-                    == "active_oscd_cue_mixture_black_child_prune"
-                    else "disabled; split sources are still replaced by their children"
+                    "negative signed-score hard-prunes only old enough ACTIVE descendants"
+                    if args.density_policy == "active_signed_lifespan_score"
+                    and args.signed_score_prune_threshold is not None
+                    else (
+                        "hard-prune previously densified black ACTIVE children with direct-parent support guard"
+                        if args.density_policy
+                        == "active_oscd_cue_mixture_black_child_prune"
+                        else "disabled; split sources are still replaced by their children"
+                    )
                 )
             ),
             "black_child_pruning": {
@@ -3194,6 +3865,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     for row in density_rows
                 )
             ),
+            "total_signed_score_candidates": int(total_signed_score_candidates),
+            "total_signed_score_clone_sources": int(
+                total_signed_score_clone_sources
+            ),
+            "total_signed_score_split_sources": int(
+                total_signed_score_split_sources
+            ),
+            "total_signed_score_prune_candidates": int(
+                total_signed_score_prune_candidates
+            ),
+            "total_signed_score_pruned": int(total_signed_score_pruned),
             "total_removed": int(total_pruned),
             "total_opacity_pruned": int(total_opacity_pruned),
             "total_size_pruned": int(total_size_pruned),
@@ -3338,6 +4020,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "threshold": float(config.evaluation_threshold),
                 "event_render": str(visual_root / "event_render"),
                 "event_geometry": "current dynamic topology before the frame density event",
+                "event_render_contract": (
+                    "persistent half-bright OPEN/CLOSED state with full-bright "
+                    "exact-timestamp OPEN/CLOSE events"
+                ),
+                "event_state_intensity": 0.5,
+                "never_open_rows_rendered": False,
             }
             if visual_root is not None
             else None
@@ -3354,6 +4042,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     }
     _write_csv(args.output_dir / "frame_metrics.csv", frame_rows)
     _write_csv(args.output_dir / "density_events.csv", density_rows)
+    _write_csv(args.output_dir / "density_source_events.csv", signed_density_source_rows)
     with (args.output_dir / "lifecycle_events.jsonl").open(
         "w", encoding="utf-8"
     ) as file:
@@ -3462,6 +4151,53 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--updates-per-frame", type=positive_int, default=16)
     parser.add_argument("--densify-update-index", type=int, default=4)
     parser.add_argument("--oscd-grad-threshold", type=nonnegative_float, default=0.001)
+    parser.add_argument(
+        "--signed-score-artifact",
+        type=Path,
+        default=None,
+        help=(
+            "Required for active_signed_lifespan_score: causal PC1/sign posterior "
+            "arrays from the signed SAM-diff frontend"
+        ),
+    )
+    parser.add_argument(
+        "--signed-score-posterior",
+        choices=("balanced", "global"),
+        default="balanced",
+        help="Choose balanced or global P(+ is NEW/ADD) from the score artifact",
+    )
+    parser.add_argument(
+        "--signed-score-sam-model",
+        default="facebook/sam2.1-hiera-tiny",
+        help="Local SAM2 model name used to reproduce current-frame signed deltas",
+    )
+    parser.add_argument(
+        "--signed-score-threshold",
+        type=nonnegative_float,
+        default=0.0,
+        help="Positive signed lifespan score threshold for clone/split selection",
+    )
+    parser.add_argument(
+        "--signed-score-max-sources",
+        type=int,
+        default=2048,
+        help="Maximum score-selected source rows per density event; use 0 for no limit",
+    )
+    parser.add_argument(
+        "--signed-score-prune-threshold",
+        type=nonnegative_float,
+        default=None,
+        help=(
+            "Optional negative signed score threshold for generation>0 ACTIVE "
+            "descendant pruning; omitted disables score pruning"
+        ),
+    )
+    parser.add_argument(
+        "--signed-score-prune-min-age-frames",
+        type=positive_int,
+        default=1,
+        help="Minimum OPEN episode age before negative score can prune descendants",
+    )
     parser.add_argument(
         "--cue-mixture-threshold",
         type=probability,
@@ -3575,7 +4311,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--visualization-dir",
         type=Path,
         default=None,
-        help="Optionally capture post-update raw renders and exact-timestamp event renders",
+        help=(
+            "Optionally capture post-update raw renders and current lifecycle "
+            "state with exact-timestamp event highlights"
+        ),
     )
     return parser.parse_args(argv)
 

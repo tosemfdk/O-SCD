@@ -7,8 +7,10 @@ from experiments.run_online_dynamic_active_oscd_density import (
     _candidate_transition_progress,
     _candidate_dc_optimizer_masks,
     _config,
+    _current_episode_start,
     _cue_local_support,
     _cue_mixture_score,
+    _load_signed_score_artifact,
     _initialize_first_open_dc,
     _learned_dc_change_magnitude,
     _lifespan_gate_semantic_colors,
@@ -18,6 +20,8 @@ from experiments.run_online_dynamic_active_oscd_density import (
     _render_to_rgb_u8,
     _save_binary_mask,
     _sample_training_view,
+    _signed_negative_suppression_rows,
+    _signed_score_masks_from_delta,
     _close_only_lifespan_change_weight,
     _single_candidate_close_candidate_mask,
     _single_candidate_reset_change_probability,
@@ -183,6 +187,177 @@ def test_runner_accepts_child_only_black_pruning_after_cue_mixture_split():
     assert args.cue_mixture_threshold == 0.5
     assert args.black_child_prune_threshold == 0.5
     assert args.black_child_prune_min_age_frames == 1
+
+
+def test_runner_accepts_signed_lifespan_score_density_with_artifact():
+    args = parse_args(
+        [
+            "--scope",
+            "scene_change3",
+            "--output-dir",
+            str(Path("/tmp/test-signed-lifespan-score")),
+            "--density-policy",
+            "active_signed_lifespan_score",
+            "--signed-score-artifact",
+            "/tmp/causal_pca_posterior_arrays.npz",
+            "--signed-score-threshold",
+            "0.01",
+            "--signed-score-max-sources",
+            "128",
+            "--signed-score-prune-threshold",
+            "0.02",
+            "--signed-score-prune-min-age-frames",
+            "2",
+        ]
+    )
+    _validate_args(args)
+    assert args.density_policy == "active_signed_lifespan_score"
+    assert args.signed_score_posterior == "balanced"
+    assert args.signed_score_threshold == 0.01
+    assert args.signed_score_max_sources == 128
+
+
+def test_runner_rejects_signed_lifespan_score_without_artifact():
+    args = parse_args(
+        [
+            "--scope",
+            "scene_change3",
+            "--output-dir",
+            str(Path("/tmp/test-invalid-signed-lifespan-score")),
+            "--density-policy",
+            "active_signed_lifespan_score",
+        ]
+    )
+    with pytest.raises(ValueError, match="signed-score-artifact"):
+        _validate_args(args)
+
+
+def test_load_signed_score_artifact_accepts_exact_causal_prefix(tmp_path):
+    path = tmp_path / "arrays.npz"
+    np.savez(
+        path,
+        frame_names=np.asarray(["f0.png", "f1.png", "f2.png"]),
+        pc1_axes=np.zeros((3, 256), dtype=np.float32),
+        epsilon_negative=np.asarray([-0.1, -0.2, -0.3], dtype=np.float32),
+        epsilon_positive=np.asarray([0.1, 0.2, 0.3], dtype=np.float32),
+        balanced_p_plus_is_add=np.asarray([0.9, 0.8, 0.7], dtype=np.float32),
+        global_p_plus_is_add=np.asarray([0.6, 0.5, 0.4], dtype=np.float32),
+    )
+
+    artifact = _load_signed_score_artifact(
+        path, expected_frame_names=["f0.png", "f1.png"], posterior="balanced"
+    )
+
+    assert artifact.frame_names == ("f0.png", "f1.png")
+    assert artifact.pc1_axes.shape == (2, 256)
+    assert artifact.p_plus_is_new.tolist() == pytest.approx([0.9, 0.8])
+
+
+def test_load_signed_score_artifact_rejects_nonprefix(tmp_path):
+    path = tmp_path / "arrays.npz"
+    np.savez(
+        path,
+        frame_names=np.asarray(["f0.png", "f2.png"]),
+        pc1_axes=np.zeros((2, 256), dtype=np.float32),
+        epsilon_negative=np.zeros(2, dtype=np.float32),
+        epsilon_positive=np.zeros(2, dtype=np.float32),
+        balanced_p_plus_is_add=np.full(2, 0.5, dtype=np.float32),
+    )
+    with pytest.raises(ValueError, match="causal prefix"):
+        _load_signed_score_artifact(
+            path, expected_frame_names=["f0.png", "f1.png"], posterior="balanced"
+        )
+
+
+def test_load_signed_score_artifact_rejects_reversed_sign_thresholds(tmp_path):
+    path = tmp_path / "arrays.npz"
+    np.savez(
+        path,
+        frame_names=np.asarray(["f0.png"]),
+        pc1_axes=np.zeros((1, 256), dtype=np.float32),
+        epsilon_negative=np.asarray([0.2], dtype=np.float32),
+        epsilon_positive=np.asarray([0.1], dtype=np.float32),
+        balanced_p_plus_is_add=np.asarray([0.9], dtype=np.float32),
+    )
+
+    with pytest.raises(ValueError, match="epsilon_negative"):
+        _load_signed_score_artifact(
+            path, expected_frame_names=["f0.png"], posterior="balanced"
+        )
+
+
+def test_signed_score_masks_use_causal_pc_axis_and_candidate_gate():
+    delta = torch.zeros(64 * 64, 256)
+    delta[0, 0] = 2.0
+    delta[1, 0] = -2.0
+    delta[2, 0] = 2.0
+    candidate = torch.zeros(1, 128, 128)
+    candidate[:, :2, :4] = 1.0
+    axis = np.zeros(256, dtype=np.float32)
+    axis[0] = 1.0
+
+    plus, minus = _signed_score_masks_from_delta(
+        delta,
+        candidate,
+        axis,
+        epsilon_negative=-1.0,
+        epsilon_positive=1.0,
+        cue_threshold=0.5,
+    )
+
+    assert plus.shape == (1, 128, 128)
+    assert minus.shape == (1, 128, 128)
+    assert int((plus > 0.5).sum().item()) == 4
+    assert int((minus > 0.5).sum().item()) == 4
+
+
+def test_current_episode_start_reads_only_active_current_slots():
+    model = SimpleNamespace(
+        current_state_index=torch.tensor([0, -1, 1]),
+        state_start=torch.tensor([[3.0, 0.0], [99.0, 99.0], [1.0, 5.0]]),
+    )
+
+    starts = _current_episode_start(model, timestamp=7)
+
+    assert starts.tolist() == pytest.approx([3.0, 7.0, 5.0])
+
+
+def test_negative_suppression_rows_use_strict_negative_threshold():
+    view = SimpleNamespace(
+        world_view_transform=torch.eye(4),
+        FoVx=math.radians(90.0),
+        FoVy=math.radians(90.0),
+        image_width=100,
+        image_height=100,
+    )
+    signed = SimpleNamespace(
+        score=torch.tensor([0.0, -0.0, -0.1, -0.2]),
+        sign_support=torch.tensor([0.0, 0.0, -0.1, -0.2]),
+        age=torch.ones(4),
+        age_weight=torch.ones(4),
+    )
+
+    rows = _signed_negative_suppression_rows(
+        view,
+        torch.tensor(
+            [
+                [0.0, 0.0, 1.0],
+                [0.0, 0.0, 1.0],
+                [0.0, 0.0, 1.0],
+                [0.0, 0.0, 1.0],
+            ]
+        ),
+        torch.arange(4),
+        torch.zeros(4, dtype=torch.long),
+        signed,
+        threshold=0.0,
+        max_rows=None,
+        already_logged=torch.zeros(4, dtype=torch.bool),
+    )
+
+    assert [row["stable_id"] for row in rows] == [3, 2]
+    assert all(row["action"] == "negative_suppress" for row in rows)
+    assert all(row["selected_for_mutation"] is False for row in rows)
 
 
 def test_cue_mixture_score_requires_both_sides_and_observation_mass():

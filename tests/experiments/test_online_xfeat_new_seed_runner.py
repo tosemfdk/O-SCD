@@ -2,12 +2,21 @@ import pytest
 
 from experiments.run_online_xfeat_new_seed import (
     FEATURE_CACHE_META_KEY,
+    active_new_constrains_xfeat_anchor,
+    active_new_uses_density,
+    active_new_uses_pruning,
+    active_new_uses_seed_only_dc,
     active_seed_render_sign,
     aggregate_across_scenes,
     aggregate_metric_scope,
+    object_scope_prediction,
+    new_sidecar_projected_dc_loss,
     validate_feature_cache,
+    write_e4d_comparison_artifacts,
     write_seed_comparison_artifacts,
     seed_only_coverage_loss,
+    _e4d_training_schedule,
+    e4d_full_target,
 )
 
 
@@ -126,3 +135,159 @@ def test_seed_only_coverage_loss_keeps_gradient_independent_of_base_memory():
     assert seed_logits.grad is not None
     assert seed_logits.grad[:, 1:3, 1:3].abs().sum() > 0
     assert parts["positive"] > 0
+
+
+def test_e4d_replay_is_current_biased_and_never_selects_future():
+    replay = [{"timestamp": value} for value in range(9)]
+    selected = _e4d_training_schedule(replay, 12)
+    assert [row["timestamp"] for row in selected[::3]] == [8, 8, 8, 8]
+    assert sum(row["timestamp"] == 8 for row in selected) == 4
+    assert all(row["timestamp"] <= 8 for row in selected)
+
+
+def test_e4d_full_target_is_signed_cue_intersection_without_gt():
+    import torch
+    from types import SimpleNamespace
+
+    cue = torch.ones((1, 4, 4))
+    cue[:, :, 0] = 0.1
+    view = SimpleNamespace(image_height=4, image_width=4, candidate_map=cue)
+    signed = torch.ones((2, 2), dtype=torch.bool)
+    target, stable = e4d_full_target(view, signed)
+    assert target.shape == (1, 4, 4)
+    assert not bool(target[:, :, 0].any())
+    assert bool(target[:, :, 1:].all())
+    assert bool(stable[:, 0].all())
+
+
+def test_new_sidecar_projected_dc_loss_trains_only_dc_without_base_rows():
+    import math
+    from types import SimpleNamespace
+
+    import torch
+
+    from temporal.active_new_gaussians import ActiveNewGaussianModel
+
+    model = ActiveNewGaussianModel(device="cpu")
+    model.append_xfeat_anchors(
+        xyz=torch.tensor([[0.0, 0.0, 2.0]]),
+        start=0.0,
+        scaling=torch.full((1, 3), math.log(0.1)),
+        opacity=0.5,
+    )
+    view = SimpleNamespace(
+        image_height=16,
+        image_width=16,
+        FoVx=math.radians(60.0),
+        FoVy=math.radians(60.0),
+        world_view_transform=torch.eye(4),
+    )
+    target = torch.zeros((1, 16, 16))
+    target[:, 6:11, 6:11] = 1.0
+
+    loss, parts = new_sidecar_projected_dc_loss(
+        model, view, target, timestamp=0
+    )
+    loss.backward()
+
+    assert parts["visible_rows"] == 1
+    assert parts["cue_target_mean"] > 0.0
+    assert model.new_dc.grad is not None
+    assert float(model.new_dc.grad.abs().sum()) > 0.0
+    for parameter in (model._xyz, model._opacity, model._scaling, model._rotation):
+        assert parameter.grad is None
+
+
+def test_object_metrics_select_matching_prediction_bank():
+    import numpy as np
+
+    full = np.array([[True, True, True]])
+    new = np.array([[True, False, False]])
+    remove = np.array([[False, True, False]])
+
+    assert np.array_equal(
+        object_scope_prediction(
+            "new_full",
+            full_prediction=full,
+            new_prediction=new,
+            remove_prediction=remove,
+        ),
+        new,
+    )
+    assert np.array_equal(
+        object_scope_prediction(
+            "remove_full",
+            full_prediction=full,
+            new_prediction=new,
+            remove_prediction=remove,
+        ),
+        remove,
+    )
+    assert np.array_equal(
+        object_scope_prediction(
+            "full",
+            full_prediction=full,
+            new_prediction=new,
+            remove_prediction=remove,
+        ),
+        full,
+    )
+
+
+def test_e4e_variant_factorial_contract():
+    assert {
+        variant: (
+            active_new_uses_seed_only_dc(variant),
+            active_new_constrains_xfeat_anchor(variant),
+            active_new_uses_density(variant),
+            active_new_uses_pruning(variant),
+        )
+        for variant in ("C0", "C1", "C2", "C3")
+    } == {
+        "C0": (False, False, True, True),
+        "C1": (True, False, True, True),
+        "C2": (False, True, True, True),
+        "C3": (True, True, True, True),
+    }
+    assert active_new_uses_density("D2")
+    assert active_new_uses_pruning("D3")
+    assert not active_new_uses_seed_only_dc("D3")
+
+
+def test_e4e_comparison_artifacts_include_sidecar_scope(tmp_path):
+    metric = {
+        "frames": 1,
+        "tp": 3,
+        "tn": 7,
+        "fp": 1,
+        "fn": 2,
+        "precision": 0.75,
+        "recall": 0.6,
+        "iou": 0.5,
+        "f1": 2.0 / 3.0,
+    }
+    report = {
+        "scene": 1,
+        "e4d_metric_scopes": {
+            variant: {
+                scope: metric
+                for scope in (
+                    "full",
+                    "new_full",
+                    "remove_full",
+                    "sidecar_alpha_new_full",
+                )
+            }
+            for variant in ("C0", "C1", "C2", "C3")
+        },
+    }
+
+    outputs = write_e4d_comparison_artifacts(
+        [report], tmp_path, ("C0", "C1", "C2", "C3")
+    )
+
+    assert (tmp_path / "C0_C1_C2_C3_comparison.csv").is_file()
+    assert "sidecar_alpha_new_full" in (
+        tmp_path / "C0_C1_C2_C3_comparison.md"
+    ).read_text()
+    assert outputs["plot"].endswith("C0_C1_C2_C3_comparison.png")

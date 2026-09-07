@@ -1,0 +1,29 @@
+{
+  "dataset": "/home/rvl/workspace/github/O-SCD/data/PASLCD",
+  "instance": "Instance_1",
+  "scenes": [
+    "Cantina",
+    "Garden"
+  ],
+  "frames_per_scene": 25,
+  "conditions": {
+    "baseline": {
+      "cache": "off",
+      "render": "split"
+    },
+    "combined": {
+      "cache": "snapshot",
+      "render": "joint_channels"
+    }
+  },
+  "common": "3D2Dsigma2,firstBF10/otherBF30,Gaussianaggregatebinary,softQ,u120,seed0,uncapped,independent scene resets",
+  "order": [
+    "Cantina baseline",
+    "Cantina combined",
+    "Garden combined",
+    "Garden baseline"
+  ],
+  "metrics": "Mean-frame IoU/F1 and pooledprecision/recall; binaryGT only (no NEW-onlyGT metric)",
+  "timing": "CUDA wholetraining+seal and subprocesswall; finalmask/cachedinterval validationseparate. Sequentialruns; leave livevieweruntouched.",
+  "scope": "Two25framescenes percondition,100processed frames total; nofullESCD or20scenePASLCD run"
+}

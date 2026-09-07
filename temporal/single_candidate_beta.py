@@ -272,6 +272,7 @@ class SingleCandidateBetaFilter:
         total_mass=None,
         *,
         candidate_support=None,
+        log_bayes_factor_threshold=None,
         row_indices=None,
         indices=None,
         timestamp: int,
@@ -293,6 +294,35 @@ class SingleCandidateBetaFilter:
         if bool((da < 0).any()) or bool((db < 0).any()):
             raise ValueError("evidence counts must be nonnegative")
         rows = self._normalize_indices(row_indices, da.numel())
+        if log_bayes_factor_threshold is None:
+            commit_threshold = None
+        else:
+            raw_threshold = log_bayes_factor_threshold
+            if isinstance(raw_threshold, bool):
+                raise TypeError("log_bayes_factor_threshold must be numeric")
+            if isinstance(raw_threshold, Real):
+                threshold_value = float(raw_threshold)
+                if not math.isfinite(threshold_value) or threshold_value <= 0.0:
+                    raise ValueError("log_bayes_factor_threshold must be finite and > 0")
+                commit_threshold = torch.full(
+                    da.shape, threshold_value, device=self.device, dtype=self.dtype
+                )
+            else:
+                raw_tensor = torch.as_tensor(raw_threshold, device=self.device)
+                if raw_tensor.dtype == torch.bool or raw_tensor.dtype.is_complex:
+                    raise TypeError("log_bayes_factor_threshold must be numeric")
+                threshold_tensor = raw_tensor.to(dtype=self.dtype).flatten()
+                if threshold_tensor.numel() == 1:
+                    threshold_tensor = threshold_tensor.expand_as(da)
+                elif threshold_tensor.shape != da.shape:
+                    raise ValueError(
+                        "log_bayes_factor_threshold must be scalar or match evidence"
+                    )
+                if not bool(torch.isfinite(threshold_tensor).all()) or bool(
+                    (threshold_tensor <= 0).any()
+                ):
+                    raise ValueError("log_bayes_factor_threshold must be finite and > 0")
+                commit_threshold = threshold_tensor.clone()
         if candidate_support is None:
             support = torch.ones(da.shape, device=self.device, dtype=torch.bool)
         else:
@@ -398,9 +428,14 @@ class SingleCandidateBetaFilter:
                 evaluated[eval_pos] = True
                 self.last_log_bayes_factor[eval_rows] = block_score
 
-                commit_mask = (
-                    block_score >= float(self.config.log_bayes_factor_threshold)
-                ) & (
+                threshold = (
+                    torch.full_like(
+                        block_score, float(self.config.log_bayes_factor_threshold)
+                    )
+                    if commit_threshold is None
+                    else commit_threshold[eval_pos]
+                )
+                commit_mask = (block_score >= threshold) & (
                     block_support >= int(self.config.min_candidate_support_views)
                 )
                 support_failure = (

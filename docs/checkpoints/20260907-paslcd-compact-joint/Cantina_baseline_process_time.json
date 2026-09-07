@@ -1,0 +1,9 @@
+{
+  "wall_seconds": 54.161654739873484,
+  "exit_code": 0,
+  "started": "2026-09-07T17:15:02.161242+09:00",
+  "finished": "2026-09-07T17:15:56.323241+09:00",
+  "gpu_processes_before": "pid, process_name, used_gpu_memory [MiB]\n2076506, warp-terminal, 207 MiB\n2251858, /home/rvl/miniforge3/envs/oscd/bin/python, 5136 MiB\n",
+  "gpu_processes_after": "pid, process_name, used_gpu_memory [MiB]\n2076506, warp-terminal, 207 MiB\n2251858, /home/rvl/miniforge3/envs/oscd/bin/python, 5136 MiB\n",
+  "definition": "Process launch->exit includingimports/setup/cachedinputloading/training/captures/metrics/finalsnapshot audit."
+}

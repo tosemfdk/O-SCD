@@ -16,6 +16,7 @@ import torch
 from torch import nn
 
 from utils.general_utils import inverse_sigmoid
+from utils.sh_utils import RGB2SH
 
 
 def _as_device(device: torch.device | str | None) -> torch.device:
@@ -109,6 +110,10 @@ class NewSeedGaussianModel(nn.Module):
         self.register_buffer("_rotation", _empty((0, 4), device=dev, dtype=dtype))
         self.register_buffer("start", _empty((0,), device=dev, dtype=dtype))
         self.register_buffer("end", _empty((0,), device=dev, dtype=dtype))
+        # The default sidecar contract renders only active intervals.  A runner
+        # may opt into the repository's representation contract in which
+        # NEVER_OPEN rows remain black occluders until their detector commits.
+        self.render_never_open_black = False
         self.metadata: list[dict[str, Any]] = []
         self.setup_functions()
 
@@ -175,6 +180,62 @@ class NewSeedGaussianModel(nn.Module):
     def active_mask(self, timestamp: float | torch.Tensor) -> torch.Tensor:
         return _is_active(timestamp, self.start, self.end)
 
+    def never_open_mask(self) -> torch.Tensor:
+        """Rows proposed geometrically but not yet opened by a detector."""
+
+        return torch.isposinf(self.start) & torch.isposinf(self.end)
+
+    def closed_mask(self, timestamp: float | torch.Tensor) -> torch.Tensor:
+        """Rows whose most recent active interval ended by ``timestamp``."""
+
+        current = torch.as_tensor(
+            timestamp, device=self.start.device, dtype=self.start.dtype
+        )
+        return (~self.never_open_mask()) & (self.end <= current)
+
+    @torch.no_grad()
+    def open_rows(
+        self, rows: torch.Tensor, timestamp: float | torch.Tensor
+    ) -> torch.Tensor:
+        """OPEN or REOPEN fixed rows without changing their geometry or DC."""
+
+        selected = rows.to(device=self.start.device, dtype=torch.long).flatten()
+        if selected.numel() and (
+            bool((selected < 0).any()) or bool((selected >= self.num_seeds).any())
+        ):
+            raise IndexError("seed rows are out of range")
+        if selected.numel() != torch.unique(selected).numel():
+            raise ValueError("seed rows must be unique")
+        current = torch.as_tensor(
+            timestamp, device=self.start.device, dtype=self.start.dtype
+        )
+        self.start[selected] = current
+        self.end[selected] = float("inf")
+        return selected
+
+    @torch.no_grad()
+    def close_rows(
+        self, rows: torch.Tensor, timestamp: float | torch.Tensor
+    ) -> torch.Tensor:
+        """CLOSE active fixed rows at a half-open interval boundary."""
+
+        selected = rows.to(device=self.start.device, dtype=torch.long).flatten()
+        if selected.numel() and (
+            bool((selected < 0).any()) or bool((selected >= self.num_seeds).any())
+        ):
+            raise IndexError("seed rows are out of range")
+        if selected.numel() != torch.unique(selected).numel():
+            raise ValueError("seed rows must be unique")
+        current = torch.as_tensor(
+            timestamp, device=self.start.device, dtype=self.start.dtype
+        )
+        if selected.numel() and not bool(
+            self.active_mask(current)[selected].all()
+        ):
+            raise ValueError("only active seed rows can be closed")
+        self.end[selected] = current
+        return selected
+
     def close_active(self, timestamp: float | torch.Tensor) -> torch.Tensor:
         """Close currently-active rows at ``timestamp`` and return the closed mask."""
         active = self.active_mask(timestamp)
@@ -200,10 +261,63 @@ class NewSeedGaussianModel(nn.Module):
             "end": self.end[mask],
         }
 
+    def get_lifecycle_render_attributes(
+        self, timestamp: float | torch.Tensor
+    ) -> dict[str, torch.Tensor]:
+        """Return OPEN plus black NEVER_OPEN rows; omit CLOSED rows."""
+
+        active = self.active_mask(timestamp)
+        never_open = self.never_open_mask()
+        mask = active | never_open
+        selected_active = active[mask]
+        dc = torch.where(
+            selected_active[:, None, None],
+            self.seed_dc[mask],
+            torch.zeros_like(self.seed_dc[mask]),
+        )
+        return {
+            "mask": mask,
+            "xyz": self._xyz[mask],
+            "dc": dc,
+            "features_rest": self._features_rest[mask],
+            "opacity": self.get_opacity[mask],
+            "opacity_logits": self._opacity[mask],
+            "scaling": self.get_scaling[mask],
+            "scaling_logits": self._scaling[mask],
+            "rotation": self.get_rotation[mask],
+            "rotation_logits": self._rotation[mask],
+            "start": self.start[mask],
+            "end": self.end[mask],
+        }
+
+    def get_all_render_attributes(self) -> dict[str, torch.Tensor]:
+        """Return every fixed row for lifespan-agnostic detector probing."""
+
+        mask = torch.ones(self.num_seeds, device=self.start.device, dtype=torch.bool)
+        return {
+            "mask": mask,
+            "xyz": self._xyz,
+            "dc": self.seed_dc,
+            "features_rest": self._features_rest,
+            "opacity": self.get_opacity,
+            "opacity_logits": self._opacity,
+            "scaling": self.get_scaling,
+            "scaling_logits": self._scaling,
+            "rotation": self.get_rotation,
+            "rotation_logits": self._rotation,
+            "start": self.start,
+            "end": self.end,
+        }
+
     def active_view(self, timestamp: float | torch.Tensor) -> "ActiveNewSeedView":
         """Return a temporary renderer adapter containing active seed rows only."""
 
         return ActiveNewSeedView(self, timestamp)
+
+    def lifecycle_view(self, timestamp: float | torch.Tensor) -> "ActiveNewSeedView":
+        """Return OPEN rows plus black NEVER_OPEN occluders."""
+
+        return ActiveNewSeedView(self, timestamp, attribute_mode="lifecycle")
 
     def append(
         self,
@@ -264,7 +378,8 @@ class NewSeedGaussianModel(nn.Module):
         )
         start_tensor = torch.as_tensor(start, device=device, dtype=dtype).expand(rows).clone()
         end_tensor = torch.as_tensor(end, device=device, dtype=dtype).expand(rows).clone()
-        if not torch.all(start_tensor < end_tensor):
+        dormant = torch.isposinf(start_tensor) & torch.isposinf(end_tensor)
+        if not torch.all((start_tensor < end_tensor) | dormant):
             raise ValueError("each seed must satisfy start < end")
 
         old_param = self.seed_dc
@@ -384,6 +499,7 @@ class NewSeedGaussianModel(nn.Module):
     def to_checkpoint(self) -> dict[str, Any]:
         return {
             "sh_degree": self.max_sh_degree,
+            "render_never_open_black": bool(self.render_never_open_black),
             "seed_dc": self.seed_dc.detach().clone(),
             "xyz": self._xyz.detach().clone(),
             "features_rest": self._features_rest.detach().clone(),
@@ -412,6 +528,9 @@ class NewSeedGaussianModel(nn.Module):
         model.start = checkpoint["start"].detach().clone()
         model.end = checkpoint["end"].detach().clone()
         model.metadata = copy.deepcopy(list(checkpoint.get("metadata", [{} for _ in range(model.num_seeds)])))
+        model.render_never_open_black = bool(
+            checkpoint.get("render_never_open_black", False)
+        )
         if len(model.metadata) != model.num_seeds:
             raise ValueError("checkpoint metadata length does not match seed rows")
         return model
@@ -434,6 +553,9 @@ class ConcatenatedChangeView:
         base_dc: torch.Tensor | None = None,
         base_opacity: torch.Tensor | None = None,
         detach_base_dc: bool = True,
+        seed_attribute_mode: str = "auto",
+        seed_lifecycle_active: torch.Tensor | None = None,
+        seed_lifecycle_never_open: torch.Tensor | None = None,
     ) -> None:
         self.base = base
         self.seeds = seeds
@@ -444,7 +566,60 @@ class ConcatenatedChangeView:
         self.opacity_activation = getattr(base, "opacity_activation", torch.sigmoid)
         self.rotation_activation = getattr(base, "rotation_activation", torch.nn.functional.normalize)
         self.covariance_activation = getattr(base, "covariance_activation", seeds.covariance_activation)
-        attrs = seeds.get_active_render_attributes(timestamp)
+        explicit_lifecycle = (
+            seed_lifecycle_active is not None
+            or seed_lifecycle_never_open is not None
+        )
+        if explicit_lifecycle:
+            if seed_lifecycle_active is None or seed_lifecycle_never_open is None:
+                raise ValueError(
+                    "explicit seed lifecycle requires active and never-open masks"
+                )
+            if seed_attribute_mode not in {"auto", "lifecycle"}:
+                raise ValueError(
+                    "explicit seed lifecycle masks require lifecycle attribute mode"
+                )
+            active = seed_lifecycle_active.to(device=seeds.get_xyz.device)
+            never_open = seed_lifecycle_never_open.to(device=seeds.get_xyz.device)
+            expected_shape = (int(seeds.get_xyz.shape[0]),)
+            if (
+                active.dtype != torch.bool
+                or never_open.dtype != torch.bool
+                or tuple(active.shape) != expected_shape
+                or tuple(never_open.shape) != expected_shape
+            ):
+                raise ValueError(
+                    "explicit seed lifecycle masks must be boolean [N] tensors"
+                )
+            if bool((active & never_open).any()):
+                raise ValueError("seed active and never-open masks must be disjoint")
+            selected = active | never_open
+            selected_active = active[selected]
+            seed_dc = seeds._features_dc[selected]
+            black_dc = RGB2SH(seed_dc.new_zeros(()))
+            attrs = {
+                "mask": selected,
+                "xyz": seeds.get_xyz[selected],
+                "dc": torch.where(
+                    selected_active[:, None, None], seed_dc, black_dc
+                ),
+                "features_rest": seeds._features_rest[selected],
+                "opacity": seeds.get_opacity[selected],
+                "scaling": seeds.get_scaling[selected],
+                "rotation": seeds.get_rotation[selected],
+            }
+        elif seed_attribute_mode == "auto":
+            seed_attribute_mode = (
+                "lifecycle" if seeds.render_never_open_black else "active"
+            )
+        if not explicit_lifecycle and seed_attribute_mode == "active":
+            attrs = seeds.get_active_render_attributes(timestamp)
+        elif not explicit_lifecycle and seed_attribute_mode == "lifecycle":
+            attrs = seeds.get_lifecycle_render_attributes(timestamp)
+        elif not explicit_lifecycle and seed_attribute_mode == "all":
+            attrs = seeds.get_all_render_attributes()
+        elif not explicit_lifecycle:
+            raise ValueError("seed_attribute_mode must be auto|active|lifecycle|all")
         self.seed_active_mask = attrs["mask"]
         base_features_dc = base._features_dc if base_dc is None else base_dc
         if detach_base_dc:
@@ -462,6 +637,12 @@ class ConcatenatedChangeView:
         else:
             base_opacity_value = base_opacity.detach() if detach_base_dc else base_opacity
         self._opacity_value = torch.cat([base_opacity_value, attrs["opacity"].detach()], dim=0)
+        # ``render_change`` validates override opacity against the model's raw
+        # opacity tensor for dtype/device.  This adapter stores activated
+        # opacity values, but exposing the concatenated tensor under the
+        # conventional name is sufficient because the override supplies the
+        # actual values used by the renderer.
+        self._opacity = self._opacity_value
         self._scaling_value = torch.cat([base.get_scaling.detach(), attrs["scaling"].detach()], dim=0)
         self._rotation_value = torch.cat([base.get_rotation.detach(), attrs["rotation"].detach()], dim=0)
 
@@ -492,8 +673,21 @@ class ConcatenatedChangeView:
 class ActiveNewSeedView:
     """Temporary active-only adapter for a base-independent NEW coverage loss."""
 
-    def __init__(self, seeds: NewSeedGaussianModel, timestamp: float | torch.Tensor) -> None:
-        attrs = seeds.get_active_render_attributes(timestamp)
+    def __init__(
+        self,
+        seeds: NewSeedGaussianModel,
+        timestamp: float | torch.Tensor,
+        *,
+        attribute_mode: str = "active",
+    ) -> None:
+        if attribute_mode == "active":
+            attrs = seeds.get_active_render_attributes(timestamp)
+        elif attribute_mode == "lifecycle":
+            attrs = seeds.get_lifecycle_render_attributes(timestamp)
+        elif attribute_mode == "all":
+            attrs = seeds.get_all_render_attributes()
+        else:
+            raise ValueError("attribute_mode must be active|lifecycle|all")
         self.active_sh_degree = 0
         self.max_sh_degree = seeds.max_sh_degree
         self.scaling_activation = seeds.scaling_activation
@@ -539,6 +733,9 @@ def build_concatenated_change_view(
     base_dc: torch.Tensor | None = None,
     base_opacity: torch.Tensor | None = None,
     detach_base_dc: bool = True,
+    seed_attribute_mode: str = "auto",
+    seed_lifecycle_active: torch.Tensor | None = None,
+    seed_lifecycle_never_open: torch.Tensor | None = None,
 ) -> ConcatenatedChangeView:
     return ConcatenatedChangeView(
         base,
@@ -547,4 +744,7 @@ def build_concatenated_change_view(
         base_dc=base_dc,
         base_opacity=base_opacity,
         detach_base_dc=detach_base_dc,
+        seed_attribute_mode=seed_attribute_mode,
+        seed_lifecycle_active=seed_lifecycle_active,
+        seed_lifecycle_never_open=seed_lifecycle_never_open,
     )

@@ -20,14 +20,12 @@ from temporal.view_consistent_binary_lifespan_controller import (  # noqa: E402
     ViewConsistentBinaryLifespanController,
 )
 
-
 def test_override_color_contracts_cuda():
     model, camera, pipe, background = build_synthetic_temporal_scene(image_size=32)
     with pytest.raises(ValueError, match="shape"):
         render_change(camera, model.base, pipe, background, override_color=torch.zeros((5, 1), device="cuda"))
     with pytest.raises(ValueError, match="dtype"):
         render_change(camera, model.base, pipe, background, override_color=torch.zeros((5, 3), device="cuda", dtype=torch.float64))
-
 
 def test_alpha_t_vjp_closed_gaussian_remains_observable_and_no_base_grad():
     model, camera, pipe, background = build_synthetic_temporal_scene(image_size=48)
@@ -38,7 +36,6 @@ def test_alpha_t_vjp_closed_gaussian_remains_observable_and_no_base_grad():
     assert result.total_mass[0] > 0  # row 0 is closed at timestamp 95 in temporal renderer
     for name in ("_xyz", "_features_dc", "_features_rest", "_opacity", "_scaling", "_rotation"):
         assert getattr(model.base, name).grad is None
-
 
 def test_alpha_t_evidence_is_bitwise_independent_of_temporal_geometry_and_lifecycle():
     model, camera, pipe, background = build_synthetic_temporal_scene(image_size=40)
@@ -158,6 +155,34 @@ def test_alpha_t_evidence_is_bitwise_independent_of_temporal_geometry_and_lifecy
     for name, grad in expected_grad.items():
         assert torch.equal(getattr(model.base, name).grad, grad)
 
+def test_alpha_t_soft_vjp_capped_binary_uses_exclusive_gaussian_increments_and_no_base_grad():
+    model, camera, pipe, background = build_synthetic_temporal_scene(image_size=40)
+    cue = torch.linspace(0.0, 1.0, 40, device="cuda").repeat(40, 1)[None]
+
+    result = accumulate_change_evidence(
+        camera,
+        model.base,
+        pipe,
+        background,
+        cue,
+        cue_mode="soft",
+        cue_scale=1.0,
+        count_mode="capped_binary",
+        mass_saturation=0.75,
+        min_evidence_mass=0.0,
+    )
+
+    expected_sum = torch.clamp(result.total_mass / 0.75, 0.0, 1.0)
+    expected_active = result.e_plus > result.e_minus
+    assert torch.equal(result.delta_a > 0, expected_active & (expected_sum > 0))
+    assert torch.equal(result.delta_b > 0, (~expected_active) & (expected_sum > 0))
+    assert torch.equal(result.delta_a * result.delta_b, torch.zeros_like(result.delta_a))
+    assert torch.allclose(result.delta_a + result.delta_b, expected_sum, atol=1e-6)
+    assert torch.any((result.e_plus > 0) & (result.e_minus > 0))
+    assert torch.any(result.e_plus > result.e_minus)
+    assert torch.any(result.e_plus <= result.e_minus)
+    for name in ("_xyz", "_features_dc", "_features_rest", "_opacity", "_scaling", "_rotation"):
+        assert getattr(model.base, name).grad is None
 
 def test_alpha_t_vjp_matches_both_finite_difference_channels():
     model, camera, pipe, background = build_synthetic_temporal_scene(image_size=32)
@@ -189,7 +214,6 @@ def test_alpha_t_vjp_matches_both_finite_difference_channels():
         fd = ((changed[channel] - base_render[channel]) * weights).sum() / eps
         assert torch.isclose(fd, evidence[row], rtol=5e-2, atol=5e-2)
 
-
 def test_alpha_t_vjp_preserves_existing_base_gradients():
     model, camera, pipe, background = build_synthetic_temporal_scene(image_size=24)
     expected = {}
@@ -203,7 +227,6 @@ def test_alpha_t_vjp_preserves_existing_base_gradients():
     )
     for name, grad in expected.items():
         assert torch.equal(getattr(model.base, name).grad, grad)
-
 
 def test_dynamic_child_remains_detector_observable_after_it_becomes_inactive():
     synthetic, camera, pipe, background = build_synthetic_temporal_scene(image_size=32)

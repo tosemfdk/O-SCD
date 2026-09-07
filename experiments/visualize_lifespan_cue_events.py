@@ -1,8 +1,9 @@
-"""Visualize causal R_change, cached cues, and exact-timestamp lifespan events.
+"""Visualize causal R_change, cached cues, and Gaussian lifespan state.
 
-The event panel is intentionally sparse: only Gaussian rows whose lifecycle
-decision is OPEN or CLOSE at the current global image timestamp are rendered.
-OPEN is green, CLOSE is red, and KEEP/NONE rows are omitted.
+The lifecycle panel keeps every Gaussian that has entered a lifespan visible.
+Committed OPEN rows remain half-bright green and committed CLOSED rows remain
+half-bright red.  Rows whose lifecycle decision changes at the current image
+timestamp are highlighted at full brightness.  NEVER_OPEN rows are omitted.
 """
 
 from __future__ import annotations
@@ -24,6 +25,9 @@ import torch
 
 OPEN_COLOR = (0, 255, 0)
 CLOSE_COLOR = (255, 0, 0)
+STATE_INTENSITY = 0.5
+OPEN_STATE_COLOR = (0, 128, 0)
+CLOSED_STATE_COLOR = (128, 0, 0)
 
 
 def _font(size: int) -> ImageFont.ImageFont:
@@ -70,28 +74,87 @@ def event_probe_tensors(
     *,
     device: torch.device,
     dtype: torch.dtype,
+    open_state_rows: Sequence[int] = (),
+    closed_state_rows: Sequence[int] = (),
+    state_intensity: float = STATE_INTENSITY,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return per-row RGB colors and a boolean event mask."""
+    """Return lifecycle colors and a mask for state/event Gaussian rows.
+
+    State rows receive half-bright colors by default.  Exact-timestamp OPEN or
+    CLOSE event colors are then written at full brightness, so a current event
+    always overrides its persistent state color.
+    """
     if gaussian_count < 1:
         raise ValueError("gaussian_count must be positive")
+    if not math.isfinite(float(state_intensity)) or not 0.0 <= float(
+        state_intensity
+    ) <= 1.0:
+        raise ValueError("state_intensity must be finite and in [0,1]")
     open_tensor = torch.as_tensor(open_rows, device=device, dtype=torch.long).flatten()
     close_tensor = torch.as_tensor(close_rows, device=device, dtype=torch.long).flatten()
-    for name, rows in (("open_rows", open_tensor), ("close_rows", close_tensor)):
+    open_state_tensor = torch.as_tensor(
+        open_state_rows, device=device, dtype=torch.long
+    ).flatten()
+    closed_state_tensor = torch.as_tensor(
+        closed_state_rows, device=device, dtype=torch.long
+    ).flatten()
+    for name, rows in (
+        ("open_rows", open_tensor),
+        ("close_rows", close_tensor),
+        ("open_state_rows", open_state_tensor),
+        ("closed_state_rows", closed_state_tensor),
+    ):
         if rows.numel() and bool(((rows < 0) | (rows >= gaussian_count)).any()):
             raise IndexError(f"{name} contains an out-of-range Gaussian index")
     if open_tensor.numel() and close_tensor.numel():
         overlap = torch.isin(open_tensor, close_tensor)
         if bool(overlap.any()):
             raise ValueError("one Gaussian cannot OPEN and CLOSE at the same timestamp")
+    if open_state_tensor.numel() and closed_state_tensor.numel():
+        overlap = torch.isin(open_state_tensor, closed_state_tensor)
+        if bool(overlap.any()):
+            raise ValueError("one Gaussian cannot be OPEN and CLOSED simultaneously")
     colors = torch.zeros((gaussian_count, 3), device=device, dtype=dtype)
     selected = torch.zeros(gaussian_count, device=device, dtype=torch.bool)
+    if open_state_tensor.numel():
+        colors[open_state_tensor, 1] = float(state_intensity)
+        selected[open_state_tensor] = True
+    if closed_state_tensor.numel():
+        colors[closed_state_tensor, 0] = float(state_intensity)
+        selected[closed_state_tensor] = True
     if open_tensor.numel():
+        colors[open_tensor] = 0.0
         colors[open_tensor, 1] = 1.0
         selected[open_tensor] = True
     if close_tensor.numel():
+        colors[close_tensor] = 0.0
         colors[close_tensor, 0] = 1.0
         selected[close_tensor] = True
     return colors, selected
+
+
+def advance_lifecycle_state(
+    open_state_rows: set[int],
+    closed_state_rows: set[int],
+    *,
+    open_rows: Sequence[int],
+    close_rows: Sequence[int],
+) -> tuple[set[int], set[int]]:
+    """Apply exact-timestamp events and return the current committed states."""
+
+    opens = {int(row) for row in open_rows}
+    closes = {int(row) for row in close_rows}
+    if opens & closes:
+        raise ValueError("one Gaussian cannot OPEN and CLOSE at the same timestamp")
+    next_open = set(open_state_rows)
+    next_closed = set(closed_state_rows)
+    next_open.difference_update(closes)
+    next_closed.update(closes)
+    next_closed.difference_update(opens)
+    next_open.update(opens)
+    if next_open & next_closed:
+        raise RuntimeError("lifecycle state sets must remain disjoint")
+    return next_open, next_closed
 
 
 def turbo_heatmap(cue: np.ndarray) -> np.ndarray:
@@ -335,6 +398,8 @@ def compose_frame_panel(
     open_count: int,
     close_count: int,
     panel_width: int,
+    open_state_count: int | None = None,
+    closed_state_count: int | None = None,
     thresholded_render: np.ndarray | None = None,
     lifecycle_chart: Image.Image | None = None,
 ) -> Image.Image:
@@ -352,13 +417,20 @@ def compose_frame_panel(
             )
         )
     panel_items.append(
-        labeled_panel(event_render, "Lifespan events @ current t", panel_width)
+        labeled_panel(
+            event_render,
+            "Lifespan state + events",
+            panel_width,
+        )
     )
     panels = tuple(panel_items)
     gap = 8
     body_width = sum(panel.width for panel in panels) + gap * (len(panels) - 1)
     body_height = max(panel.height for panel in panels)
-    header_height = 58
+    show_state_legend = (
+        open_state_count is not None and closed_state_count is not None
+    )
+    header_height = 82 if show_state_legend else 58
     chart_gap = 8 if lifecycle_chart is not None else 0
     chart_height = lifecycle_chart.height if lifecycle_chart is not None else 0
     canvas = Image.new(
@@ -389,6 +461,29 @@ def compose_frame_panel(
         fill="black",
         font=_font(18),
     )
+    if show_state_legend:
+        assert open_state_count is not None and closed_state_count is not None
+        state_y = 43
+        draw.rectangle(
+            (legend_x, state_y, legend_x + 18, state_y + 18),
+            fill=OPEN_STATE_COLOR,
+        )
+        draw.text(
+            (legend_x + 25, state_y - 5),
+            f"OPEN state {open_state_count:,}",
+            fill="black",
+            font=_font(16),
+        )
+        draw.rectangle(
+            (close_x, state_y, close_x + 18, state_y + 18),
+            fill=CLOSED_STATE_COLOR,
+        )
+        draw.text(
+            (close_x + 25, state_y - 5),
+            f"CLOSED state {closed_state_count:,}",
+            fill="black",
+            font=_font(16),
+        )
     x = 0
     for panel in panels:
         canvas.paste(panel, (x, header_height))
@@ -439,8 +534,11 @@ def render_event_rows(
     background: torch.Tensor,
     open_rows: Sequence[int],
     close_rows: Sequence[int],
+    *,
+    open_state_rows: Sequence[int] = (),
+    closed_state_rows: Sequence[int] = (),
 ) -> np.ndarray:
-    """Render immutable-base footprints for only current-timestamp events."""
+    """Render immutable-base footprints for lifecycle states and events."""
     from gaussian_renderer import render_change
 
     colors, selected = event_probe_tensors(
@@ -449,6 +547,8 @@ def render_event_rows(
         close_rows,
         device=base.get_xyz.device,
         dtype=base._features_dc.dtype,
+        open_state_rows=open_state_rows,
+        closed_state_rows=closed_state_rows,
     )
     height, width = int(view.image_height), int(view.image_width)
     if not bool(selected.any()):
@@ -597,6 +697,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     panel_paths: list[Path] = []
     by_segment: dict[str, list[Path]] = defaultdict(list)
     manifest_rows: list[dict[str, Any]] = []
+    open_state_rows: set[int] = set()
+    closed_state_rows: set[int] = set()
 
     with torch.no_grad():
         for position, record in enumerate(records):
@@ -605,6 +707,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 [record], cameras, cue_cache_root, resolution
             )[0][0]
             action_rows = events.get(timestamp, {"OPEN": (), "CLOSE": ()})
+            open_state_rows, closed_state_rows = advance_lifecycle_state(
+                open_state_rows,
+                closed_state_rows,
+                open_rows=action_rows["OPEN"],
+                close_rows=action_rows["CLOSE"],
+            )
             stem = Path(record.name).stem
             captured_event_path = (
                 captured_event_render_dir / f"{stem}.png"
@@ -616,7 +724,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     raise FileNotFoundError(captured_event_path)
                 with Image.open(captured_event_path) as image:
                     event_rgb = np.asarray(image.convert("RGB"))
-                event_source = "saved_causal_event_render"
+                event_source = "saved_causal_lifecycle_state_event_render"
             else:
                 assert base is not None and pipe is not None and background is not None
                 event_rgb = render_event_rows(
@@ -626,8 +734,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     background,
                     action_rows["OPEN"],
                     action_rows["CLOSE"],
+                    open_state_rows=sorted(open_state_rows),
+                    closed_state_rows=sorted(closed_state_rows),
                 )
-                event_source = "reconstructed_immutable_base"
+                event_source = "reconstructed_immutable_base_lifecycle_state"
             raw_path = raw_render_dir / f"{stem}.png"
             if not raw_path.exists():
                 raise FileNotFoundError(raw_path)
@@ -670,6 +780,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 open_count=len(action_rows["OPEN"]),
                 close_count=len(action_rows["CLOSE"]),
                 panel_width=int(args.panel_width),
+                open_state_count=len(open_state_rows),
+                closed_state_count=len(closed_state_rows),
                 thresholded_render=thresholded,
                 lifecycle_chart=chart,
             )
@@ -686,6 +798,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "frame": record.name,
                     "open_count": len(action_rows["OPEN"]),
                     "close_count": len(action_rows["CLOSE"]),
+                    "open_state_count": len(open_state_rows),
+                    "closed_state_count": len(closed_state_rows),
                     "panel": str(panel_path),
                     "event_render": str(event_path),
                     "event_render_source": event_source,
@@ -716,8 +830,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         segment_gifs[segment] = str(path)
 
     payload = {
-        "schema_version": 1,
-        "contract": "exact-timestamp OPEN/CLOSE event-only immutable-base Gaussian render",
+        "schema_version": 2,
+        "contract": "persistent half-bright lifecycle state with full-bright exact-timestamp OPEN/CLOSE events",
         "run_dir": str(args.run_dir),
         "raw_render_dir": str(raw_render_dir),
         "thresholded_render_dir": (
@@ -740,9 +854,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         "frames": len(panel_paths),
         "continuous_gif": str(continuous_gif),
         "segment_gifs": segment_gifs,
-        "event_colors": {"OPEN": "green", "CLOSE": "red"},
-        "keep_rows_rendered": False,
-        "event_rows_persist_across_frames": False,
+        "event_colors": {
+            "OPEN": "full green",
+            "CLOSE": "full red",
+            "OPEN_state": "half green",
+            "CLOSED_state": "half red",
+        },
+        "state_intensity": STATE_INTENSITY,
+        "never_open_rows_rendered": False,
+        "persistent_state_rows_rendered": True,
+        "event_rows_persist_across_frames_as_state": True,
         "runtime_seconds": time.time() - started,
         "frames_manifest": manifest_rows,
     }

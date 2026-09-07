@@ -3,16 +3,17 @@
 This detector deliberately changes the Beta semantics used by the existing
 cue-state filter.  ``a`` counts evidence that the committed lifecycle bit is
 wrong (FLIP), while ``b`` counts evidence that it is still valid (KEEP).
-The reset candidate uses a neutral Beta prior.  After a committed flip, the
-candidate block is reinterpreted in the new state's coordinates: evidence that
-was FLIP under the old bit becomes KEEP under the toggled bit.
+The frozen reference state starts from the configured stable prior, while a
+reset candidate uses the configured reset prior.  After a committed flip, the
+winning reset posterior is reinterpreted in the new state's coordinates:
+evidence that was FLIP under the old bit becomes KEEP under the toggled bit.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from numbers import Real
+from numbers import Integral, Real
 from typing import Any
 
 import torch
@@ -111,6 +112,40 @@ class LifespanGateBetaFilter(SingleCandidateBetaFilter):
         self.initialized.fill_(True)
 
     @torch.no_grad()
+    def ensure_capacity(self, required_rows: int) -> None:
+        """Grow row-aligned filter buffers to at least ``required_rows``.
+
+        Existing rows are preserved bitwise.  Newly appended rows are initialized
+        exactly like a fresh :class:`LifespanGateBetaFilter` with the same gate
+        configuration, device, and dtype.
+        """
+
+        if (
+            isinstance(required_rows, bool)
+            or not isinstance(required_rows, Integral)
+            or int(required_rows) < 0
+        ):
+            raise ValueError("required_rows must be a nonnegative integer")
+        required = int(required_rows)
+        current = self.num_gaussians
+        if required <= current:
+            return
+
+        tail_count = required - current
+        tail = type(self)(
+            tail_count,
+            self.gate_config,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        replacements = {
+            name: torch.cat((getattr(self, name), getattr(tail, name)), dim=0)
+            for name in self.topology_buffer_names
+        }
+        for name, value in replacements.items():
+            setattr(self, name, value)
+
+    @torch.no_grad()
     def update(
         self,
         delta_a,
@@ -118,6 +153,8 @@ class LifespanGateBetaFilter(SingleCandidateBetaFilter):
         total_mass=None,
         *,
         current_active,
+        first_open=None,
+        first_open_bayes_factor_threshold=None,
         row_indices=None,
         indices=None,
         timestamp: int,
@@ -133,6 +170,69 @@ class LifespanGateBetaFilter(SingleCandidateBetaFilter):
         active = torch.as_tensor(current_active, device=self.device).flatten()
         if active.dtype != torch.bool or active.shape != cue_positive.shape:
             raise ValueError("current_active must be boolean and match evidence")
+        if first_open is None:
+            first_open_mask = None
+            if first_open_bayes_factor_threshold is not None:
+                raise ValueError(
+                    "first_open must be provided when overriding the first-open threshold"
+                )
+            log_threshold_override = None
+        else:
+            first_open_mask = torch.as_tensor(first_open, device=self.device).flatten()
+            if (
+                first_open_mask.dtype != torch.bool
+                or first_open_mask.shape != cue_positive.shape
+            ):
+                raise ValueError("first_open must be boolean and match evidence")
+            if first_open_bayes_factor_threshold is None:
+                log_threshold_override = None
+            else:
+                raw_threshold = first_open_bayes_factor_threshold
+                if isinstance(raw_threshold, bool):
+                    raise TypeError(
+                        "first_open_bayes_factor_threshold must be numeric"
+                    )
+                if isinstance(raw_threshold, Real):
+                    threshold_value = float(raw_threshold)
+                    if not math.isfinite(threshold_value) or threshold_value <= 1.0:
+                        raise ValueError(
+                            "first_open_bayes_factor_threshold must be finite and > 1"
+                        )
+                    first_open_log_threshold = torch.full(
+                        cue_positive.shape,
+                        math.log(threshold_value),
+                        device=self.device,
+                        dtype=self.dtype,
+                    )
+                else:
+                    raw_tensor = torch.as_tensor(raw_threshold, device=self.device)
+                    if raw_tensor.dtype == torch.bool or raw_tensor.dtype.is_complex:
+                        raise TypeError(
+                            "first_open_bayes_factor_threshold must be numeric"
+                        )
+                    threshold_tensor = raw_tensor.to(dtype=self.dtype).flatten()
+                    if threshold_tensor.numel() == 1:
+                        threshold_tensor = threshold_tensor.expand_as(cue_positive)
+                    elif threshold_tensor.shape != cue_positive.shape:
+                        raise ValueError(
+                            "first_open_bayes_factor_threshold must be scalar or match evidence"
+                        )
+                    if not bool(torch.isfinite(threshold_tensor).all()) or bool(
+                        (threshold_tensor <= 1.0).any()
+                    ):
+                        raise ValueError(
+                            "first_open_bayes_factor_threshold must be finite and > 1"
+                        )
+                    first_open_log_threshold = torch.log(threshold_tensor).clone()
+                default_log_threshold = torch.full(
+                    cue_positive.shape,
+                    float(self.config.log_bayes_factor_threshold),
+                    device=self.device,
+                    dtype=self.dtype,
+                )
+                log_threshold_override = torch.where(
+                    first_open_mask, first_open_log_threshold, default_log_threshold
+                )
 
         flip = torch.where(active, cue_negative, cue_positive)
         keep = torch.where(active, cue_positive, cue_negative)
@@ -140,6 +240,7 @@ class LifespanGateBetaFilter(SingleCandidateBetaFilter):
             flip,
             keep,
             total_mass,
+            log_bayes_factor_threshold=log_threshold_override,
             row_indices=row_indices,
             indices=indices,
             timestamp=timestamp,
@@ -160,11 +261,15 @@ class LifespanGateBetaFilter(SingleCandidateBetaFilter):
                 result.b_map[positions]
                 - float(self.gate_config.reset_keep_prior)
             ).clamp_min(0.0)
+            # Carry the winning RESET posterior across the bit toggle.  The
+            # prior coordinates swap together with the evidence coordinates;
+            # re-applying the initial stable prior here would inject evidence
+            # that was absent from the Bayes-factor hypothesis that won.
             self.stable_a[committed_rows] = (
-                float(self.gate_config.stable_flip_prior) + old_block_keep
+                float(self.gate_config.reset_keep_prior) + old_block_keep
             )
             self.stable_b[committed_rows] = (
-                float(self.gate_config.stable_keep_prior) + old_block_flip
+                float(self.gate_config.reset_flip_prior) + old_block_flip
             )
             self.stable_total_evidence[committed_rows] = (
                 old_block_flip + old_block_keep

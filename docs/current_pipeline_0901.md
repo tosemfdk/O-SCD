@@ -1142,6 +1142,11 @@ causal_visuals/thresholded_render/*.png
 causal_visuals/event_render/*.png
 ```
 
+`event_render`는 NEVER_OPEN을 제외하고 현재 lifecycle 상태를 계속 표시한다.
+기존 OPEN/CLOSED는 각각 절반 밝기 초록/빨강이며, 현재 timestamp에 새로 발생한
+OPEN/CLOSE만 완전 밝기 초록/빨강으로 덮어쓴다. 따라서 event가 없는 다음
+프레임에서도 이전 committed 상태를 추적할 수 있다.
+
 최근 paired BF30 first-OPEN ablation의 상세 결과는 다음 문서에 있다.
 
 - [`bf30-first-open-render-one-all-open-ablation-ko.md`](bf30-first-open-render-one-all-open-ablation-ko.md)

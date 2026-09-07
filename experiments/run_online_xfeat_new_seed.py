@@ -65,6 +65,22 @@ from temporal.new_seed_manager import (  # noqa: E402
     NewSeedManager, NewSeedManagerConfig, SeedGeometryResult, SeedMatchEdge, SeedObservationId
 )
 from temporal.new_seed_gaussians import NewSeedGaussianModel, build_concatenated_change_view  # noqa: E402
+from temporal.active_new_gaussians import (  # noqa: E402
+    ActiveNewGaussianModel,
+    FrozenBaseActiveNewView,
+)
+from temporal.active_new_density import (  # noqa: E402
+    ActiveNewDensityConfig,
+    ActiveNewPruneConfig,
+    accumulate_density_statistics,
+    densify_active_new,
+    new_geometry_coverage_loss,
+    prune_active_new,
+    render_active_new_coverage,
+    root_anchor_hinge_loss,
+    update_causal_new_support,
+    visibility_mass_with_frozen_reference,
+)
 from temporal.new_seed_densification import (  # noqa: E402
     NewSeedDensificationConfig,
     densify_confirmed_new_region,
@@ -143,6 +159,45 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Base-independent seed-only coverage weight; defaults to 1 for NEW-only densify, else 0",
     )
+    parser.add_argument(
+        "--e4d-variants",
+        nargs="+",
+        choices=("D0", "D1", "D2", "D3"),
+        default=(),
+        help="Run the controlled XFeat-512 active-NEW geometry ablation",
+    )
+    parser.add_argument(
+        "--e4e-variants",
+        nargs="+",
+        choices=("C0", "C1", "C2", "C3"),
+        default=(),
+        help=(
+            "Run joint-vs-NEW-only learned-DC x root-anchor-radius 2x2 ablation; "
+            "all variants retain E4d D3 density/pruning"
+        ),
+    )
+    parser.add_argument("--new-xyz-lr", type=float, default=1.6e-4)
+    parser.add_argument("--new-scale-lr", type=float, default=5.0e-3)
+    parser.add_argument("--new-rotation-lr", type=float, default=1.0e-3)
+    parser.add_argument("--new-opacity-lr", type=float, default=2.5e-2)
+    parser.add_argument("--new-dc-lr", type=float, default=2.5e-3)
+    parser.add_argument("--new-inside-weight", type=float, default=1.0)
+    parser.add_argument("--new-outside-weight", type=float, default=0.1)
+    parser.add_argument("--new-densify-grad-threshold", type=float, default=2.0e-4)
+    parser.add_argument("--new-densify-abs-grad-threshold", type=float, default=1.2e-3)
+    parser.add_argument("--new-densify-interval", type=int, default=100)
+    parser.add_argument("--new-densify-from-frame", type=int, default=5)
+    parser.add_argument("--new-max-gaussians", type=int, default=5000)
+    parser.add_argument("--new-percent-dense", type=float, default=0.01)
+    parser.add_argument("--new-prune-min-opacity", type=float, default=0.01)
+    parser.add_argument("--new-prune-grace-frames", type=int, default=10)
+    parser.add_argument("--new-prune-min-observations", type=int, default=8)
+    parser.add_argument("--new-prune-min-support-ratio", type=float, default=0.25)
+    parser.add_argument("--new-prune-max-screen-radius", type=float, default=100.0)
+    parser.add_argument("--new-prune-max-world-scale-ratio", type=float, default=0.10)
+    parser.add_argument("--new-prune-min-visible-mass", type=float, default=1.0e-4)
+    parser.add_argument("--new-anchor-radius-multiplier", type=float, default=4.0)
+    parser.add_argument("--new-anchor-penalty-weight", type=float, default=1.0)
     args = parser.parse_args()
     if args.updates_per_frame <= 0:
         parser.error("--updates-per-frame must be positive")
@@ -176,6 +231,56 @@ def parse_args() -> argparse.Namespace:
         args.seed_coverage_loss_weight = 1.0 if args.new_only_densify else 0.0
     if args.seed_coverage_loss_weight < 0.0:
         parser.error("--seed-coverage-loss-weight must be non-negative")
+    if args.e4d_variants and args.e4e_variants:
+        parser.error("--e4d-variants and --e4e-variants are mutually exclusive")
+    args.e4d_variants = tuple(dict.fromkeys(args.e4d_variants))
+    args.e4e_variants = tuple(dict.fromkeys(args.e4e_variants))
+    args.active_new_variants = args.e4d_variants or args.e4e_variants
+    args.active_new_experiment = (
+        "E4e" if args.e4e_variants else "E4d" if args.e4d_variants else None
+    )
+    if args.active_new_variants:
+        if args.new_only_densify:
+            parser.error("active NEW ablations cannot reuse --new-only-densify parent-depth propagation")
+        if args.disable_seeds:
+            parser.error("active NEW ablations require XFeat seed birth")
+        if args.xfeat_top_k != 512:
+            parser.error("active NEW ablations fix --xfeat-top-k=512")
+    for name in (
+        "new_xyz_lr",
+        "new_scale_lr",
+        "new_rotation_lr",
+        "new_opacity_lr",
+        "new_dc_lr",
+        "new_inside_weight",
+        "new_outside_weight",
+        "new_densify_grad_threshold",
+        "new_densify_abs_grad_threshold",
+        "new_percent_dense",
+        "new_prune_min_opacity",
+        "new_prune_max_screen_radius",
+        "new_prune_max_world_scale_ratio",
+        "new_prune_min_visible_mass",
+        "new_anchor_penalty_weight",
+    ):
+        if not math.isfinite(float(getattr(args, name))) or float(getattr(args, name)) < 0.0:
+            parser.error(f"--{name.replace('_', '-')} must be finite and nonnegative")
+    for name in (
+        "new_densify_interval",
+        "new_densify_from_frame",
+        "new_max_gaussians",
+        "new_prune_grace_frames",
+        "new_prune_min_observations",
+    ):
+        if int(getattr(args, name)) <= 0:
+            parser.error(f"--{name.replace('_', '-')} must be positive")
+    if not 0.0 <= args.new_prune_min_support_ratio <= 1.0:
+        parser.error("--new-prune-min-support-ratio must be in [0,1]")
+    if (
+        not math.isfinite(float(args.new_anchor_radius_multiplier))
+        or float(args.new_anchor_radius_multiplier) <= 0.0
+    ):
+        parser.error("--new-anchor-radius-multiplier must be finite and positive")
     return args
 
 
@@ -693,6 +798,7 @@ def train_seed_dc_from_projected_coverage(
     target: torch.Tensor,
     updates: int,
     loss_weight: float,
+    active_timestamp: float | None = None,
 ) -> dict[str, Any]:
     """Train seed DC from a differentiable projected footprint surrogate.
 
@@ -702,7 +808,9 @@ def train_seed_dc_from_projected_coverage(
     base-independent DC gradient without touching reference rows.
     """
 
-    active = seeds.active_mask(float(view.timestamp))
+    active = seeds.active_mask(
+        float(view.timestamp) if active_timestamp is None else float(active_timestamp)
+    )
     active_indices = torch.nonzero(active, as_tuple=False).flatten()
     if active_indices.numel() == 0:
         return {
@@ -992,6 +1100,448 @@ def train_seed_dc_on_new_mask(
     }
 
 
+def e4d_scene_extent(views: list[Any]) -> float:
+    """Camera-radius extent used by the standard 3DGS position LR convention."""
+
+    centers = torch.stack([view.camera_center.detach() for view in views])
+    center = centers.mean(dim=0)
+    extent = float(torch.linalg.vector_norm(centers - center, dim=1).max().item() * 1.1)
+    if not math.isfinite(extent) or extent <= 0.0:
+        raise RuntimeError("E4d camera extent must be finite and positive")
+    return extent
+
+
+def e4d_full_target(
+    view: Any, new64: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return confirmed NEW target and clear stable mask without GT access."""
+
+    size = (int(view.image_height), int(view.image_width))
+    signed = F.interpolate(new64.float()[None, None], size, mode="nearest")[0]
+    candidate = view.candidate_map.float()
+    if candidate.ndim == 2:
+        candidate = candidate[None]
+    target = (signed > 0.5) & (candidate >= 0.5)
+    stable = candidate <= 0.2
+    return target.float(), stable[0].bool()
+
+
+def new_sidecar_projected_dc_loss(
+    model: ActiveNewGaussianModel,
+    view: Any,
+    target: torch.Tensor,
+    *,
+    timestamp: int,
+    active_row_mask: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, float | int]]:
+    """Supervise learned NEW DC directly from its projected cue footprint.
+
+    The local FastGS build cannot reliably backpropagate DC for every small,
+    dynamically sized active-only bank.  This vectorized surrogate therefore
+    samples the current causal NEW cue at nine points inside each Gaussian's
+    approximate projected footprint.  Geometry/opacity are detached; only the
+    active NEW DC rows receive BCE gradients.  No reference/base row enters the
+    loss, so background change memory cannot attenuate this supervision.
+    """
+
+    if target.ndim != 3 or target.shape[0] != 1:
+        raise ValueError("target must have shape [1,H,W]")
+    if active_row_mask is None:
+        attrs = model.get_active_render_attributes(float(timestamp))
+    else:
+        if (
+            active_row_mask.dtype != torch.bool
+            or active_row_mask.ndim != 1
+            or active_row_mask.shape[0] != model.num_gaussians
+        ):
+            raise ValueError("active_row_mask must be boolean [N]")
+        selected = active_row_mask.to(device=model.get_xyz.device)
+        attrs = {
+            "rows": torch.nonzero(selected, as_tuple=False).flatten(),
+            "xyz": model.get_xyz[selected],
+            "scaling": model.get_scaling[selected],
+        }
+    rows = attrs["rows"]
+    if rows.numel() == 0:
+        zero = model.new_dc.sum() * 0.0
+        return zero, {
+            "loss": 0.0,
+            "active_rows": 0,
+            "visible_rows": 0,
+            "cue_target_mean": 0.0,
+            "predicted_probability_mean": 0.0,
+        }
+
+    xyz = attrs["xyz"].detach()
+    scaling = attrs["scaling"].detach().mean(dim=1)
+    homogeneous = torch.cat(
+        (xyz, torch.ones((xyz.shape[0], 1), device=xyz.device, dtype=xyz.dtype)),
+        dim=1,
+    )
+    camera = homogeneous @ view.world_view_transform
+    depth = camera[:, 2]
+    height, width = int(view.image_height), int(view.image_width)
+    focal_x = float(width) / (2.0 * math.tan(float(view.FoVx) * 0.5))
+    focal_y = float(height) / (2.0 * math.tan(float(view.FoVy) * 0.5))
+    safe_depth = depth.clamp_min(1.0e-6)
+    x = focal_x * camera[:, 0] / safe_depth + float(width) * 0.5
+    y = focal_y * camera[:, 1] / safe_depth + float(height) * 0.5
+    radius = (
+        math.sqrt(focal_x * focal_y) * scaling / safe_depth
+    ).clamp(0.75, 12.0)
+    offsets = torch.tensor(
+        (
+            (0.0, 0.0),
+            (-0.5, 0.0),
+            (0.5, 0.0),
+            (0.0, -0.5),
+            (0.0, 0.5),
+            (-0.35, -0.35),
+            (-0.35, 0.35),
+            (0.35, -0.35),
+            (0.35, 0.35),
+        ),
+        device=xyz.device,
+        dtype=xyz.dtype,
+    )
+    sample_x = x[:, None] + radius[:, None] * offsets[None, :, 0]
+    sample_y = y[:, None] + radius[:, None] * offsets[None, :, 1]
+    normalized_x = 2.0 * sample_x / max(width - 1, 1) - 1.0
+    normalized_y = 2.0 * sample_y / max(height - 1, 1) - 1.0
+    grid = torch.stack((normalized_x, normalized_y), dim=-1).reshape(1, -1, 1, 2)
+    cue_samples = F.grid_sample(
+        target.detach()[None].to(device=xyz.device, dtype=xyz.dtype),
+        grid,
+        mode="bilinear",
+        padding_mode="zeros",
+        align_corners=True,
+    ).reshape(rows.numel(), offsets.shape[0])
+    cue_target = cue_samples.mean(dim=1)
+    visible = (
+        (depth > 0.0)
+        & (sample_x.max(dim=1).values >= 0.0)
+        & (sample_x.min(dim=1).values < float(width))
+        & (sample_y.max(dim=1).values >= 0.0)
+        & (sample_y.min(dim=1).values < float(height))
+    )
+    if not bool(visible.any()):
+        zero = model.new_dc.sum() * 0.0
+        return zero, {
+            "loss": 0.0,
+            "active_rows": int(rows.numel()),
+            "visible_rows": 0,
+            "cue_target_mean": 0.0,
+            "predicted_probability_mean": 0.0,
+        }
+    logits = model.new_dc[rows, 0].mean(dim=1)
+    loss = F.binary_cross_entropy_with_logits(logits[visible], cue_target[visible])
+    return loss, {
+        "loss": float(loss.detach().item()),
+        "active_rows": int(rows.numel()),
+        "visible_rows": int(visible.sum().item()),
+        "cue_target_mean": float(cue_target[visible].detach().mean().item()),
+        "predicted_probability_mean": float(
+            torch.sigmoid(logits[visible]).detach().mean().item()
+        ),
+    }
+
+
+def active_new_uses_seed_only_dc(variant: str) -> bool:
+    """Return whether learned NEW DC is optimized without the base bank."""
+
+    return variant in {"C1", "C3"}
+
+
+def active_new_constrains_xfeat_anchor(variant: str) -> bool:
+    """Return whether XFeat xyz is fixed and children use a root-radius hinge."""
+
+    return variant in {"C2", "C3"}
+
+
+def active_new_uses_density(variant: str) -> bool:
+    return variant in {"D2", "D3", "C0", "C1", "C2", "C3"}
+
+
+def active_new_uses_pruning(variant: str) -> bool:
+    return variant in {"D3", "C0", "C1", "C2", "C3"}
+
+
+def _e4d_training_schedule(
+    replay: list[dict[str, Any]], updates: int
+) -> list[dict[str, Any]]:
+    """Deterministic 1/3-current, 2/3-recent-prior causal replay."""
+
+    if not replay:
+        return []
+    current = replay[-1]
+    priors = replay[:-1][-8:]
+    selected = []
+    prior_index = 0
+    for step in range(int(updates)):
+        if not priors or step % 3 == 0:
+            selected.append(current)
+        else:
+            selected.append(priors[-1 - (prior_index % len(priors))])
+            prior_index += 1
+    return selected
+
+
+def train_e4d_active_branch(
+    model: ActiveNewGaussianModel,
+    optimizer: torch.optim.Optimizer,
+    *,
+    base: GaussianModel,
+    base_new_dc: torch.Tensor,
+    current_timestamp: int,
+    replay: list[dict[str, Any]],
+    updates: int,
+    pipe: SimpleNamespace,
+    background: torch.Tensor,
+    inside_weight: float,
+    outside_weight: float,
+    seed_only_dc: bool = False,
+    constrain_xfeat_anchor: bool = False,
+    anchor_radius_multiplier: float = 4.0,
+    anchor_penalty_weight: float = 1.0,
+) -> dict[str, Any]:
+    """Optimize one active-NEW sidecar with controlled supervision.
+
+    Geometry sees only the causal current/prior NEW replay schedule.  Every
+    variant learns NEW DC from the current confirmed cue.  The controlled DC
+    factor is joint base+NEW SSF versus a base-free, per-NEW-Gaussian projected
+    cue-mixture objective.  In constrained variants generation-zero XFeat xyz
+    is exact-fixed, while descendants pay a normalized hinge only after leaving
+    their root anchor's trust radius.
+    """
+
+    branch_started = time.time()
+    active_count = int(model.active_mask(float(current_timestamp)).sum().item())
+    if active_count == 0 or not replay:
+        return {
+            "active_rows": active_count,
+            "updates": 0,
+            "first": None,
+            "last": None,
+            "gradient_rows": 0,
+            "geometry_backward_skipped_updates": 0,
+            "anchor_restore_rows": 0,
+            "runtime_seconds": time.time() - branch_started,
+        }
+    schedule = _e4d_training_schedule(replay, updates)
+    current = replay[-1]
+    first = last = None
+    gradient_rows = 0
+    geometry_backward_skipped_updates = 0
+    anchor_restore_rows = 0
+    for step, item in enumerate(schedule, 1):
+        optimizer.zero_grad(set_to_none=True)
+        active_view = model.active_view(float(current_timestamp))
+        package = render_active_new_coverage(
+            item["view"], active_view, pipe, background
+        )
+        geometry_loss, geometry_parts = new_geometry_coverage_loss(
+            item["target"],
+            package["render"],
+            inside_weight=inside_weight,
+            outside_weight=outside_weight,
+        )
+        anchor_loss, anchor_parts = root_anchor_hinge_loss(
+            model,
+            timestamp=current_timestamp,
+            radius_multiplier=anchor_radius_multiplier,
+        )
+        weighted_anchor_loss = (
+            float(anchor_penalty_weight) * anchor_loss
+            if constrain_xfeat_anchor
+            else anchor_loss * 0.0
+        )
+        total_geometry_loss = geometry_loss + weighted_anchor_loss
+        # The FastGS extension can reject a launch when the active-only
+        # geometry graph and the 1.28M-row joint color graph are scheduled by
+        # one combined backward.  Their trainable parameter sets are disjoint,
+        # so two sequential backward calls before one optimizer step produce
+        # the same summed gradient without co-scheduling both rasterizers.
+        geometry_visible = int((package["radii"] > 0).sum().item())
+        if geometry_visible:
+            total_geometry_loss.backward()
+            density = accumulate_density_statistics(model, active_view, package)
+        elif constrain_xfeat_anchor and anchor_parts["outside_rows"]:
+            # Avoid the rasterizer's invalid zero-sized backward launch while
+            # still applying the direct 3D trust-region penalty.
+            weighted_anchor_loss.backward()
+            density = {
+                "visible": 0,
+                "signed_norm": 0.0,
+                "absolute_norm": 0.0,
+            }
+            geometry_backward_skipped_updates += 1
+        else:
+            # FastGS's backward path launches a zero-sized CUDA grid when no
+            # NEW splat intersects the selected replay view.  Such a view has
+            # no valid geometry responsibility, so skipping only this
+            # geometry backward is both causal and gradient-equivalent.
+            density = {
+                "visible": 0,
+                "signed_norm": 0.0,
+                "absolute_norm": 0.0,
+            }
+            geometry_backward_skipped_updates += 1
+        if seed_only_dc:
+            # Learn intrinsic NEW DC directly from its own projected causal cue
+            # mixture.  The base bank is absent and geometry is detached.
+            dc_loss, dc_parts = new_sidecar_projected_dc_loss(
+                model,
+                current["view"],
+                current["target"],
+                timestamp=current_timestamp,
+            )
+        else:
+            dc_view = FrozenBaseActiveNewView(
+                base,
+                model,
+                timestamp=float(current_timestamp),
+                base_dc=base_new_dc,
+                detach_new_geometry=True,
+            )
+            dc_render = render_change(
+                current["view"], dc_view, pipe, background
+            )["render"]
+            dc_loss, dc_parts = ssf_loss(current["target"], dc_render)
+        dc_loss.backward()
+        dc_gradient_norm = (
+            float(model.new_dc.grad.detach().norm().item())
+            if model.new_dc.grad is not None
+            else 0.0
+        )
+        if constrain_xfeat_anchor:
+            model.zero_xfeat_anchor_xyz_gradient()
+        gradient_rows += int(density["visible"])
+        optimizer.step()
+        if constrain_xfeat_anchor:
+            anchor_restore_rows += model.restore_xfeat_anchor_xyz(optimizer)
+        row = {
+            "step": step,
+            "view_timestamp": int(item["timestamp"]),
+            "dc_view_timestamp": int(current["timestamp"]),
+            "loss": float(
+                total_geometry_loss.detach().item() + dc_loss.detach().item()
+            ),
+            "geometry": geometry_parts,
+            "anchor_hinge": {
+                **anchor_parts,
+                "enabled": bool(constrain_xfeat_anchor),
+                "weight": float(anchor_penalty_weight),
+                "weighted_loss": float(weighted_anchor_loss.detach().item()),
+            },
+            "geometry_backward_skipped": geometry_visible == 0,
+            "dc": dc_parts,
+            "dc_supervision": (
+                "new_sidecar_only_projected_cue_mixture"
+                if seed_only_dc
+                else "joint_base_and_new_ssf"
+            ),
+            "dc_gradient_norm": dc_gradient_norm,
+            "visible_gradient_rows": int(density["visible"]),
+            "signed_gradient_norm": float(density["signed_norm"]),
+            "absolute_gradient_norm": float(density["absolute_norm"]),
+        }
+        if first is None:
+            first = row
+        last = row
+    return {
+        "active_rows": active_count,
+        "updates": len(schedule),
+        "first": first,
+        "last": last,
+        "gradient_rows": gradient_rows,
+        "geometry_backward_skipped_updates": geometry_backward_skipped_updates,
+        "anchor_restore_rows": anchor_restore_rows,
+        "runtime_seconds": time.time() - branch_started,
+    }
+
+
+def render_new_sidecar_alpha_score(
+    view: Any,
+    seeds: NewSeedGaussianModel | ActiveNewGaussianModel | None,
+    pipe: SimpleNamespace,
+    background: torch.Tensor,
+) -> torch.Tensor:
+    """Render an evaluation-only white-alpha NEW footprint diagnostic."""
+
+    height, width = int(view.image_height), int(view.image_width)
+    if seeds is None or seeds.num_seeds == 0:
+        return torch.zeros(
+            (1, height, width), device=background.device, dtype=background.dtype
+        )
+    active_count = int(seeds.active_mask(float(view.timestamp)).sum().item())
+    if active_count == 0:
+        return torch.zeros(
+            (1, height, width), device=background.device, dtype=background.dtype
+        )
+    active_view = seeds.active_view(float(view.timestamp))
+    colors = torch.ones(
+        (active_count, 3),
+        device=active_view.get_xyz.device,
+        dtype=active_view.get_xyz.dtype,
+    )
+    return render_change(
+        view,
+        active_view,
+        pipe,
+        torch.zeros_like(background),
+        override_color=colors,
+        clamp_output=False,
+    )["render"].mean(dim=0, keepdim=True).clamp(0.0, 1.0)
+
+
+def render_new_sidecar_learned_score(
+    view: Any,
+    seeds: NewSeedGaussianModel | ActiveNewGaussianModel | None,
+    pipe: SimpleNamespace,
+    background: torch.Tensor,
+) -> torch.Tensor:
+    """Render only active NEW rows with their learned DC values."""
+
+    height, width = int(view.image_height), int(view.image_width)
+    if seeds is None or seeds.num_seeds == 0:
+        return torch.zeros(
+            (1, height, width), device=background.device, dtype=background.dtype
+        )
+    active_count = int(seeds.active_mask(float(view.timestamp)).sum().item())
+    if active_count == 0:
+        return torch.zeros(
+            (1, height, width), device=background.device, dtype=background.dtype
+        )
+    active_view = (
+        seeds.lifecycle_view(float(view.timestamp))
+        if bool(getattr(seeds, "render_never_open_black", False))
+        and hasattr(seeds, "lifecycle_view")
+        else seeds.active_view(float(view.timestamp))
+    )
+    return render_change(
+        view,
+        active_view,
+        pipe,
+        torch.zeros_like(background),
+    )["render"].mean(dim=0, keepdim=True).clamp(0.0, 1.0)
+
+
+def object_scope_prediction(
+    scope: str,
+    *,
+    full_prediction: np.ndarray,
+    new_prediction: np.ndarray,
+    remove_prediction: np.ndarray,
+) -> np.ndarray:
+    """Select the prediction bank matching an evaluation object type."""
+
+    if scope in {"new", "new_full"}:
+        return new_prediction
+    if scope in {"remove", "remove_full"}:
+        return remove_prediction
+    return full_prediction
+
+
 @torch.inference_mode()
 def evaluate_branch_change(
     view: Any,
@@ -1003,14 +1553,19 @@ def evaluate_branch_change(
     gt_masks64: dict[str, np.ndarray],
     *,
     gt_full: np.ndarray | None = None,
-    seeds: NewSeedGaussianModel | None = None,
+    gt_full_scopes: dict[str, np.ndarray] | None = None,
+    seeds: NewSeedGaussianModel | ActiveNewGaussianModel | None = None,
     new_sign: str | None = None,
 ) -> dict[str, Any]:
     plus_model: Any = base
     minus_model: Any = base
     plus_override = plus_dc.detach()
     minus_override = minus_dc.detach()
-    if seeds is not None and seeds.num_seeds > 0 and new_sign in {"+", "-"}:
+    if (
+        seeds is not None
+        and seeds.num_seeds > 0
+        and new_sign in {"+", "-"}
+    ):
         if new_sign == "+":
             plus_model = build_concatenated_change_view(base, seeds, timestamp=float(view.timestamp), base_dc=plus_dc, detach_base_dc=True)
             plus_override = None
@@ -1031,24 +1586,91 @@ def evaluate_branch_change(
     # second time would map every nonnegative pixel to >=0.5 and make the whole
     # image positive.  Match the repository evaluator exactly: mean RGB, clamp,
     # then threshold at 0.5.
-    score = torch.maximum(plus_render, minus_render).clamp(0.0, 1.0)
+    base_or_learned_score = torch.maximum(plus_render, minus_render).clamp(0.0, 1.0)
+    learned_new_score = render_new_sidecar_learned_score(
+        view, seeds, pipe, background
+    )
+    sidecar_alpha_score = render_new_sidecar_alpha_score(
+        view, seeds, pipe, background
+    )
+    if new_sign == "+":
+        remove_score = minus_render.clamp(0.0, 1.0)
+    elif new_sign == "-":
+        remove_score = plus_render.clamp(0.0, 1.0)
+    else:
+        remove_score = torch.zeros_like(base_or_learned_score)
+    score = base_or_learned_score
     pred_full = score[0].detach().cpu().numpy() >= 0.5
+    learned_new_pred_full = learned_new_score[0].detach().cpu().numpy() >= 0.5
+    remove_pred_full = remove_score[0].detach().cpu().numpy() >= 0.5
+    sidecar_alpha_pred_full = (
+        sidecar_alpha_score[0].detach().cpu().numpy() >= 0.5
+    )
     score64 = F.interpolate(score[None], (64, 64), mode="area")[0, 0]
+    learned_new_score64 = F.interpolate(
+        learned_new_score[None], (64, 64), mode="area"
+    )[0, 0]
+    remove_score64 = F.interpolate(remove_score[None], (64, 64), mode="area")[0, 0]
+    sidecar_alpha_score64 = F.interpolate(
+        sidecar_alpha_score[None], (64, 64), mode="area"
+    )[0, 0]
     pred64 = score64.detach().cpu().numpy() >= 0.5
+    learned_new_pred64 = learned_new_score64.detach().cpu().numpy() >= 0.5
+    remove_pred64 = remove_score64.detach().cpu().numpy() >= 0.5
+    sidecar_alpha_pred64 = sidecar_alpha_score64.detach().cpu().numpy() >= 0.5
     metrics: dict[str, Any] = {
         "predicted_pixels_full": int(np.count_nonzero(pred_full)),
         "score_mean_full": float(score.mean().item()),
         "predicted_cells64": int(np.count_nonzero(pred64)),
         "score_mean64": float(score64.mean().item()),
+        "new_sidecar_predicted_pixels_full": int(
+            np.count_nonzero(learned_new_pred_full)
+        ),
+        "new_sidecar_score_mean_full": float(learned_new_score.mean().item()),
+        "sidecar_alpha_predicted_pixels_full": int(
+            np.count_nonzero(sidecar_alpha_pred_full)
+        ),
+        "sidecar_alpha_score_mean_full": float(sidecar_alpha_score.mean().item()),
     }
     if gt_full is not None:
         full = binary_metrics(pred_full, np.asarray(gt_full, dtype=bool))
         for key, value in full.items():
             metrics[f"full_{key}"] = value
+    for scope, mask in (gt_full_scopes or {}).items():
+        scoped_prediction = object_scope_prediction(
+            scope,
+            full_prediction=pred_full,
+            new_prediction=learned_new_pred_full,
+            remove_prediction=remove_pred_full,
+        )
+        scoped_full = binary_metrics(
+            scoped_prediction, np.asarray(mask, dtype=bool)
+        )
+        for key, value in scoped_full.items():
+            metrics[f"{scope}_{key}"] = value
+    if gt_full_scopes is not None and "new_full" in gt_full_scopes:
+        sidecar_alpha_new_full = binary_metrics(
+            sidecar_alpha_pred_full,
+            np.asarray(gt_full_scopes["new_full"], dtype=bool),
+        )
+        for key, value in sidecar_alpha_new_full.items():
+            metrics[f"sidecar_alpha_new_full_{key}"] = value
     for scope, gt64 in gt_masks64.items():
-        scoped = binary_metrics(pred64, np.asarray(gt64, dtype=bool))
+        scoped_prediction = object_scope_prediction(
+            scope,
+            full_prediction=pred64,
+            new_prediction=learned_new_pred64,
+            remove_prediction=remove_pred64,
+        )
+        scoped = binary_metrics(scoped_prediction, np.asarray(gt64, dtype=bool))
         for key, value in scoped.items():
             metrics[f"{scope}_{key}"] = value
+    if "new" in gt_masks64:
+        sidecar_alpha_new = binary_metrics(
+            sidecar_alpha_pred64, np.asarray(gt_masks64["new"], dtype=bool)
+        )
+        for key, value in sidecar_alpha_new.items():
+            metrics[f"sidecar_alpha_new_{key}"] = value
     return metrics
 
 
@@ -1063,11 +1685,24 @@ def train_current_signed_masks(
     pipe: SimpleNamespace,
     background: torch.Tensor,
     updates: int,
+    *,
+    cue_target: torch.Tensor | None = None,
 ) -> dict[str, Any]:
     size = (int(view.image_height), int(view.image_width))
-    cue_binary = (view.candidate_map >= 0.5).float()
-    target_plus = F.interpolate(plus64.float()[None, None], size, mode="nearest")[0] * cue_binary
-    target_minus = F.interpolate(minus64.float()[None, None], size, mode="nearest")[0] * cue_binary
+    if cue_target is None:
+        cue_target = (view.candidate_map >= 0.5).float()
+    if cue_target.shape != (1, *size):
+        raise ValueError(f"cue_target must have shape {(1, *size)}")
+    if not torch.is_floating_point(cue_target):
+        raise TypeError("cue_target must be floating point")
+    if cue_target.device != view.original_image.device:
+        raise ValueError("cue_target must share the view device")
+    if not bool(torch.isfinite(cue_target).all()):
+        raise ValueError("cue_target must be finite")
+    if bool(((cue_target < 0.0) | (cue_target > 1.0)).any()):
+        raise ValueError("cue_target must lie in [0,1]")
+    target_plus = F.interpolate(plus64.float()[None, None], size, mode="nearest")[0] * cue_target
+    target_minus = F.interpolate(minus64.float()[None, None], size, mode="nearest")[0] * cue_target
     first = last = None
     for step in range(updates):
         optimizer.zero_grad(set_to_none=True)
@@ -1774,6 +2409,168 @@ def write_seed_comparison_artifacts(scene_reports: list[dict[str, Any]], output_
     return {"csv": str(csv_path), "markdown": str(md_path), "visual_table": str(png_path)}
 
 
+def write_e4d_comparison_artifacts(
+    scene_reports: list[dict[str, Any]], output_dir: Path, variants: tuple[str, ...]
+) -> dict[str, str]:
+    """Write a controlled active-NEW ablation metric table."""
+
+    is_e4e = bool(variants) and all(variant.startswith("C") for variant in variants)
+    family = "E4e" if is_e4e else "E4d"
+    stem = "_".join(variants) + "_comparison"
+    scopes = (
+        ("full", "new_full", "remove_full", "sidecar_alpha_new_full")
+        if is_e4e
+        else ("full", "new_full", "remove_full")
+    )
+    rows: list[dict[str, Any]] = []
+    for report in scene_reports:
+        for variant in variants:
+            for scope in scopes:
+                metric = report["e4d_metric_scopes"][variant][scope]
+                rows.append(
+                    {
+                        "scene": f"SceneChange{report['scene']}",
+                        "variant": variant,
+                        "scope": scope,
+                        "frames": metric["frames"],
+                        "precision": metric["precision"],
+                        "recall": metric["recall"],
+                        "iou": metric["iou"],
+                        "f1": metric["f1"],
+                    }
+                )
+    for variant in variants:
+        for scope in scopes:
+            entries = [report["e4d_metric_scopes"][variant][scope] for report in scene_reports]
+            counts = {
+                name: sum(int(entry[name]) for entry in entries)
+                for name in ("tp", "tn", "fp", "fn")
+            }
+            tp, tn, fp, fn = (counts[name] for name in ("tp", "tn", "fp", "fn"))
+            rows.append(
+                {
+                    "scene": "Overall",
+                    "variant": variant,
+                    "scope": scope,
+                    "frames": sum(int(entry["frames"]) for entry in entries),
+                    "precision": tp / (tp + fp) if tp + fp else 0.0,
+                    "recall": tp / (tp + fn) if tp + fn else 0.0,
+                    "iou": tp / (tp + fp + fn) if tp + fp + fn else 0.0,
+                    "f1": 2 * tp / (2 * tp + fp + fn) if 2 * tp + fp + fn else 0.0,
+                }
+            )
+    csv_path = output_dir / f"{stem}.csv"
+    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+    markdown_path = output_dir / f"{stem}.md"
+    lines = [
+        f"# {family} XFeat-512 active NEW comparison",
+        "",
+        "| Scene | Variant | Scope | Precision | Recall | IoU | F1 |",
+        "|---|---|---|---:|---:|---:|---:|",
+    ]
+    for row in rows:
+        lines.append(
+            f"| {row['scene']} | {row['variant']} | {row['scope']} | "
+            f"{row['precision']:.6f} | {row['recall']:.6f} | "
+            f"{row['iou']:.6f} | {row['f1']:.6f} |"
+        )
+    lines.extend(
+        [
+            "",
+            "- `full` is the official full-resolution overall mask.",
+            "- `new_full` compares only the learned-DC NEW sidecar mask with NEW GT.",
+            "- `remove_full` compares only the causally assigned opposite-sign base mask with REMOVED GT.",
+            "- `sidecar_alpha_new_full` is an evaluation-only white-alpha footprint audit; it is not the final NEW mask.",
+            f"- {'C0-C3' if is_e4e else 'D0-D3'} share one causal SAM/PCA/posterior/XFeat promotion trace.",
+        ]
+    )
+    markdown_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    overall = [row for row in rows if row["scene"] == "Overall"]
+    colors = {
+        "D0": (66, 133, 244),
+        "D1": (244, 180, 0),
+        "D2": (15, 157, 88),
+        "D3": (219, 68, 55),
+        "C0": (66, 133, 244),
+        "C1": (244, 180, 0),
+        "C2": (15, 157, 88),
+        "C3": (219, 68, 55),
+    }
+    plot = Image.new("RGB", (1280, 620), "white")
+    draw = ImageDraw.Draw(plot)
+    draw.text(
+        (28, 18),
+        f"{family} XFeat-512 active NEW: overall metrics",
+        font=font(24),
+        fill="black",
+    )
+    scope_labels = {
+        "full": "Overall",
+        "new_full": "NEW",
+        "remove_full": "REMOVED",
+        "sidecar_alpha_new_full": "NEW alpha footprint",
+    }
+    for panel, metric_name in enumerate(("iou", "f1")):
+        left = 70 + panel * 625
+        top, bottom, right = 105, 515, left + 555
+        draw.text(
+            (left, 72), metric_name.upper(), font=font(18), fill=(35, 35, 35)
+        )
+        draw.line((left, top, left, bottom), fill=(80, 80, 80), width=2)
+        draw.line((left, bottom, right, bottom), fill=(80, 80, 80), width=2)
+        for tick in range(0, 11, 2):
+            value = tick / 10.0
+            y = bottom - int(value * (bottom - top))
+            draw.line((left, y, right, y), fill=(225, 225, 225), width=1)
+            draw.text((left - 48, y - 8), f"{value:.1f}", font=font(11), fill=(80, 80, 80))
+        group_width = (right - left) / len(scopes)
+        bar_width = 27
+        for scope_index, scope in enumerate(scopes):
+            group_center = left + group_width * (scope_index + 0.5)
+            draw.text(
+                (group_center - 42, bottom + 15),
+                scope_labels[scope],
+                font=font(12),
+                fill=(40, 40, 40),
+            )
+            scoped = {row["variant"]: row for row in overall if row["scope"] == scope}
+            for variant_index, variant in enumerate(variants):
+                value = float(scoped[variant][metric_name])
+                x0 = int(
+                    group_center
+                    - (len(variants) * bar_width + (len(variants) - 1) * 6) / 2
+                    + variant_index * (bar_width + 6)
+                )
+                y0 = bottom - int(value * (bottom - top))
+                draw.rectangle(
+                    (x0, y0, x0 + bar_width, bottom),
+                    fill=colors[variant],
+                    outline=(70, 70, 70),
+                )
+                draw.text(
+                    (x0 - 7, y0 - 18),
+                    f"{value:.3f}",
+                    font=font(9),
+                    fill=(30, 30, 30),
+                )
+    legend_x = 430
+    for index, variant in enumerate(variants):
+        x = legend_x + index * 115
+        draw.rectangle((x, 570, x + 18, 588), fill=colors[variant])
+        draw.text((x + 25, 568), variant, font=font(12), fill="black")
+    plot_path = output_dir / f"{stem}.png"
+    plot.save(plot_path)
+    return {
+        "csv": str(csv_path),
+        "markdown": str(markdown_path),
+        "plot": str(plot_path),
+    }
+
+
 def assert_seed_acceptance_invariants(
     seed_model: NewSeedGaussianModel,
     seed_manager: NewSeedManager,
@@ -1859,6 +2656,12 @@ def run_scene(
     args: argparse.Namespace,
 ) -> dict[str, Any]:
     started = time.time()
+    if torch.cuda.is_available():
+        # The SAM model is intentionally shared across scenes.  Resetting here
+        # makes the reported peak include that resident frontend plus every
+        # scene-local reference/NEW allocation, while avoiding a stale peak
+        # inherited from the previous scene.
+        torch.cuda.reset_peak_memory_stats()
     scene_out = args.output_dir / f"scene_change{scene}"
     scene_out.mkdir(parents=True, exist_ok=True)
     frame_dir = scene_out / "gif_frames"
@@ -1893,6 +2696,30 @@ def run_scene(
     # training and guaranteeing a truly controlled comparison.
     seed_model = NewSeedGaussianModel(sh_degree=base.max_sh_degree, device=base._features_dc.device, dtype=base._features_dc.dtype)
     seed_optimizer = torch.optim.Adam(seed_model.optimizer_parameter_groups(args.seed_lr or args.lr), lr=args.seed_lr or args.lr, eps=1e-15)
+    e4d_variants = tuple(args.active_new_variants)
+    e4d_extent = e4d_scene_extent(views)
+    e4d_models: dict[str, ActiveNewGaussianModel] = {}
+    e4d_optimizers: dict[str, torch.optim.Optimizer] = {}
+    for variant in e4d_variants:
+        if variant == "D0":
+            continue
+        model = ActiveNewGaussianModel(
+            sh_degree=base.max_sh_degree,
+            device=base._features_dc.device,
+            dtype=base._features_dc.dtype,
+        )
+        e4d_models[variant] = model
+        e4d_optimizers[variant] = torch.optim.Adam(
+            model.optimizer_parameter_groups(
+                xyz_lr=float(args.new_xyz_lr) * e4d_extent,
+                dc_lr=float(args.new_dc_lr),
+                opacity_lr=float(args.new_opacity_lr),
+                scaling_lr=float(args.new_scale_lr),
+                rotation_lr=float(args.new_rotation_lr),
+            ),
+            lr=0.0,
+            eps=1e-15,
+        )
     seed_manager = NewSeedManager(NewSeedManagerConfig(candidate_ttl_frames=args.seed_candidate_ttl))
     observation_buffer = XFeatObservationBuffer(max_frames=args.seed_buffer_frames)
     observation_index: dict[int, SignedXFeatObservation] = {}
@@ -1916,6 +2743,25 @@ def run_scene(
     seed_rejection_counts: Counter[str] = Counter()
     masked_keypoint_totals = {"plus": 0, "minus": 0}
     densification_totals: Counter[str] = Counter()
+    e4d_replay: list[dict[str, Any]] = []
+    e4d_last_sign: str | None = None
+    e4d_optimizer_steps = {variant: 0 for variant in e4d_models}
+    e4d_last_density_step = {variant: 0 for variant in e4d_models}
+    e4d_density_seconds = {variant: 0.0 for variant in e4d_models}
+    e4d_pruning_seconds = {variant: 0.0 for variant in e4d_models}
+    e4d_densification_events: dict[str, list[dict[str, Any]]] = {
+        variant: [] for variant in e4d_models
+    }
+    e4d_pruning_events: dict[str, list[dict[str, Any]]] = {
+        variant: [] for variant in e4d_models
+    }
+    e4d_gradient_rows: dict[str, list[dict[str, Any]]] = {
+        variant: [] for variant in e4d_models
+    }
+    e4d_reprojection_rows: dict[str, list[dict[str, Any]]] = {
+        variant: [] for variant in e4d_models
+    }
+    e4d_count_rows: list[dict[str, Any]] = []
     seed_reprojection_rows: list[dict[str, Any]] = []
     overlap = {"plus_add": 0, "plus_remove": 0, "minus_add": 0, "minus_remove": 0}
     object_evidence = {obj["index"]: {"plus": 0, "minus": 0} for obj in objects}
@@ -2024,6 +2870,9 @@ def run_scene(
             "joint_gradient_norm": None,
             "coverage_gradient_norm": None,
         }
+        e4d_training: dict[str, dict[str, Any]] = {}
+        e4d_frame_density: dict[str, dict[str, Any]] = {}
+        e4d_frame_pruning: dict[str, dict[str, Any]] = {}
         densification_row = {
             "attempted": False,
             "considered_cells": 0,
@@ -2041,6 +2890,9 @@ def run_scene(
                 # Keep the sidecar lifespan synchronized with the manager's
                 # half-open close on a posterior sign flip. Rows are retained.
                 seed_model.close_active(float(record.global_index))
+                for model in e4d_models.values():
+                    model.close_active(float(record.global_index))
+                e4d_replay.clear()
             seed_manager.set_gate(new_sign, float(record.global_index))
             history = observation_buffer.backfill(record.global_index, args.seed_buffer_frames) if not seed_gate_opened else observation_buffer.latest(args.seed_prior_views + 1)
             seed_gate_opened = True
@@ -2126,6 +2978,29 @@ def run_scene(
                     },
                     optimizer=seed_optimizer,
                 )
+                for variant, active_model in e4d_models.items():
+                    active_model.append_xfeat_anchors(
+                        xyz=xyz,
+                        start=float(promotion.start_time),
+                        scaling=torch.full(
+                            (1, 3), log_scale, device=xyz.device, dtype=xyz.dtype
+                        ),
+                        opacity=0.1,
+                        metadata={
+                            "scene": scene,
+                            "seed_id": promotion.seed_id,
+                            "track_id": promotion.track_id,
+                            "source_sign": promotion.source_sign,
+                            "mapping_confidence": new_confidence,
+                            "support": [
+                                (item.frame_index, item.keypoint_index)
+                                for item in promotion.support_observations
+                            ],
+                            "diagnostics": dict(promotion.diagnostics),
+                            "variant": variant,
+                        },
+                        optimizer=e4d_optimizers[variant],
+                    )
             if (
                 args.new_only_densify
                 and seed_model.num_seeds > 0
@@ -2198,6 +3073,187 @@ def run_scene(
                     args.updates_per_frame,
                     coverage_loss_weight=args.seed_coverage_loss_weight,
                 )
+                if e4d_models:
+                    target, stable_mask = e4d_full_target(view, new64)
+                    if e4d_last_sign not in (None, new_sign):
+                        e4d_replay.clear()
+                    e4d_last_sign = new_sign
+                    e4d_replay.append(
+                        {
+                            "timestamp": int(record.global_index),
+                            "view": view,
+                            "target": target.detach(),
+                            "stable_mask": stable_mask.detach(),
+                        }
+                    )
+                    e4d_replay[:] = e4d_replay[-int(args.seed_buffer_frames) :]
+                    for variant, active_model in e4d_models.items():
+                        constrain_anchor = active_new_constrains_xfeat_anchor(
+                            variant
+                        )
+                        density_config = ActiveNewDensityConfig(
+                            grad_threshold=float(args.new_densify_grad_threshold),
+                            abs_grad_threshold=float(
+                                args.new_densify_abs_grad_threshold
+                            ),
+                            percent_dense=float(args.new_percent_dense),
+                            max_gaussians=int(args.new_max_gaussians),
+                            preserve_xfeat_anchors=constrain_anchor,
+                            one_shot_anchor_densification=constrain_anchor,
+                        )
+                        prune_config = ActiveNewPruneConfig(
+                            min_opacity=float(args.new_prune_min_opacity),
+                            grace_frames=int(args.new_prune_grace_frames),
+                            min_observations=int(args.new_prune_min_observations),
+                            min_support_ratio=float(
+                                args.new_prune_min_support_ratio
+                            ),
+                            max_screen_radius=float(
+                                args.new_prune_max_screen_radius
+                            ),
+                            max_world_scale_ratio=float(
+                                args.new_prune_max_world_scale_ratio
+                            ),
+                            min_visible_mass=float(
+                                args.new_prune_min_visible_mass
+                            ),
+                            preserve_xfeat_anchors=constrain_anchor,
+                        )
+                        active_before = active_model.active_mask(
+                            float(record.global_index)
+                        )
+                        launch_context = {
+                            "variant": variant,
+                            "frame_index": int(record.global_index),
+                            "total_rows": int(active_model.num_gaussians),
+                            "active_rows": int(active_before.sum().item()),
+                            "max_scale": float(
+                                active_model.get_scaling.detach()[active_before]
+                                .amax()
+                                .item()
+                            )
+                            if bool(active_before.any())
+                            else 0.0,
+                        }
+                        try:
+                            training_row = train_e4d_active_branch(
+                                active_model,
+                                e4d_optimizers[variant],
+                                base=base,
+                                base_new_dc=base_new_dc,
+                                current_timestamp=int(record.global_index),
+                                replay=e4d_replay,
+                                updates=int(args.updates_per_frame),
+                                pipe=pipe,
+                                background=background,
+                                inside_weight=float(args.new_inside_weight),
+                                outside_weight=float(args.new_outside_weight),
+                                seed_only_dc=active_new_uses_seed_only_dc(variant),
+                                constrain_xfeat_anchor=constrain_anchor,
+                                anchor_radius_multiplier=float(
+                                    args.new_anchor_radius_multiplier
+                                ),
+                                anchor_penalty_weight=float(
+                                    args.new_anchor_penalty_weight
+                                ),
+                            )
+                        except RuntimeError as error:
+                            raise RuntimeError(
+                                f"E4d renderer/update failed: {launch_context}"
+                            ) from error
+                        e4d_training[variant] = training_row
+                        e4d_optimizer_steps[variant] += int(training_row["updates"])
+                        if training_row["last"] is not None:
+                            e4d_gradient_rows[variant].append(
+                                {
+                                    "frame_index": int(record.global_index),
+                                    "signed_gradient_norm": training_row["last"][
+                                        "signed_gradient_norm"
+                                    ],
+                                    "absolute_gradient_norm": training_row["last"][
+                                        "absolute_gradient_norm"
+                                    ],
+                                    "visible_gradient_rows": training_row[
+                                        "gradient_rows"
+                                    ],
+                                    "geometry_backward_skipped_updates": training_row[
+                                        "geometry_backward_skipped_updates"
+                                    ],
+                                }
+                            )
+                        # Prune before density reset so D3 can consume the
+                        # accumulated projected-radius statistics.  Newly born
+                        # children are evaluated from the next causal frame,
+                        # which also respects their grace period.
+                        if active_new_uses_pruning(variant) and active_model.num_gaussians:
+                            pruning_started = time.time()
+                            active_rows, visible_mass = visibility_mass_with_frozen_reference(
+                                view,
+                                base,
+                                active_model,
+                                timestamp=int(record.global_index),
+                                pipe=pipe,
+                                background=background,
+                            )
+                            support_update = update_causal_new_support(
+                                active_model,
+                                decision_timestamp=int(record.global_index),
+                                observation_timestamp=int(record.global_index),
+                                view=view,
+                                new_mask=target[0].bool(),
+                                stable_mask=stable_mask,
+                                active_rows=active_rows,
+                                visibility_mass=visible_mass,
+                                config=prune_config,
+                            )
+                            prune_result = prune_active_new(
+                                active_model,
+                                e4d_optimizers[variant],
+                                timestamp=int(record.global_index),
+                                scene_extent=e4d_extent,
+                                config=prune_config,
+                            )
+                            prune_result["support_update"] = support_update
+                            prune_result["runtime_seconds"] = (
+                                time.time() - pruning_started
+                            )
+                            e4d_pruning_seconds[variant] += float(
+                                prune_result["runtime_seconds"]
+                            )
+                            e4d_frame_pruning[variant] = prune_result
+                            e4d_pruning_events[variant].extend(prune_result["events"])
+
+                        should_densify = (
+                            active_new_uses_density(variant)
+                            and frame_index >= int(args.new_densify_from_frame)
+                            and e4d_optimizer_steps[variant]
+                            - e4d_last_density_step[variant]
+                            >= int(args.new_densify_interval)
+                        )
+                        if should_densify:
+                            density_started = time.time()
+                            density_result = densify_active_new(
+                                active_model,
+                                e4d_optimizers[variant],
+                                timestamp=int(record.global_index),
+                                scene_extent=e4d_extent,
+                                config=density_config,
+                                random_seed=int(args.seed)
+                                + 100_003 * scene
+                                + 1009 * int(record.global_index)
+                                + 2,
+                            )
+                            density_result["runtime_seconds"] = (
+                                time.time() - density_started
+                            )
+                            e4d_density_seconds[variant] += float(
+                                density_result["runtime_seconds"]
+                            )
+                            e4d_last_density_step[variant] = e4d_optimizer_steps[variant]
+                            e4d_frame_density[variant] = density_result
+                            e4d_densification_events[variant].extend(
+                                density_result["events"]
+                            )
 
         # Evaluation-only annotations are intentionally loaded after posterior
         # and training decisions so they cannot enter the online path.
@@ -2231,9 +3287,17 @@ def run_scene(
             "new": added64,
             "remove": removed64,
         }
+        added_full, removed_full, appearance_full = annotation_masks_at_size(
+            record.name,
+            objects,
+            height=int(view.image_height),
+            width=int(view.image_width),
+        )
+        gt_full_scopes = {"new_full": added_full, "remove_full": removed_full}
         baseline_eval = evaluate_branch_change(
             view, base, dc_plus, dc_minus, pipe, background, gt_masks64,
             gt_full=gt_full,
+            gt_full_scopes=gt_full_scopes,
         )
         active_seed_rows_for_render = (
             int(seed_model.active_mask(float(view.timestamp)).sum().item())
@@ -2254,15 +3318,35 @@ def run_scene(
             background,
             gt_masks64,
             gt_full=gt_full,
+            gt_full_scopes=gt_full_scopes,
             seeds=seed_model,
             new_sign=seed_render_sign,
         )
-        added_full, removed_full, appearance_full = annotation_masks_at_size(
-            record.name,
-            objects,
-            height=int(view.image_height),
-            width=int(view.image_width),
-        )
+        e4d_evaluations: dict[str, dict[str, Any]] = {}
+        if "D0" in e4d_variants:
+            e4d_evaluations["D0"] = seed_eval
+        for variant, active_model in e4d_models.items():
+            active_count = int(
+                active_model.active_mask(float(view.timestamp)).sum().item()
+            )
+            render_sign = active_seed_render_sign(
+                new_sign,
+                seed_manager.current_sign,
+                active_count,
+            )
+            e4d_evaluations[variant] = evaluate_branch_change(
+                view,
+                base,
+                dc_plus,
+                dc_minus,
+                pipe,
+                background,
+                gt_masks64,
+                gt_full=gt_full,
+                gt_full_scopes=gt_full_scopes,
+                seeds=active_model,
+                new_sign=render_sign,
+            )
         active_attributes = seed_model.get_active_render_attributes(float(view.timestamp))
         active_indices = torch.nonzero(
             active_attributes["mask"], as_tuple=False
@@ -2304,6 +3388,42 @@ def run_scene(
                     > float(seed_model.start[seed_row].item()),
                 }
             )
+        for variant, active_model in e4d_models.items():
+            active_rows = torch.nonzero(
+                active_model.active_mask(float(view.timestamp)), as_tuple=False
+            ).flatten().detach().cpu().tolist()
+            for active_row in active_rows:
+                xyz_world = active_model._xyz[active_row].detach().cpu()
+                uv, depth = project_point(xyz_world, observation)
+                x, y = float(uv[0]), float(uv[1])
+                xi, yi = int(math.floor(x)), int(math.floor(y))
+                inside = (
+                    depth > 0.0
+                    and 0 <= xi < int(view.image_width)
+                    and 0 <= yi < int(view.image_height)
+                )
+                metadata = active_model.metadata[active_row]
+                e4d_reprojection_rows[variant].append(
+                    {
+                        "frame_index": int(record.global_index),
+                        "frame_name": record.name,
+                        "stable_id": int(active_model.stable_id[active_row].item()),
+                        "birth_kind": metadata.get("birth_kind"),
+                        "generation": int(active_model.generation[active_row].item()),
+                        "x": x,
+                        "y": y,
+                        "depth": depth,
+                        "inside_image": inside,
+                        "inside_new_gt": bool(inside and added_full[yi, xi]),
+                        "inside_remove_gt": bool(inside and removed_full[yi, xi]),
+                        "inside_appearance_gt": bool(
+                            inside and appearance_full[yi, xi]
+                        ),
+                        "birth_frame": int(active_model.birth_frame[active_row].item()),
+                        "is_post_birth_view": int(record.global_index)
+                        > int(active_model.birth_frame[active_row].item()),
+                    }
+                )
 
         global_plus, global_minus, global_skip = evidence_by_method["global"]
         balanced_plus, balanced_minus, balanced_skip = evidence_by_method["balanced"]
@@ -2392,8 +3512,98 @@ def run_scene(
             "gt_minus_remove_cells": int(np.count_nonzero(minus_np & removed64)),
             "frame_runtime_seconds": time.time() - frame_started,
         }
+        e4d_count_entry: dict[str, Any] = {
+            "scene": scene,
+            "frame_index": int(record.global_index),
+            "frame_name": record.name,
+        }
+        if "D0" in e4d_variants:
+            e4d_count_entry["D0"] = int(seed_model.num_seeds)
+        for variant, active_model in e4d_models.items():
+            e4d_count_entry[variant] = int(active_model.num_gaussians)
+            training_row = e4d_training.get(variant, {})
+            density_row = e4d_frame_density.get(variant, {})
+            pruning_row = e4d_frame_pruning.get(variant, {})
+            row[f"{variant}_gaussian_count"] = int(active_model.num_gaussians)
+            row[f"{variant}_active_count"] = int(
+                active_model.active_mask(float(record.global_index)).sum().item()
+            )
+            row[f"{variant}_training_updates"] = int(training_row.get("updates", 0))
+            row[f"{variant}_training_last_loss"] = (
+                None
+                if training_row.get("last") is None
+                else training_row["last"]["loss"]
+            )
+            row[f"{variant}_dc_supervision"] = (
+                None
+                if training_row.get("last") is None
+                else training_row["last"]["dc_supervision"]
+            )
+            row[f"{variant}_dc_gradient_norm"] = (
+                None
+                if training_row.get("last") is None
+                else training_row["last"]["dc_gradient_norm"]
+            )
+            row[f"{variant}_training_runtime_seconds"] = float(
+                training_row.get("runtime_seconds", 0.0)
+            )
+            row[f"{variant}_geometry_backward_skipped_updates"] = int(
+                training_row.get("geometry_backward_skipped_updates", 0)
+            )
+            row[f"{variant}_anchor_restore_rows"] = int(
+                training_row.get("anchor_restore_rows", 0)
+            )
+            row[f"{variant}_anchor_hinge_loss"] = (
+                None
+                if training_row.get("last") is None
+                else training_row["last"]["anchor_hinge"]["loss"]
+            )
+            row[f"{variant}_anchor_outside_rows"] = (
+                0
+                if training_row.get("last") is None
+                else int(training_row["last"]["anchor_hinge"]["outside_rows"])
+            )
+            row[f"{variant}_density_clones"] = int(density_row.get("clone_count", 0))
+            row[f"{variant}_density_split_sources"] = int(
+                density_row.get("split_source_count", 0)
+            )
+            row[f"{variant}_pruned"] = int(
+                len(pruning_row.get("events", []))
+            )
+        if e4d_variants:
+            e4d_count_rows.append(e4d_count_entry)
         for branch_name, values in (("baseline", baseline_eval), ("seed", seed_eval)):
-            for scope in ("full", "all", "geometry", "new", "remove"):
+            for scope in ("full", "new_full", "remove_full", "all", "geometry", "new", "remove"):
+                for metric_name in (
+                    "tp",
+                    "tn",
+                    "fp",
+                    "fn",
+                    "pred_positive",
+                    "gt_positive",
+                    "pixels",
+                    "precision",
+                    "recall",
+                    "iou",
+                    "f1",
+                    "accuracy",
+                ):
+                    row[f"{branch_name}_{scope}_{metric_name}"] = values[
+                        f"{scope}_{metric_name}"
+                    ]
+        for variant, values in e4d_evaluations.items():
+            branch_name = variant.lower()
+            for scope in (
+                "full",
+                "new_full",
+                "remove_full",
+                "all",
+                "geometry",
+                "new",
+                "remove",
+                "sidecar_alpha_new_full",
+                "sidecar_alpha_new",
+            ):
                 for metric_name in (
                     "tp",
                     "tn",
@@ -2535,6 +3745,133 @@ def run_scene(
     if not geometry_audit["all_fields_bitwise_equal"]:
         raise RuntimeError(f"DC-only invariant failed in SceneChange{scene}: {geometry_audit}")
     seed_acceptance_audit = assert_seed_acceptance_invariants(seed_model, seed_manager, args)
+    e4d_outputs: dict[str, Any] = {}
+    if e4d_variants:
+        base_audit_path = scene_out / "base_bitwise_audit.json"
+        base_audit_path.write_text(
+            json.dumps(json_safe(geometry_audit), indent=2) + "\n", encoding="utf-8"
+        )
+        causal_audit = {
+            "gt_used_in_pca_or_posterior": False,
+            "gt_used_in_xfeat_seed_birth": False,
+            "gt_used_in_geometry_optimization": False,
+            "gt_used_in_densification": False,
+            "gt_used_in_pruning": False,
+            "future_views_used_in_optimization": False,
+            "future_views_used_in_pruning": False,
+            "reference_topology_edited": False,
+            "reference_rows": int(base._xyz.shape[0]),
+            "all_reference_fields_bitwise_equal": bool(
+                geometry_audit["all_fields_bitwise_equal"]
+            ),
+        }
+        causal_audit_path = scene_out / "causal_audit.json"
+        causal_audit_path.write_text(
+            json.dumps(causal_audit, indent=2) + "\n", encoding="utf-8"
+        )
+        counts_path = scene_out / "gaussian_count_over_time.csv"
+        with counts_path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(e4d_count_rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(e4d_count_rows)
+        for variant, active_model in e4d_models.items():
+            variant_out = scene_out / variant
+            variant_out.mkdir(exist_ok=True)
+            checkpoint_path = variant_out / "checkpoint.pt"
+            torch.save(
+                {
+                    "variant": variant,
+                    "model": active_model.to_checkpoint(),
+                    "optimizer": e4d_optimizers[variant].state_dict(),
+                    "optimizer_steps": e4d_optimizer_steps[variant],
+                    "scene_extent": e4d_extent,
+                },
+                checkpoint_path,
+            )
+            ply_path = variant_out / "final_new_gaussians.ply"
+            save_active_seed_ply(
+                active_model,
+                timestamp=float(records[-1].global_index),
+                path=ply_path,
+            )
+            gradient_path = variant_out / "geometry_gradient_stats.csv"
+            gradient_rows = e4d_gradient_rows[variant]
+            if gradient_rows:
+                with gradient_path.open("w", newline="", encoding="utf-8") as handle:
+                    writer = csv.DictWriter(
+                        handle, fieldnames=list(gradient_rows[0].keys())
+                    )
+                    writer.writeheader()
+                    writer.writerows(gradient_rows)
+            else:
+                gradient_path.write_text("", encoding="utf-8")
+            densify_path = variant_out / "densification_events.jsonl"
+            densify_path.write_text(
+                "".join(
+                    json.dumps(json_safe(item), ensure_ascii=False) + "\n"
+                    for item in e4d_densification_events[variant]
+                ),
+                encoding="utf-8",
+            )
+            prune_path = variant_out / "pruning_events.jsonl"
+            prune_path.write_text(
+                "".join(
+                    json.dumps(json_safe(item), ensure_ascii=False) + "\n"
+                    for item in e4d_pruning_events[variant]
+                ),
+                encoding="utf-8",
+            )
+            reprojection_rows = e4d_reprojection_rows[variant]
+            reprojection_file = variant_out / "new_reprojection_metrics.csv"
+            if reprojection_rows:
+                with reprojection_file.open(
+                    "w", newline="", encoding="utf-8"
+                ) as handle:
+                    writer = csv.DictWriter(
+                        handle, fieldnames=list(reprojection_rows[0].keys())
+                    )
+                    writer.writeheader()
+                    writer.writerows(reprojection_rows)
+            else:
+                reprojection_file.write_text("", encoding="utf-8")
+            e4d_outputs[variant] = {
+                "checkpoint": str(checkpoint_path),
+                "final_new_gaussians_ply": str(ply_path),
+                "geometry_gradient_stats": str(gradient_path),
+                "densification_events": str(densify_path),
+                "pruning_events": str(prune_path),
+                "reprojection_metrics": str(reprojection_file),
+            }
+        if "D0" in e4d_variants:
+            d0_out = scene_out / "D0"
+            d0_out.mkdir(exist_ok=True)
+            d0_checkpoint = d0_out / "checkpoint.pt"
+            d0_checkpoint.write_bytes(seed_checkpoint_path.read_bytes())
+            d0_ply = d0_out / "final_new_gaussians.ply"
+            save_active_seed_ply(
+                seed_model,
+                timestamp=float(records[-1].global_index),
+                path=d0_ply,
+            )
+            d0_gradient = d0_out / "geometry_gradient_stats.csv"
+            d0_gradient.write_text("", encoding="utf-8")
+            d0_densify = d0_out / "densification_events.jsonl"
+            d0_densify.write_text("", encoding="utf-8")
+            d0_prune = d0_out / "pruning_events.jsonl"
+            d0_prune.write_text("", encoding="utf-8")
+            d0_reprojection = d0_out / "new_reprojection_metrics.csv"
+            d0_reprojection.write_bytes(reprojection_path.read_bytes())
+            e4d_outputs["D0"] = {
+                "checkpoint": str(d0_checkpoint),
+                "final_new_gaussians_ply": str(d0_ply),
+                "geometry_gradient_stats": str(d0_gradient),
+                "densification_events": str(d0_densify),
+                "pruning_events": str(d0_prune),
+                "reprojection_metrics": str(d0_reprojection),
+            }
+        e4d_outputs["base_bitwise_audit"] = str(base_audit_path)
+        e4d_outputs["causal_audit"] = str(causal_audit_path)
+        e4d_outputs["gaussian_count_over_time"] = str(counts_path)
 
     outputs = {
         "frame_metrics_csv": str(csv_path),
@@ -2547,6 +3884,7 @@ def run_scene(
         "active_seed_reprojections_csv": str(reprojection_path),
         "gif": str(gif_path) if not args.skip_gif else "not_generated",
         "gif_frames": str(frame_dir) if args.save_frame_pngs else "not_saved",
+        "e4d": e4d_outputs,
     }
     report = finalize_scene_report(
         scene, rows, objects, object_evidence, overlap, trackers, geometry_audit, time.time() - started, outputs, args
@@ -2641,7 +3979,15 @@ def run_scene(
     report["metric_scopes"] = {
         branch: {
             scope: aggregate_metric_scope(rows, branch, scope)
-            for scope in ("full", "all", "geometry", "new", "remove")
+            for scope in (
+                "full",
+                "new_full",
+                "remove_full",
+                "all",
+                "geometry",
+                "new",
+                "remove",
+            )
         }
         for branch in ("baseline", "seed")
     }
@@ -2651,8 +3997,253 @@ def run_scene(
             - report["metric_scopes"]["baseline"][scope][metric]
             for metric in ("precision", "recall", "iou", "f1", "mean_frame_iou", "mean_frame_f1")
         }
-        for scope in ("full", "all", "geometry", "new", "remove")
+        for scope in (
+            "full",
+            "new_full",
+            "remove_full",
+            "all",
+            "geometry",
+            "new",
+            "remove",
+        )
     }
+    if e4d_variants:
+        scopes = [
+            "full",
+            "new_full",
+            "remove_full",
+            "all",
+            "geometry",
+            "new",
+            "remove",
+        ]
+        if args.active_new_experiment == "E4e":
+            scopes.extend(("sidecar_alpha_new_full", "sidecar_alpha_new"))
+        report["e4d_metric_scopes"] = {
+            variant: {
+                scope: aggregate_metric_scope(rows, variant.lower(), scope)
+                for scope in scopes
+            }
+            for variant in e4d_variants
+        }
+        initial_parent_count = int(
+            sum(
+                metadata.get("birth_kind", "xfeat_triangulated")
+                != "new_only_densified"
+                for metadata in seed_model.metadata
+            )
+        )
+        diagnostics: dict[str, Any] = {}
+        if "D0" in e4d_variants:
+            diagnostics["D0"] = {
+                "initial_xfeat_parent_count": initial_parent_count,
+                "final_xfeat_parent_surviving_count": initial_parent_count,
+                "final_new_gaussian_count": int(seed_model.num_seeds),
+                "final_active_new_gaussian_count": int(
+                    seed_model.active_mask(float(records[-1].global_index)).sum().item()
+                ),
+                "peak_new_gaussian_count": max(
+                    (int(item["D0"]) for item in e4d_count_rows), default=0
+                ),
+                "densified_child_count": 0,
+                "final_densified_child_surviving_count": 0,
+                "split_replaced_source_count": 0,
+                "pruned_parent_count": 0,
+                "pruned_child_count": 0,
+                "geometry_optimization_seconds": 0.0,
+                "geometry_backward_skipped_updates": 0,
+                "densification_seconds": 0.0,
+                "pruning_seconds": 0.0,
+            }
+        for variant, active_model in e4d_models.items():
+            metadata = active_model.metadata
+            anchors = [row for row in metadata if row.get("birth_kind") == "xfeat_anchor"]
+            children = [
+                row for row in metadata if row.get("birth_kind") == "gradient_densified"
+            ]
+            density_events = e4d_densification_events[variant]
+            prune_events = e4d_pruning_events[variant]
+            gradient_rows = e4d_gradient_rows[variant]
+            displacements = torch.linalg.vector_norm(
+                active_model._xyz.detach() - active_model.initial_xyz, dim=1
+            ).cpu().tolist()
+            root_displacements = torch.linalg.vector_norm(
+                active_model._xyz.detach() - active_model.root_anchor_xyz, dim=1
+            )
+            root_radii = (
+                float(args.new_anchor_radius_multiplier)
+                * active_model.root_anchor_scale
+            ).clamp_min(torch.finfo(active_model._xyz.dtype).eps)
+            root_ratios = root_displacements / root_radii
+            anchor_mask = active_model.generation == 0
+            child_mask = active_model.generation > 0
+            reprojections = e4d_reprojection_rows[variant]
+
+            def reprojection_summary(kind: str) -> dict[str, Any]:
+                selected = [
+                    item
+                    for item in reprojections
+                    if item["birth_kind"] == kind and item["is_post_birth_view"]
+                ]
+                inside = [item for item in selected if item["inside_image"]]
+                return {
+                    "samples": len(selected),
+                    "inside_image": len(inside),
+                    "new_precision": sum(item["inside_new_gt"] for item in inside)
+                    / max(len(inside), 1),
+                    "removed_leakage": sum(
+                        item["inside_remove_gt"] for item in inside
+                    )
+                    / max(len(inside), 1),
+                    "stable_or_other_leakage": sum(
+                        not item["inside_new_gt"] for item in inside
+                    )
+                    / max(len(inside), 1),
+                }
+
+            diagnostics[variant] = {
+                "dc_supervision": (
+                    "new_sidecar_only_projected_cue_mixture"
+                    if active_new_uses_seed_only_dc(variant)
+                    else "joint_base_and_new_ssf"
+                ),
+                "xfeat_xyz_fixed_and_root_hinge": active_new_constrains_xfeat_anchor(
+                    variant
+                ),
+                "new_dc_max_abs": float(
+                    active_model.new_dc.detach().abs().amax().item()
+                )
+                if active_model.num_gaussians
+                else 0.0,
+                "initial_xfeat_parent_count": initial_parent_count,
+                "final_xfeat_parent_surviving_count": len(anchors),
+                "densified_child_count": sum(
+                    int(event.get("children", 0)) for event in density_events
+                ),
+                "final_densified_child_surviving_count": len(children),
+                "split_replaced_source_count": sum(
+                    event.get("action") == "split" for event in density_events
+                ),
+                "pruned_parent_count": sum(
+                    event.get("birth_kind") == "xfeat_anchor"
+                    for event in prune_events
+                ),
+                "pruned_child_count": sum(
+                    event.get("birth_kind") == "gradient_densified"
+                    for event in prune_events
+                ),
+                "final_new_gaussian_count": int(active_model.num_gaussians),
+                "final_active_new_gaussian_count": int(
+                    active_model.active_mask(float(records[-1].global_index)).sum().item()
+                ),
+                "peak_new_gaussian_count": max(
+                    (int(item.get(variant, 0)) for item in e4d_count_rows), default=0
+                ),
+                "generation_histogram": dict(
+                    Counter(int(value) for value in active_model.generation.tolist())
+                ),
+                "xyz_displacement": distribution(displacements),
+                "xfeat_anchor_xyz_bitwise_equal_root": bool(
+                    torch.equal(
+                        active_model._xyz.detach()[anchor_mask],
+                        active_model.root_anchor_xyz[anchor_mask],
+                    )
+                ),
+                "xfeat_anchor_xyz_drift": distribution(
+                    root_displacements[anchor_mask].detach().cpu().tolist()
+                ),
+                "child_root_anchor_distance_ratio": distribution(
+                    root_ratios[child_mask].detach().cpu().tolist()
+                ),
+                "children_outside_root_radius": int(
+                    (root_ratios[child_mask] > 1.0).sum().item()
+                ),
+                "root_anchor_radius_multiplier": float(
+                    args.new_anchor_radius_multiplier
+                ),
+                "root_anchor_penalty_weight": float(
+                    args.new_anchor_penalty_weight
+                ),
+                "anchor_densification_count": distribution(
+                    active_model.densification_count[anchor_mask]
+                    .detach()
+                    .float()
+                    .cpu()
+                    .tolist()
+                ),
+                "scale": distribution(
+                    active_model.get_scaling.detach().amax(dim=1).cpu().tolist()
+                ),
+                "opacity": distribution(
+                    active_model.get_opacity.detach().squeeze(1).cpu().tolist()
+                ),
+                "signed_viewspace_gradient": distribution(
+                    [row["signed_gradient_norm"] for row in gradient_rows]
+                ),
+                "absolute_viewspace_gradient": distribution(
+                    [row["absolute_gradient_norm"] for row in gradient_rows]
+                ),
+                "geometry_optimization_seconds": float(
+                    sum(row[f"{variant}_training_runtime_seconds"] for row in rows)
+                ),
+                "geometry_backward_skipped_updates": int(
+                    sum(
+                        row[f"{variant}_geometry_backward_skipped_updates"]
+                        for row in rows
+                    )
+                ),
+                "anchor_restore_rows": int(
+                    sum(row[f"{variant}_anchor_restore_rows"] for row in rows)
+                ),
+                "densification_seconds": float(e4d_density_seconds[variant]),
+                "pruning_seconds": float(e4d_pruning_seconds[variant]),
+                "xfeat_parent_reprojection": reprojection_summary("xfeat_anchor"),
+                "densified_child_reprojection": reprojection_summary(
+                    "gradient_densified"
+                ),
+            }
+        report["e4d_contract"] = {
+            "experiment_family": args.active_new_experiment,
+            "variants": list(e4d_variants),
+            "research_variable": (
+                "joint-vs-NEW-only learned-DC supervision and fixed-XFeat/root-radius constraint"
+                if args.active_new_experiment == "E4e"
+                else "NEW sidecar representation update after unchanged E4a XFeat promotion"
+            ),
+            "reference_optimizer_membership": False,
+            "reference_topology_edited": False,
+            "shared_frontend_trace_sha256": hashlib.sha256(
+                np.stack(axes).tobytes()
+                + np.asarray(
+                    [row["global_p_plus_is_add"] for row in rows], dtype=np.float64
+                ).tobytes()
+                + np.asarray(
+                    [row["balanced_p_plus_is_add"] for row in rows], dtype=np.float64
+                ).tobytes()
+                + json.dumps(
+                    json_safe(seed_candidate_log), sort_keys=True
+                ).encode("utf-8")
+            ).hexdigest(),
+            "base_bitwise_audit": geometry_audit,
+            "causal_replay": {
+                "buffer": int(args.seed_buffer_frames),
+                "max_prior_views": int(args.seed_prior_views),
+                "current_fraction": 1.0 / 3.0,
+                "future_views_used": False,
+            },
+            "shared_density_random_seed_across_active_variants": True,
+            "diagnostics": diagnostics,
+            "runtime": {
+                "scene_seconds": float(time.time() - started),
+                "seconds_per_frame": float(time.time() - started)
+                / max(len(records), 1),
+                "peak_cuda_memory_bytes": int(
+                    torch.cuda.max_memory_allocated()
+                    if torch.cuda.is_available()
+                    else 0
+                ),
+            },
+        }
     summary_path = scene_out / "summary.json"
     report["outputs"]["summary"] = str(summary_path)
     summary_path.write_text(json.dumps(json_safe(report), indent=2, ensure_ascii=False) + "\n")
@@ -2666,6 +4257,29 @@ def main() -> None:
     args = parse_args()
     seed_everything(args.seed)
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    configuration_path = args.output_dir / "configuration.json"
+    configuration_path.write_text(
+        json.dumps(
+            json_safe(
+                {
+                    "experiment": (
+                        "E4e Semantic NEW and Root-Anchor Radius"
+                        if args.active_new_experiment == "E4e"
+                        else "E4d XFeat-Anchored Active NEW Geometry"
+                        if args.active_new_experiment == "E4d"
+                        else "legacy online XFeat NEW seed"
+                    ),
+                    "arguments": vars(args),
+                    "causal_frontend_modified": False,
+                    "e4b_parent_depth_propagation_used": bool(args.new_only_densify),
+                }
+            ),
+            indent=2,
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     summary = json.loads((RUN / "summary.json").read_text())
     cameras = load_fixed_camera_index(Path(summary["fixed_cameras_json"]))
     checkpoint = torch.load(RUN / "temporal_rchange_checkpoint.pt", map_location="cpu", weights_only=False)
@@ -2677,6 +4291,13 @@ def main() -> None:
         scene_reports.append(run_scene(scene, summary, cameras, checkpoint, sam, args))
     comparison_outputs = write_comparison_artifacts(scene_reports, args.output_dir)
     seed_comparison_outputs = write_seed_comparison_artifacts(scene_reports, args.output_dir)
+    active_new_comparison_outputs = (
+        write_e4d_comparison_artifacts(
+            scene_reports, args.output_dir, tuple(args.active_new_variants)
+        )
+        if args.active_new_variants
+        else {}
+    )
     combined = {
         "experiment": "online_xfeat_new_seed_vs_dc_only_controlled_comparison",
         "created_at_unix": time.time(),
@@ -2685,6 +4306,9 @@ def main() -> None:
         "scene_pca_and_posterior_reset_independently": True,
         "comparison_outputs": comparison_outputs,
         "seed_comparison_outputs": seed_comparison_outputs,
+        "active_new_comparison_outputs": active_new_comparison_outputs,
+        "e4d_comparison_outputs": active_new_comparison_outputs,
+        "configuration": str(configuration_path),
         "scenes": scene_reports,
     }
     combined["overall_metric_scopes"] = {
@@ -2702,6 +4326,63 @@ def main() -> None:
         }
         for scope in ("full", "all", "geometry", "new", "remove")
     }
+    if args.active_new_variants:
+        combined["active_new_experiment"] = args.active_new_experiment
+        combined["active_new_variants"] = list(args.active_new_variants)
+        if args.active_new_experiment == "E4d":
+            combined["e4d_variants"] = list(args.active_new_variants)
+        scopes = [
+            "full",
+            "new_full",
+            "remove_full",
+            "all",
+            "geometry",
+            "new",
+            "remove",
+        ]
+        if args.active_new_experiment == "E4e":
+            scopes.extend(("sidecar_alpha_new_full", "sidecar_alpha_new"))
+        overall_e4d: dict[str, Any] = {}
+        for variant in args.active_new_variants:
+            overall_e4d[variant] = {}
+            for scope in scopes:
+                entries = [
+                    report["e4d_metric_scopes"][variant][scope]
+                    for report in scene_reports
+                ]
+                counts = {
+                    name: sum(int(entry[name]) for entry in entries)
+                    for name in (
+                        "tp",
+                        "tn",
+                        "fp",
+                        "fn",
+                        "pred_positive",
+                        "gt_positive",
+                        "pixels",
+                    )
+                }
+                tp, tn, fp, fn = (
+                    counts[name] for name in ("tp", "tn", "fp", "fn")
+                )
+                overall_e4d[variant][scope] = {
+                    "frames": sum(int(entry["frames"]) for entry in entries),
+                    **counts,
+                    "precision": tp / (tp + fp) if tp + fp else 0.0,
+                    "recall": tp / (tp + fn) if tp + fn else 0.0,
+                    "iou": tp / (tp + fp + fn) if tp + fp + fn else 0.0,
+                    "f1": 2 * tp / (2 * tp + fp + fn)
+                    if 2 * tp + fp + fn
+                    else 0.0,
+                    "accuracy": (tp + tn) / max(tp + tn + fp + fn, 1),
+                }
+        combined["e4d_overall_metric_scopes"] = overall_e4d
+        combined["active_new_overall_metric_scopes"] = overall_e4d
+        combined["e4d_reference_baselines"] = {
+            "E4a_XFeat512_fixed_overall_iou": 0.438807,
+            "E4a_XFeat512_fixed_overall_f1": 0.609960,
+            "E4c_XFeat4096_fixed_overall_iou": 0.441080,
+        }
     combined_path = args.output_dir / "summary.json"
     combined_path.write_text(json.dumps(json_safe(combined), indent=2, ensure_ascii=False) + "\n")
     print(json.dumps(json_safe(combined), indent=2, ensure_ascii=False), flush=True)

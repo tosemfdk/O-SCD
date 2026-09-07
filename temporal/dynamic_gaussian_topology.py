@@ -55,6 +55,10 @@ class DynamicDensityMasks:
     gradient_observed: torch.Tensor
     gradient_split: torch.Tensor
     cue_mixture_split: torch.Tensor
+    signed_score_candidate: torch.Tensor
+    signed_score_clone: torch.Tensor
+    signed_score_split: torch.Tensor
+    signed_score_prune: torch.Tensor
     clone: torch.Tensor
     split: torch.Tensor
 
@@ -72,6 +76,11 @@ class DynamicDensityResult:
     gradient_split_source_count: int
     cue_mixture_split_source_count: int
     cue_mixture_only_split_source_count: int
+    signed_score_candidate_count: int
+    signed_score_clone_source_count: int
+    signed_score_split_source_count: int
+    signed_score_prune_candidate_count: int
+    signed_score_pruned_count: int
     split_source_removed_count: int
     opacity_pruned_count: int
     size_pruned_count: int
@@ -205,6 +214,46 @@ class DynamicGaussianTopologyManager:
         selected = value[rows]
         return selected.repeat((int(repeat),) + (1,) * (selected.ndim - 1))
 
+    def _stable_topk_rows(
+        self,
+        candidate: torch.Tensor,
+        score: torch.Tensor,
+        max_sources: int | None,
+    ) -> torch.Tensor:
+        """Return deterministic score-desc/stable-id-asc candidate rows."""
+
+        rows = torch.nonzero(candidate, as_tuple=False).flatten()
+        if max_sources is None:
+            return rows
+        if isinstance(max_sources, bool) or int(max_sources) < 0:
+            raise ValueError("signed_density_max_sources must be a nonnegative integer")
+        if int(rows.numel()) <= int(max_sources):
+            return rows
+        if int(max_sources) == 0:
+            return rows[:0]
+        # Deterministic ordering without materializing all candidates on CPU:
+        # first impose stable-id ascending, then stable-sort by score descending.
+        # Tied scores therefore preserve the prior stable-id order.
+        stable_order = torch.argsort(self.stable_id[rows], stable=True)
+        rows = rows[stable_order]
+        score_order = torch.argsort(score[rows], descending=True, stable=True)
+        return rows[score_order[: int(max_sources)]]
+
+    def _current_episode_start(self, timestamp: int | float) -> torch.Tensor:
+        """Return per-row active lifecycle start; inactive rows get timestamp."""
+
+        rows = torch.arange(self.count, device=self.model.current_state_index.device)
+        slots = self.model.current_state_index
+        starts = torch.full(
+            (self.count,),
+            float(timestamp),
+            device=self.model.state_start.device,
+            dtype=self.model.state_start.dtype,
+        )
+        active = slots >= 0
+        starts[active] = self.model.state_start[rows[active], slots[active]]
+        return starts
+
     def _combined_child_rows(
         self,
         clone_rows: torch.Tensor,
@@ -305,6 +354,11 @@ class DynamicGaussianTopologyManager:
         split_children: int = 2,
         cue_mixture_score: torch.Tensor | None = None,
         cue_mixture_threshold: float = 0.5,
+        signed_density_score: torch.Tensor | None = None,
+        signed_density_threshold: float = 0.0,
+        signed_density_max_sources: int | None = None,
+        signed_density_prune_threshold: float | None = None,
+        signed_density_prune_min_age_frames: int = 1,
         black_child_prune_threshold: float | None = None,
         black_child_prune_min_age_frames: int = 1,
     ) -> DynamicDensityResult:
@@ -319,6 +373,15 @@ class DynamicGaussianTopologyManager:
         computed from the current frame's pre-optimization raw cue evidence.
         It may only add large-Gaussian split sources; it never clones small
         rows, changes lifecycle state, or replaces the original gradient rule.
+
+        ``signed_density_score`` is an optional detached per-row signed value.
+        When supplied, positive rows above ``signed_density_threshold`` fully
+        replace the gradient/cue-mixture topology selection: small rows clone,
+        large rows split, and source selection is deterministic score-desc then
+        stable-id-asc with an optional ``signed_density_max_sources`` budget.
+        Negative rows are never densified.  They may prune only ACTIVE children
+        with ``generation > 0`` when ``signed_density_prune_threshold`` is set;
+        initial generation-zero rows remain protected.
 
         ``black_child_prune_threshold`` optionally hard-prunes only previously
         densified ACTIVE children whose learned intrinsic DC render value is
@@ -348,6 +411,29 @@ class DynamicGaussianTopologyManager:
         )
         if cue_mixture_threshold > 1.0:
             raise ValueError("cue_mixture_threshold must be at most one")
+        signed_density_threshold = _validate_positive_finite(
+            "signed_density_threshold",
+            signed_density_threshold,
+            allow_zero=True,
+        )
+        if signed_density_max_sources is not None and (
+            isinstance(signed_density_max_sources, bool)
+            or not isinstance(signed_density_max_sources, int)
+            or signed_density_max_sources < 0
+        ):
+            raise ValueError("signed_density_max_sources must be a nonnegative integer")
+        if signed_density_prune_threshold is not None:
+            signed_density_prune_threshold = _validate_positive_finite(
+                "signed_density_prune_threshold",
+                signed_density_prune_threshold,
+                allow_zero=True,
+            )
+        if (
+            isinstance(signed_density_prune_min_age_frames, bool)
+            or not isinstance(signed_density_prune_min_age_frames, int)
+            or signed_density_prune_min_age_frames < 1
+        ):
+            raise ValueError("signed_density_prune_min_age_frames must be an integer >= 1")
         if black_child_prune_threshold is not None:
             black_child_prune_threshold = _validate_positive_finite(
                 "black_child_prune_threshold",
@@ -378,6 +464,17 @@ class DynamicGaussianTopologyManager:
                 ((mixture_score < 0.0) | (mixture_score > 1.0)).any()
             ):
                 raise ValueError("cue_mixture_score must be finite and in [0,1]")
+        signed_score: torch.Tensor | None = None
+        if signed_density_score is not None:
+            if not isinstance(signed_density_score, torch.Tensor):
+                raise TypeError("signed_density_score must be a tensor")
+            signed_score = signed_density_score.detach().to(
+                device=self.model.xyz.device, dtype=self.model.xyz.dtype
+            ).flatten()
+            if signed_score.shape != (self.count,):
+                raise ValueError("signed_density_score must match the current topology")
+            if not bool(torch.isfinite(signed_score).all()):
+                raise ValueError("signed_density_score must be finite")
 
         old_count = self.count
         active = self.active_mask()
@@ -390,15 +487,34 @@ class DynamicGaussianTopologyManager:
         small = self.model.base.get_scaling.max(dim=1).values <= (
             self.percent_dense * scene_extent
         )
-        gradient_candidate = active & observed & gradient_ok
-        clone = gradient_candidate & small
-        gradient_split = gradient_candidate & ~small
-        cue_mixture_split = (
-            active
-            & ~small
-            & (mixture_score >= float(cue_mixture_threshold))
-        )
-        split = gradient_split | cue_mixture_split
+        signed_candidate = torch.zeros_like(active)
+        signed_clone = torch.zeros_like(active)
+        signed_split = torch.zeros_like(active)
+        signed_prune_candidate_pre = torch.zeros_like(active)
+        if signed_score is None:
+            gradient_candidate = active & observed & gradient_ok
+            clone = gradient_candidate & small
+            gradient_split = gradient_candidate & ~small
+            cue_mixture_split = (
+                active
+                & ~small
+                & (mixture_score >= float(cue_mixture_threshold))
+            )
+            split = gradient_split | cue_mixture_split
+        else:
+            positive = active & (signed_score > float(signed_density_threshold))
+            selected_positive_rows = self._stable_topk_rows(
+                positive,
+                signed_score,
+                signed_density_max_sources,
+            )
+            signed_candidate[selected_positive_rows] = True
+            signed_clone = signed_candidate & small
+            signed_split = signed_candidate & ~small
+            clone = signed_clone
+            split = signed_split
+            gradient_split = torch.zeros_like(active)
+            cue_mixture_split = torch.zeros_like(active)
         clone_rows = torch.nonzero(clone, as_tuple=False).flatten()
         split_rows = torch.nonzero(split, as_tuple=False).flatten()
 
@@ -453,6 +569,20 @@ class DynamicGaussianTopologyManager:
             ),
             dim=0,
         )
+        if signed_score is None:
+            combined_signed_score = torch.zeros(
+                combined_count, device=active.device, dtype=self.model.xyz.dtype
+            )
+        else:
+            child_score = (
+                signed_score[source_rows]
+                if child_count
+                else signed_score.new_empty((0,))
+            )
+            combined_signed_score = torch.cat(
+                (signed_score, child_score),
+                dim=0,
+            )
 
         split_source_mask = torch.zeros(
             combined_count, device=active.device, dtype=torch.bool
@@ -478,7 +608,35 @@ class DynamicGaussianTopologyManager:
                 > 0.1 * scene_extent
             )
             size_prune = combined_active & (screen_large | world_large)
-        base_remove = split_source_mask | opacity_prune | size_prune
+        signed_score_prune = torch.zeros_like(opacity_prune)
+        if signed_score is not None and signed_density_prune_threshold is not None:
+            rows = torch.arange(
+                combined_count,
+                device=combined_lifecycle["current_state_index"].device,
+                dtype=torch.long,
+            )
+            slots = combined_lifecycle["current_state_index"]
+            current_starts = torch.full(
+                (combined_count,),
+                float(timestamp),
+                device=combined_lifecycle["state_start"].device,
+                dtype=combined_lifecycle["state_start"].dtype,
+            )
+            active_slots = slots >= 0
+            current_starts[active_slots] = combined_lifecycle["state_start"][
+                rows[active_slots], slots[active_slots]
+            ]
+            episode_old_enough = (
+                float(timestamp) - current_starts
+            ) >= float(signed_density_prune_min_age_frames)
+            signed_score_prune = (
+                combined_active
+                & (combined_generation > 0)
+                & episode_old_enough.to(device=combined_active.device)
+                & (combined_signed_score <= -float(signed_density_prune_threshold))
+            )
+            signed_prune_candidate_pre = signed_score_prune[:old_count].detach().clone()
+        base_remove = split_source_mask | opacity_prune | size_prune | signed_score_prune
 
         black_child_candidate = torch.zeros_like(base_remove)
         black_child_prune = torch.zeros_like(base_remove)
@@ -597,6 +755,8 @@ class DynamicGaussianTopologyManager:
                 reason = "low_opacity"
             elif bool(size_prune[row]):
                 reason = "oversized"
+            elif bool(signed_score_prune[row]):
+                reason = "negative_signed_score"
             elif bool(black_child_prune[row]):
                 reason = "black_child"
             self.lineage_events.append(
@@ -636,6 +796,13 @@ class DynamicGaussianTopologyManager:
             cue_mixture_only_split_source_count=int(
                 (cue_mixture_split & ~gradient_split).sum().item()
             ),
+            signed_score_candidate_count=int(signed_candidate.sum().item()),
+            signed_score_clone_source_count=int(signed_clone.sum().item()),
+            signed_score_split_source_count=int(signed_split.sum().item()),
+            signed_score_prune_candidate_count=int(
+                signed_prune_candidate_pre.sum().item()
+            ),
+            signed_score_pruned_count=int(signed_score_prune.sum().item()),
             split_source_removed_count=int(split_source_mask.sum().item()),
             opacity_pruned_count=int(opacity_prune.sum().item()),
             size_pruned_count=int(size_prune.sum().item()),
@@ -652,6 +819,10 @@ class DynamicGaussianTopologyManager:
                 gradient_observed=observed.detach().clone(),
                 gradient_split=gradient_split.detach().clone(),
                 cue_mixture_split=cue_mixture_split.detach().clone(),
+                signed_score_candidate=signed_candidate.detach().clone(),
+                signed_score_clone=signed_clone.detach().clone(),
+                signed_score_split=signed_split.detach().clone(),
+                signed_score_prune=signed_prune_candidate_pre.detach().clone(),
                 clone=clone.detach().clone(),
                 split=split.detach().clone(),
             ),

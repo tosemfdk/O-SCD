@@ -1,0 +1,204 @@
+{
+  "scenes": [
+    "Cantina",
+    "Garden"
+  ],
+  "instance": "Instance_1",
+  "frames_per_condition": 50,
+  "processed_frames": 100,
+  "per_scene": {
+    "Cantina": {
+      "baseline": {
+        "metrics": {
+          "frames": 25,
+          "mean_frame_iou": 0.43928554619635807,
+          "mean_frame_f1": 0.5820565853055657,
+          "precision": 0.8506325808865003,
+          "recall": 0.4876857500916396,
+          "aggregate_iou": 0.4492168337651111,
+          "aggregate_f1": 0.6199442668603725,
+          "tp": 508230,
+          "tn": 13157031,
+          "fp": 89243,
+          "fn": 533896
+        },
+        "training_plus_seal_seconds": 35.665537376422435,
+        "runner_seconds": 52.204030269989744,
+        "process_wall_seconds": 54.161654739873484,
+        "root_births": 2543,
+        "density_children": 55,
+        "final_archive": 2598,
+        "seed_open": 536,
+        "peak_cuda_gib": 1.299001693725586,
+        "existing_2d_rejected": 7492,
+        "same_frame_2d_rejected": 4007,
+        "render_calls": 6000
+      },
+      "combined": {
+        "metrics": {
+          "frames": 25,
+          "mean_frame_iou": 0.44189867105147707,
+          "mean_frame_f1": 0.5842576134470322,
+          "precision": 0.8493898624057992,
+          "recall": 0.491126792729478,
+          "aggregate_iou": 0.4517834649596294,
+          "aggregate_f1": 0.6223840894512357,
+          "tp": 511816,
+          "tn": 13155521,
+          "fp": 90753,
+          "fn": 530310
+        },
+        "training_plus_seal_seconds": 17.84487927821465,
+        "runner_seconds": 34.23221721500158,
+        "process_wall_seconds": 36.14991941512562,
+        "root_births": 2564,
+        "density_children": 62,
+        "final_archive": 2626,
+        "seed_open": 597,
+        "peak_cuda_gib": 1.2997384071350098,
+        "existing_2d_rejected": 7381,
+        "same_frame_2d_rejected": 4034,
+        "render_calls": 3000
+      }
+    },
+    "Garden": {
+      "baseline": {
+        "metrics": {
+          "frames": 25,
+          "mean_frame_iou": 0.49660077841099365,
+          "mean_frame_f1": 0.6532379061062646,
+          "precision": 0.6334635351794095,
+          "recall": 0.693054465375894,
+          "aggregate_iou": 0.49467950588464155,
+          "aggregate_f1": 0.6619205039435666,
+          "tp": 127145,
+          "tn": 13992025,
+          "fp": 73569,
+          "fn": 56311
+        },
+        "training_plus_seal_seconds": 40.82106866501272,
+        "runner_seconds": 56.30914187896997,
+        "process_wall_seconds": 58.21318192384206,
+        "root_births": 2232,
+        "density_children": 20,
+        "final_archive": 2252,
+        "seed_open": 395,
+        "peak_cuda_gib": 1.4712834358215332,
+        "existing_2d_rejected": 1712,
+        "same_frame_2d_rejected": 2842,
+        "render_calls": 6000
+      },
+      "combined": {
+        "metrics": {
+          "frames": 25,
+          "mean_frame_iou": 0.4966114150527596,
+          "mean_frame_f1": 0.6532147213969712,
+          "precision": 0.633540774991405,
+          "recall": 0.6930871707657422,
+          "aggregate_iou": 0.49474327247824934,
+          "aggregate_f1": 0.6619775871718447,
+          "tp": 127151,
+          "tn": 13992046,
+          "fp": 73548,
+          "fn": 56305
+        },
+        "training_plus_seal_seconds": 18.86615020991303,
+        "runner_seconds": 34.1618171997834,
+        "process_wall_seconds": 36.085438763024285,
+        "root_births": 2224,
+        "density_children": 18,
+        "final_archive": 2242,
+        "seed_open": 413,
+        "peak_cuda_gib": 1.3934597969055176,
+        "existing_2d_rejected": 1701,
+        "same_frame_2d_rejected": 2844,
+        "render_calls": 3000
+      }
+    }
+  },
+  "aggregate": {
+    "baseline": {
+      "frames": 50,
+      "metrics": {
+        "frames": 50,
+        "mean_frame_iou": 0.46794316230367594,
+        "mean_frame_f1": 0.6176472457059151,
+        "precision": 0.7960227365266536,
+        "recall": 0.5184271635843216,
+        "aggregate_iou": 0.45763306381329794,
+        "aggregate_f1": 0.627912573025874,
+        "tp": 635375,
+        "tn": 27149056,
+        "fp": 162812,
+        "fn": 590207
+      },
+      "training_plus_seal_seconds": 76.48660604143515,
+      "runner_seconds": 108.51317214895971,
+      "process_wall_seconds": 112.37483666371554,
+      "root_births": 4775,
+      "density_children": 75,
+      "render_calls": 12000
+    },
+    "combined": {
+      "frames": 50,
+      "metrics": {
+        "frames": 50,
+        "mean_frame_iou": 0.4692550430521183,
+        "mean_frame_f1": 0.6187361674220017,
+        "precision": 0.7954592987645468,
+        "recall": 0.5213580160283033,
+        "aggregate_iou": 0.45972718566958515,
+        "aggregate_f1": 0.6298809670502994,
+        "tp": 638967,
+        "tn": 27147567,
+        "fp": 164301,
+        "fn": 586615
+      },
+      "training_plus_seal_seconds": 36.71102948812768,
+      "runner_seconds": 68.39403441478498,
+      "process_wall_seconds": 72.23535817814991,
+      "root_births": 4788,
+      "density_children": 80,
+      "render_calls": 6000
+    }
+  },
+  "combined_minus_baseline": {
+    "mean_frame_iou": 0.0013118807484423511,
+    "mean_frame_f1": 0.0010889217160865439,
+    "precision": -0.0005634377621067665,
+    "recall": 0.002930852443981724,
+    "aggregate_iou": 0.002094121856287212,
+    "aggregate_f1": 0.0019683940244253906
+  },
+  "timing_comparison": {
+    "training_plus_seal_seconds": {
+      "reduction_fraction": 0.5200332268862841,
+      "speedup": 2.0834775572330617
+    },
+    "runner_seconds": {
+      "reduction_fraction": 0.36971675364076384,
+      "speedup": 1.5865882613513735
+    },
+    "process_wall_seconds": {
+      "reduction_fraction": 0.35719276376511233,
+      "speedup": 1.5556763266345541
+    }
+  },
+  "matched_source_config_input_cues_and_replay": true,
+  "all_saved_masks_verified": true,
+  "all_invariant_violations_zero": true,
+  "snapshot_interval_checks": 100,
+  "order": [
+    "Cantina baseline",
+    "Cantina combined",
+    "Garden combined",
+    "Garden baseline"
+  ],
+  "limitations": [
+    "Two preselected scenes/one seed0: not full20scenePASLCD or statistical equivalence proof.",
+    "Binary GT only; no NEW/REMOVE ground-truth split evaluated.",
+    "Cached SAM/DA3 inputs; processwall includes setup/learning/captures/verification, not cache preparation.",
+    "Existing liveviewer/system load can affect timing; order is counterbalanced across scenes.",
+    "Joint shared occlusion intentionally changes seed gradients/topology."
+  ]
+}

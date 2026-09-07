@@ -6,7 +6,28 @@ from collections.abc import Callable
 
 import torch
 
-from utils.general_utils import build_rotation
+
+
+def _build_rotation(rotation_raw: torch.Tensor) -> torch.Tensor:
+    """Device-preserving quaternion rotation used by topology-only code."""
+
+    quaternion = torch.nn.functional.normalize(rotation_raw, dim=1)
+    real, x, y, z = quaternion.unbind(dim=1)
+    rotation = torch.zeros(
+        (quaternion.shape[0], 3, 3),
+        device=quaternion.device,
+        dtype=quaternion.dtype,
+    )
+    rotation[:, 0, 0] = 1 - 2 * (y * y + z * z)
+    rotation[:, 0, 1] = 2 * (x * y - real * z)
+    rotation[:, 0, 2] = 2 * (x * z + real * y)
+    rotation[:, 1, 0] = 2 * (x * y + real * z)
+    rotation[:, 1, 1] = 1 - 2 * (x * x + z * z)
+    rotation[:, 1, 2] = 2 * (y * z - real * x)
+    rotation[:, 2, 0] = 2 * (x * z - real * y)
+    rotation[:, 2, 1] = 2 * (y * z + real * x)
+    rotation[:, 2, 2] = 1 - 2 * (x * x + y * y)
+    return rotation
 
 
 def fastgs_split_children(
@@ -37,7 +58,7 @@ def fastgs_split_children(
     samples = torch.normal(
         mean=torch.zeros_like(repeated_scaling), std=repeated_scaling
     )
-    rotations = build_rotation(rotation_raw).repeat(repeat, 1, 1)
+    rotations = _build_rotation(rotation_raw).repeat(repeat, 1, 1)
     child_xyz = (
         torch.bmm(rotations, samples.unsqueeze(-1)).squeeze(-1)
         + xyz.repeat(repeat, 1)

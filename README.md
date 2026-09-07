@@ -1,6 +1,9 @@
 # Changes in Real Time: Online Scene Change Detection with Multi-View Fusion
 *Chamuditha Jayanga, Jason Lai, Lloyd Windrim, Donald Dansereau, Niko Suenderhauf, Dimity Miller*
 
+> Evolving-scene research checkpoint (2026-09-07): [current implementation and validation](docs/current-viewer-checkpoint-20260907-ko.md).
+> This fork's temporal/DA3 experiments are distinct from the original O-SCD results below.
+
 [![Static Badge](https://img.shields.io/badge/Project%20Page-%23ecf0f1?logo=homepage&logoColor=%23222222&link=https%3A%2F%2Fchumsy0725.github.io%2FMV-3DCD%2F)](https://chumsy0725.github.io/O-SCD/)
 
 <p align="center">
@@ -64,6 +67,5 @@ Our code is based on [3D Gaussian Splatting](https://github.com/graphdeco-inria/
 ### Funding Acknowledgement
 
 This work was supported by the ARC Research Hub in Intelligent Robotic Systems for Real-Time Asset Management (ARIAM) (IH210100030) and Abyss Solutions. C.J., N.S., and D.M. also acknowledge ongoing support from the QUT Centre for Robotics.
-
 
 

@@ -433,3 +433,114 @@ def test_black_child_pruning_keeps_one_child_when_removed_parent_has_no_support(
     assert surviving_children.numel() == 1
     assert manager.generation[surviving_children].item() == 1
     assert manager.validate()
+
+
+def test_signed_score_replaces_gradient_gate_and_uses_stable_topk_for_clones():
+    model, _optimizer, _tracker, _controller, manager = _objects(n=4)
+    model.open_rows(torch.tensor([0, 1, 2]), timestamp=0)
+    # Row 0 has enough gradient for legacy cloning, but signed-score mode must
+    # ignore the gradient path entirely.
+    manager.xyz_gradient_accum[0] = 10.0
+    manager.denom[0] = 1.0
+
+    result = manager.apply_active_oscd_density_control(
+        timestamp=1,
+        scene_extent=1.0,
+        grad_threshold=1e-3,
+        min_opacity=0.0,
+        signed_density_score=torch.tensor([0.1, 0.9, 0.9, 1.0]),
+        signed_density_threshold=0.5,
+        signed_density_max_sources=1,
+    )
+
+    assert result.gradient_split_source_count == 0
+    assert result.cue_mixture_split_source_count == 0
+    assert result.signed_score_candidate_count == 1
+    assert result.signed_score_clone_source_count == 1
+    assert result.clone_source_count == 1
+    assert result.masks.clone.tolist() == [False, True, False, False]
+    assert result.masks.signed_score_candidate.tolist() == [False, True, False, False]
+    assert manager.parent_stable_id[-1].item() == 1
+    assert manager.validate()
+
+
+def test_signed_score_topk_ties_use_stable_id_not_row_order_and_zero_selects_none():
+    model, _optimizer, _tracker, _controller, manager = _objects(n=4)
+    model.open_rows(torch.tensor([0, 1, 2]), timestamp=0)
+    manager.stable_id.copy_(torch.tensor([10, 2, 5, 7]))
+    manager.next_stable_id = 11
+
+    result = manager.apply_active_oscd_density_control(
+        timestamp=1,
+        scene_extent=1.0,
+        grad_threshold=1.0,
+        min_opacity=0.0,
+        signed_density_score=torch.tensor([0.9, 0.9, 0.9, 1.0]),
+        signed_density_threshold=0.5,
+        signed_density_max_sources=2,
+    )
+
+    assert result.masks.signed_score_candidate.tolist() == [False, True, True, False]
+    assert result.clone_source_count == 2
+    assert sorted(manager.parent_stable_id[-2:].tolist()) == [2, 5]
+    assert manager.validate()
+
+    model, _optimizer, _tracker, _controller, manager = _objects(n=3)
+    model.open_rows(torch.tensor([0, 1]), timestamp=0)
+    zero = manager.apply_active_oscd_density_control(
+        timestamp=1,
+        scene_extent=1.0,
+        grad_threshold=1.0,
+        min_opacity=0.0,
+        signed_density_score=torch.tensor([0.9, 0.8, 0.7]),
+        signed_density_threshold=0.5,
+        signed_density_max_sources=0,
+    )
+    assert zero.signed_score_candidate_count == 0
+    assert zero.clone_source_count == 0
+    assert manager.count == 3
+    assert manager.validate()
+
+
+def test_negative_signed_score_prunes_only_active_children_and_protects_generation_zero():
+    model, _optimizer, _tracker, _controller, manager = _objects(n=3)
+    model.open_rows(torch.tensor([0]), timestamp=0)
+
+    born = manager.apply_active_oscd_density_control(
+        timestamp=10,
+        scene_extent=1.0,
+        grad_threshold=1.0,
+        min_opacity=0.0,
+        signed_density_score=torch.tensor([1.0, 0.0, 0.0]),
+        signed_density_threshold=0.5,
+    )
+    assert born.clone_child_count == 1
+    child_stable_id = int(manager.stable_id[-1].item())
+    child_row = manager.stable_id.tolist().index(child_stable_id)
+    assert manager.creation_timestamp[child_row].item() == 10
+    child_slot = model.current_state_index[child_row]
+    assert model.state_start[child_row, child_slot].item() == pytest.approx(0.0)
+
+    # Same timestamp as child creation: pruning succeeds only because age is
+    # computed from inherited lifecycle state_start, not creation_timestamp.
+    score = torch.zeros(manager.count)
+    score[0] = -1.0  # generation-zero source must be protected.
+    score[child_row] = -1.0
+    pruned = manager.apply_active_oscd_density_control(
+        timestamp=10,
+        scene_extent=1.0,
+        grad_threshold=1.0,
+        min_opacity=0.0,
+        signed_density_score=score,
+        signed_density_threshold=0.5,
+        signed_density_prune_threshold=0.5,
+        signed_density_prune_min_age_frames=5,
+    )
+
+    assert pruned.signed_score_prune_candidate_count == 1
+    assert pruned.signed_score_pruned_count == 1
+    assert pruned.total_removed_count == 1
+    assert child_stable_id not in manager.stable_id.tolist()
+    assert int(manager.stable_id[0].item()) == 0
+    assert bool((manager.generation == 0).all())
+    assert manager.validate()

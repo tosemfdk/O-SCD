@@ -118,14 +118,29 @@ Artifacts:
   visualization/ref_sc1_sc2_sc3_lifespan_events.gif
 ```
 
-영상 패널은 기존 형식을 유지한다.
+영상 패널은 다음 형식을 사용한다.
 
 1. Inference RGB
 2. Combined change cue
 3. Causal raw R_change
 4. 실제 평가에 사용한 threshold mask
-5. 현재 timestamp의 hard OPEN/CLOSE event
+5. 현재 lifecycle 상태와 hard OPEN/CLOSE event
+   - 현재 timestamp에 새로 발생한 OPEN: 완전 초록
+   - 현재 timestamp에 새로 발생한 CLOSE: 완전 빨강
+   - 이전부터 유지 중인 OPEN: 절반 밝기 초록
+   - 이전부터 유지 중인 CLOSED: 절반 밝기 빨강
+   - NEVER_OPEN: 표시하지 않음
 6. Timestamp별 hard OPEN/CLOSE Gaussian 개수
+
+지속 상태까지 표시하는 시각화 전용 재실행 결과는 아래에 있다. 이는 detector나
+metric 계약을 바꾼 새 ablation이 아니며, CUDA 재실행 변동 때문에 primary v2
+수치와 bitwise하게 같지는 않다.
+
+```text
+/tmp/escd_bf30_learned_dc_close_only_metric_mask_visual_20260901_v3/
+  visualization/ref_sc1_sc2_sc3_lifespan_events.mp4
+  visualization/ref_sc1_sc2_sc3_lifespan_events.gif
+```
 
 ## 7. PASLCD 20 scenes / 500 frames
 
